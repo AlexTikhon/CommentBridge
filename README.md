@@ -1,144 +1,104 @@
-# Social Comments API
+# CommentBridge
 
-A production-minded NestJS/TypeScript backend for reading normalized comments
-on a logical social post and replying through platform adapters. The solution is
-intentionally one application and one PostgreSQL database: enough structure to
-make boundaries and failure behavior explicit without speculative infrastructure.
+CommentBridge is a TypeScript/NestJS REST API that reads normalized comments for
+a logical social-media post and sends replies through platform adapters. It covers
+multi-publication reads, stable cursor pagination, parent-scoped idempotency,
+delivery lifecycle tracking, RFC 7807 errors, Swagger, PostgreSQL integration
+tests, and deterministic Instagram and LinkedIn mocks.
 
-The seeded post ID is `11111111-1111-4111-8111-111111111111` and the seeded
-Instagram comment ID is `44444444-4444-4444-8444-444444444441`.
+To run it: copy `.env.example` to `.env`, run `pnpm install`, start PostgreSQL with
+`docker compose up -d postgres`, then run `pnpm db:migrate`, `pnpm db:seed`, and
+`pnpm dev`.
+
+## Implemented requirements
+
+- Logical `Post` records separated from per-account `PostPublication` records.
+- One normalized, self-referencing `Comment` table for inbound comments and
+  outbound replies.
+- Reads from `PUBLISHED` publications only, with platform and direct-parent
+  filters and reply counts under the same visibility rule.
+- Parent-scoped idempotent replies with a database uniqueness constraint.
+- `PENDING` → `SENT`/`FAILED` outbound lifecycle; no provider call in a long
+  database transaction.
+- Platform adapter registry with deterministic Instagram and LinkedIn mocks and
+  platform-specific message limits.
+- RFC 7807-style errors, safe NestJS HTTP exception handling, validation details,
+  request correlation IDs, and Swagger/OpenAPI.
+- Unit, PostgreSQL integration, and E2E tests with an explicit destructive-reset
+  guard.
 
 ## Architecture
 
-The application follows pragmatic ports and adapters. The controller owns HTTP
-concerns, the application service owns workflow and invariants, and infrastructure
-implements persistence and provider contracts. No Prisma or provider SDK types
-cross into the controller contract.
+The controller owns HTTP concerns, `CommentsService` owns workflow and invariants,
+and ports isolate persistence and social-platform behavior. Prisma and mock-provider
+details do not cross into the public API contract.
 
 ```mermaid
-flowchart TD
-  Client --> Controller[Comments REST controller]
-  Controller --> Service[Comments application service]
-  Service --> RepoPort[Comment repository port]
-  Service --> Registry[Platform adapter registry]
-  RepoPort --> PrismaRepo[Prisma comment repository]
-  PrismaRepo --> DB[(PostgreSQL)]
-  Registry --> Instagram[Mock Instagram adapter]
-  Registry --> LinkedIn[Mock LinkedIn adapter]
+flowchart LR
+  Client --> Controller[REST controller]
+  Controller --> Service[CommentsService]
+  Service --> Repository[CommentRepository]
+  Service --> Registry[Adapter registry]
+  Repository --> PostgreSQL[(PostgreSQL)]
+  Registry --> Instagram[Instagram mock]
+  Registry --> LinkedIn[LinkedIn mock]
 ```
 
-The service creates and commits a local `PENDING` reply, calls the provider with
-no transaction held open, then marks the row `SENT` or `FAILED`.
+A reply is first committed locally as `PENDING`. The adapter is called without an
+open database transaction, after which the reply becomes `SENT` or `FAILED`.
 
-## Data model
+## Quick start
 
-```mermaid
-erDiagram
-  POST ||--o{ POST_PUBLICATION : has
-  SOCIAL_ACCOUNT ||--o{ POST_PUBLICATION : publishes
-  POST_PUBLICATION ||--o{ COMMENT : contains
-  COMMENT o|--o{ COMMENT : replies
-
-  SOCIAL_ACCOUNT {
-    uuid id PK
-    SocialPlatform platform
-    string externalAccountId
-    string displayName
-  }
-  POST {
-    uuid id PK
-    string content
-  }
-  POST_PUBLICATION {
-    uuid id PK
-    uuid postId FK
-    uuid socialAccountId FK
-    string externalPostId
-    PublicationStatus status
-    datetime publishedAt
-  }
-  COMMENT {
-    uuid id PK
-    uuid postPublicationId FK
-    uuid parentId FK
-    string externalCommentId
-    CommentDirection direction
-    DeliveryStatus deliveryStatus
-    string idempotencyKey
-    string body
-    string providerErrorCode
-    datetime remoteCreatedAt
-  }
-```
-
-`Post` is the platform-neutral scheduled content. Each `PostPublication` is one
-delivery to one social account and carries the provider post ID. Inbound comments
-and outbound replies share a normalized, self-referencing table. PostgreSQL
-constraints enforce account/publication, external-comment, and idempotency
-uniqueness. A check constraint permits `RECEIVED` only for inbound rows and
-`PENDING`/`SENT`/`FAILED` only for outbound rows. SQL expression indexes support
-the effective-timestamp keyset query; these are migration-only because Prisma's
-schema language does not represent expression indexes.
-
-Prisma cannot express “the parent comment belongs to the same publication” as a
-relational constraint. The application loads the parent with its publication,
-checks the IDs, and creates the reply using that publication ID. This invariant
-is called out explicitly because direct database writers must preserve it too.
-
-## Setup and local commands
-
-Requirements: Node.js 22 (Node 24 is also accepted by `engines`), pnpm 11, Docker,
-and Docker Compose.
+Requirements: Node.js 22 or 24, pnpm 11, Docker, and Docker Compose.
 
 ```bash
 cp .env.example .env
 pnpm install
-docker compose up -d
+docker compose up -d postgres
 pnpm db:migrate
 pnpm db:seed
 pnpm dev
 ```
 
-On PowerShell, use `Copy-Item .env.example .env` instead of `cp`. The API starts
-at `http://localhost:3000`, Swagger UI at `http://localhost:3000/api/docs`, and
-OpenAPI JSON at `http://localhost:3000/api/docs-json`.
+PowerShell users can replace the first command with
+`Copy-Item .env.example .env`. The API runs at `http://localhost:3000`, Swagger UI
+at `http://localhost:3000/api/docs`, and OpenAPI JSON at
+`http://localhost:3000/api/docs-json`.
 
-All supported scripts:
+The seed prints the logical post ID. Its stable example IDs are:
+
+- post: `11111111-1111-4111-8111-111111111111`
+- Instagram comment: `44444444-4444-4444-8444-444444444441`
+- second Instagram comment: `44444444-4444-4444-8444-444444444442`
+
+To create a clean submission archive from committed files only:
 
 ```bash
-pnpm dev
-pnpm build
-pnpm start
-pnpm lint
-pnpm format:check
-pnpm typecheck
-pnpm test
-pnpm test:integration
-pnpm test:e2e
-pnpm db:migrate
-pnpm db:seed
-pnpm db:reset
+git archive --format=zip --output=commentbridge-submission.zip HEAD
 ```
 
-Integration and E2E tests intentionally require the disposable local PostgreSQL
-container and an applied migration. They reset and reseed the configured database;
-do not point `DATABASE_URL` at data you care about.
+## API examples
 
-## API
-
-`GET /health` returns application/database readiness without configuration or
-credentials.
-
-`GET /api/v1/posts/:postId/comments` accepts optional `platform`, `parentId`,
-opaque `cursor`, and `limit` (default 20, maximum 100). Omitting `parentId`
-returns a normalized flat list including both top-level comments and replies.
+List comments from published publications. Optional query parameters are
+`platform`, `parentId`, `cursor`, and `limit` (default 20, maximum 100).
 
 ```bash
 curl "http://localhost:3000/api/v1/posts/11111111-1111-4111-8111-111111111111/comments?platform=INSTAGRAM&limit=20"
 ```
 
-`POST /api/v1/comments/:commentId/replies` requires a client-generated
-`Idempotency-Key` and JSON message.
+Each comment exposes local and provider time explicitly:
+
+```json
+{
+  "createdAt": "2026-08-04T09:00:00.000Z",
+  "remoteCreatedAt": "2026-08-04T10:00:00.000Z"
+}
+```
+
+`createdAt` is always local record creation time. `remoteCreatedAt` is the
+provider timestamp and may be `null` for `PENDING` or `FAILED` outbound replies.
+
+Create a reply with a key scoped to this parent comment:
 
 ```bash
 curl -i -X POST \
@@ -148,103 +108,140 @@ curl -i -X POST \
   -d '{"message":"Thank you for your feedback!"}'
 ```
 
-A new successful reply is `201`; replaying the same key and normalized message is
-`200`. Reusing a key with a different message is `409`. Validation, missing
-resources, unpublished publications, rate limiting, and provider failures use
-`application/problem+json`. Each response includes/echoes `X-Request-Id`; each
-problem includes that ID. Stack traces, raw database errors, raw provider bodies,
-and credentials are never returned.
+A new reply returns `201`; an identical replay returns `200` and `replayed: true`.
 
-## Idempotency and delivery
+## Database model
 
-Idempotency is scoped to a publication with a unique
-`(postPublicationId, idempotencyKey)` index. The service first reads an existing
-row and the repository also converts a concurrent uniqueness race into a replay,
-so only the winner can call the mock provider. The message must match the original
-request. Successful replays return the stored reply. A replay of a failed attempt
-returns its safe failure and reply ID; a `PENDING` replay returns a conflict because
-the outcome is not yet known.
+`Post` is platform-neutral content. A `PostPublication` represents its delivery to
+one `SocialAccount` and owns the platform post ID and publication status. Inbound
+comments and outbound replies share `Comment`; `parentId` links a reply to its
+direct parent.
 
-This prevents duplicate local work and duplicate calls in a running process, but
-does not claim distributed exactly-once delivery. A crash after the provider
-accepts a reply but before `SENT` is stored leaves an ambiguous `PENDING` record.
-Production would combine provider-native idempotency, a transactional outbox,
-background retries with backoff, and reconciliation against provider state.
+PostgreSQL constraints enforce account/publication uniqueness, external-comment
+uniqueness per publication, reply idempotency per parent, valid direction/delivery
+combinations, and a parent for every outbound reply. The application always
+derives a reply's `postPublicationId` from the loaded parent. Direct database
+writers must also preserve the same-parent/same-publication invariant because
+Prisma cannot express that cross-row relationship without a more complex composite
+foreign key.
 
-## Pagination
+The read query orders by `COALESCE(remoteCreatedAt, createdAt), id`. Matching SQL
+expression indexes live in the migration because Prisma cannot represent them.
+Ordinary compound timestamp indexes were omitted after comparison with the actual
+query; required uniqueness and expression indexes remain.
 
-Pages sort descending by `COALESCE(remoteCreatedAt, createdAt)` and UUID as a
-tie-breaker. The cursor is a base64url-encoded, validated JSON tuple containing
-that timestamp and ID. Queries use keyset predicates, not offsets, so page cost
-does not grow with page number and inserts ahead of the cursor do not shift later
-pages. The cursor is opaque API data, not a stable client storage format.
+## Platform adapter extension
 
-## Platform adapters
-
-Instagram and LinkedIn mocks implement the same `SocialPlatformAdapter` port.
-They have different reply-length limits, deterministic external IDs, call counters,
-and no network access. `[test:provider-unavailable]` and `[test:rate-limit]` are
-documented deterministic failure messages isolated to these mocks.
+`SocialPlatformAdapter` contains only production behavior: platform identity,
+capabilities, and `replyToComment`. Test call assertions use Jest spies rather than
+adding counters to the port.
 
 To add a platform:
 
-1. Add the platform enum value in the domain and Prisma schema plus a migration.
-2. Implement `SocialPlatformAdapter`, including capabilities and safe error mapping.
-3. Register it in `PlatformsModule`.
+1. Add its domain and Prisma enum value with a migration.
+2. Implement the adapter, capabilities, and safe provider-error mapping.
+3. Register the adapter in `PlatformsModule`.
 
-The comment service requires no platform-specific branch.
+No platform-specific branch is needed in `CommentsService`.
 
-## Test strategy
+## Idempotency
 
-Unit tests mock repository and adapter ports at the service boundary and exercise
-workflow, capabilities, replay, failure, invariants, registry behavior, and cursor
-codec behavior. Integration tests use PostgreSQL to exercise migrations,
-constraints, multi-publication reads, filters, reply counts, stable keyset pages,
-success/failure persistence, and uniqueness. E2E tests exercise the real Nest
-validation/filter/controller stack for both endpoints, replay status codes,
-provider errors, invalid input, and missing comments. Every provider is deterministic
-and local.
+The database unique key is `(parentId, idempotencyKey)`, and every lookup uses the
+same pair. The same key and normalized message on the same parent returns the
+stored reply without calling the provider again; a different message returns
+`409`. The same key can be used independently on another parent. The unique index
+also closes concurrent-create races, so only the winning request calls the
+adapter.
 
-## Assumptions
+This is local at-most-one provider call during normal process execution, not a
+claim of distributed exactly-once delivery. A crash after provider acceptance but
+before `SENT` is stored can leave an ambiguous `PENDING` record.
 
-- Authentication and authorization are outside the take-home scope.
-- Social accounts and published posts already exist.
-- External comments have already been synchronized into the normalized database.
-- Reads come from the local database; adapters demonstrate outbound integration.
-- Mock adapters replace real platform APIs and no credentials are stored.
-- Replies are self-referencing `Comment` records.
-- Pagination is a flat list, not an unbounded recursive tree.
-- Provider tokens and OAuth flows are outside scope.
-- Production inbound synchronization would use webhooks and/or polling.
-- Production outbound delivery would likely use an outbox and worker.
+## Pagination
 
-## Trade-offs and known limitations
+Pages use descending keyset pagination over effective creation time and UUID. The
+opaque base64url cursor contains that validated tuple. This avoids growing offset
+cost and prevents new rows ahead of a cursor from shifting later pages. Cursor
+behavior remains deterministic when provider time is absent because local
+`createdAt` is the fallback.
 
-The outbound call is synchronous for an honest, small take-home API. It makes the
-success response useful but cannot close the crash window described above. Failed
-rows are not retried automatically. The database check constraint is supplied in
-SQL because Prisma cannot represent it. Parent/publication consistency is an
-application invariant rather than a database constraint. Cursor order is stable,
-but rows updated between page requests can still reflect normal read-committed
-concurrency. The mocks do not model authentication, edits, deletes, webhook races,
-or provider-specific thread depth. There is no auth, rate limiter, tracing backend,
-or production secret management.
+## Errors
+
+Errors use `application/problem+json` with `type`, `title`, `status`, `detail`,
+`code`, and `requestId`. Validation errors may include safe field messages;
+provider failures may include `replyId` and `retryable`. Custom application errors
+retain their mappings, while ordinary NestJS exceptions preserve their HTTP status
+with generic safe text. Stack traces, raw framework/database/provider details, and
+credentials are never returned.
+
+Every response includes or echoes `X-Request-Id`.
+
+## Testing
+
+Unit tests require no services:
+
+```bash
+pnpm test
+```
+
+Integration and E2E suites use the dedicated `commentbridge_test` database. The
+Compose service stores its data in a disposable `tmpfs`; the scripts load only
+`.env.test.example`. Before any `deleteMany()`, the guard requires both
+`NODE_ENV=test` and a database name ending in `_test`. It refuses unsafe settings
+without printing the connection URL or credentials.
+
+```bash
+docker compose up -d postgres-test
+pnpm db:test:migrate
+pnpm test:integration
+pnpm test:e2e
+```
+
+Complete local validation:
+
+```bash
+pnpm format:check
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm test:integration
+pnpm test:e2e
+pnpm build
+docker compose config
+git diff --check
+```
+
+## Assumptions and trade-offs
+
+- Authentication, authorization, OAuth, and real provider credentials are outside
+  the assignment scope.
+- Posts, accounts, publications, and synchronized inbound comments already exist;
+  reads use PostgreSQL as the normalized local read model.
+- The API returns a bounded flat list rather than recursively expanding threads.
+- Mock adapters are deterministic and make no external requests.
+- Synchronous outbound delivery is concise and observable but has the crash window
+  described under idempotency. Failed rows are not retried automatically.
+- Parent/publication consistency is enforced by the only application write path;
+  direct database writers must preserve it.
+
+See [docs/DECISIONS.md](docs/DECISIONS.md) for concise engineering decisions and
+[FINAL_REVIEW_PLAN.md](FINAL_REVIEW_PLAN.md) for the verified final-review scope.
 
 ## Production evolution
 
-The next step would be transactional creation of the reply plus an outbox event,
-then a worker with bounded retries, exponential backoff, dead-letter visibility,
-provider idempotency keys, and reconciliation for ambiguous results. Inbound
-webhooks/polling would upsert provider comments into the same normalized read
-model. Add tenant-aware authorization, encrypted provider credentials, operational
-metrics/traces, per-account throttling, deployment migrations, and retention/audit
-policies as product requirements become concrete.
+These items are not implemented. If product requirements justify them, outbound
+delivery could evolve to a transactional outbox and retrying worker with provider
+idempotency and reconciliation. Inbound synchronization could add authenticated
+webhooks or polling. Tenant authorization, encrypted provider credentials,
+throttling, tracing/metrics, and retention policies should follow concrete
+operational requirements.
 
-See [docs/DECISIONS.md](docs/DECISIONS.md) for concise decision records and
-[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the delivery plan.
+## AI-assisted development
 
-## AI usage disclosure
+I designed the solution and made the final engineering decisions with AI-assisted
+support. Claude was used as a collaborator during the initial architecture and
+design phase, GitHub Copilot assisted with implementation, and ChatGPT assisted
+with the final architecture and code review.
 
-AI tools were used to assist with initial scaffolding, test-case generation, and
-code review. All architectural decisions, implementation details, and generated
-changes were reviewed and validated by the author.
+I reviewed, adapted, tested, and validated all submitted code and remain fully
+responsible for the implementation and its engineering decisions.

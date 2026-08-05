@@ -7,7 +7,6 @@ export type ApplicationErrorCode =
   | 'IDEMPOTENCY_CONFLICT'
   | 'PLATFORM_RATE_LIMITED'
   | 'PLATFORM_UNAVAILABLE'
-  | 'PARENT_PUBLICATION_MISMATCH'
   | 'INTERNAL_ERROR';
 
 export class ApplicationError extends Error {

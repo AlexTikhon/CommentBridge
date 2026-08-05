@@ -17,12 +17,16 @@ describe('comments persistence integration', () => {
   const prismaService = prisma as PrismaService;
   const repository = new PrismaCommentRepository(prismaService);
   let instagram: MockInstagramAdapter;
+  let actualInstagramReply: MockInstagramAdapter['replyToComment'];
+  let instagramReplySpy: jest.SpiedFunction<MockInstagramAdapter['replyToComment']>;
   let service: CommentsService;
 
   beforeAll(async () => prisma.$connect());
   beforeEach(async () => {
     await resetAndSeed(prisma);
     instagram = new MockInstagramAdapter();
+    actualInstagramReply = instagram.replyToComment.bind(instagram);
+    instagramReplySpy = jest.spyOn(instagram, 'replyToComment');
     service = new CommentsService(
       repository,
       new PlatformAdapterRegistry([instagram, new MockLinkedInAdapter()]),
@@ -31,6 +35,17 @@ describe('comments persistence integration', () => {
   afterAll(async () => prisma.$disconnect());
 
   it('retrieves both publications, filters by platform and parent, and counts replies', async () => {
+    await prisma.comment.create({
+      data: {
+        postPublicationId: SEED_IDS.draftPublication,
+        parentId: SEED_IDS.instagramComment,
+        direction: CommentDirection.OUTBOUND,
+        deliveryStatus: DeliveryStatus.SENT,
+        idempotencyKey: 'cross-publication-count',
+        authorDisplayName: 'Direct database writer',
+        body: 'Must not affect a published publication reply count.',
+      },
+    });
     const all = await service.listComments({ postId: SEED_IDS.post, limit: 20 });
     expect(new Set(all.items.map((item) => item.platform))).toEqual(
       new Set([SocialPlatform.INSTAGRAM, SocialPlatform.LINKEDIN]),
@@ -38,6 +53,9 @@ describe('comments persistence integration', () => {
     expect(
       all.items.find((item) => item.id === SEED_IDS.instagramComment)?.replyCount,
     ).toBe(1);
+    expect(all.items.map((item) => item.id)).not.toEqual(
+      expect.arrayContaining([SEED_IDS.draftComment, SEED_IDS.failedComment]),
+    );
 
     const instagramOnly = await service.listComments({
       postId: SEED_IDS.post,
@@ -88,12 +106,81 @@ describe('comments persistence integration', () => {
     expect(first.reply.deliveryStatus).toBe(DomainDeliveryStatus.SENT);
     expect(replay.reply.id).toBe(first.reply.id);
     expect(replay.replayed).toBe(true);
-    expect(instagram.getCallCount()).toBe(1);
+    expect(instagramReplySpy).toHaveBeenCalledTimes(1);
     const stored = await prisma.comment.findUniqueOrThrow({
       where: { id: first.reply.id },
     });
     expect(stored.deliveryStatus).toBe(DeliveryStatus.SENT);
     expect(stored.externalCommentId).toMatch(/^mock-instagram-/);
+    expect(stored.authorExternalId).toBe('mock-instagram-account-1');
+    expect(stored.authorDisplayName).toBe('Demo Brand Instagram');
+    expect(stored.createdAt).toBeInstanceOf(Date);
+    expect(stored.remoteCreatedAt).toEqual(new Date('2026-08-05T12:00:00.000Z'));
+  });
+
+  it('allows the same key on different parents and conflicts on a changed same-parent message', async () => {
+    const first = await service.replyToComment(
+      SEED_IDS.instagramComment,
+      'First parent reply',
+      'shared-parent-key',
+    );
+    const second = await service.replyToComment(
+      SEED_IDS.instagramSecondComment,
+      'Second parent reply',
+      'shared-parent-key',
+    );
+
+    expect(first.reply.id).not.toBe(second.reply.id);
+    expect(instagramReplySpy).toHaveBeenCalledTimes(2);
+    await expect(
+      service.replyToComment(
+        SEED_IDS.instagramComment,
+        'Changed first reply',
+        'shared-parent-key',
+      ),
+    ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    expect(instagramReplySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('protects a concurrent duplicate with database uniqueness and one provider call', async () => {
+    let releaseProvider!: () => void;
+    let providerEntered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      providerEntered = resolve;
+    });
+    instagramReplySpy.mockImplementation(async (input) => {
+      providerEntered();
+      await gate;
+      return actualInstagramReply(input);
+    });
+
+    const first = service.replyToComment(
+      SEED_IDS.instagramComment,
+      'Concurrent reply',
+      'concurrent-key',
+    );
+    await entered;
+    const second = service.replyToComment(
+      SEED_IDS.instagramComment,
+      'Concurrent reply',
+      'concurrent-key',
+    );
+
+    await expect(second).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    releaseProvider();
+    await expect(first).resolves.toMatchObject({ replayed: false });
+    expect(instagramReplySpy).toHaveBeenCalledTimes(1);
+    expect(
+      await prisma.comment.count({
+        where: {
+          parentId: SEED_IDS.instagramComment,
+          idempotencyKey: 'concurrent-key',
+        },
+      }),
+    ).toBe(1);
   });
 
   it('persists only a safe provider failure code', async () => {
@@ -110,10 +197,11 @@ describe('comments persistence integration', () => {
     });
     expect(failed.deliveryStatus).toBe(DeliveryStatus.FAILED);
     expect(failed.providerErrorCode).toBe('PLATFORM_UNAVAILABLE');
+    expect(failed.remoteCreatedAt).toBeNull();
     expect(JSON.stringify(failed)).not.toContain('provider body');
   });
 
-  it('enforces publication-scoped external ID and idempotency uniqueness', async () => {
+  it('enforces publication-scoped external IDs and parent-scoped idempotency', async () => {
     const base = {
       postPublicationId: SEED_IDS.instagramPublication,
       parentId: SEED_IDS.instagramComment,
@@ -149,5 +237,16 @@ describe('comments persistence integration', () => {
         },
       }),
     ).rejects.toBeInstanceOf(Prisma.PrismaClientKnownRequestError);
+
+    await expect(
+      prisma.comment.create({
+        data: {
+          ...base,
+          parentId: SEED_IDS.instagramSecondComment,
+          externalCommentId: 'independent-external',
+          idempotencyKey: 'unique-a',
+        },
+      }),
+    ).resolves.toMatchObject({ parentId: SEED_IDS.instagramSecondComment });
   });
 });

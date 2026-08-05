@@ -83,7 +83,10 @@ export class PrismaCommentRepository implements CommentRepository {
   }
 
   async findForPost(query: ListCommentsInput): Promise<CursorPage<CommentView>> {
-    const conditions: Prisma.Sql[] = [Prisma.sql`p."postId" = ${query.postId}::uuid`];
+    const conditions: Prisma.Sql[] = [
+      Prisma.sql`p."postId" = ${query.postId}::uuid`,
+      Prisma.sql`p."status" = 'PUBLISHED'::"PublicationStatus"`,
+    ];
     if (query.platform) {
       conditions.push(Prisma.sql`sa."platform" = ${query.platform}::"SocialPlatform"`);
     }
@@ -124,7 +127,9 @@ export class PrismaCommentRepository implements CommentRepository {
       FROM "Comment" c
       JOIN "PostPublication" p ON p."id" = c."postPublicationId"
       JOIN "SocialAccount" sa ON sa."id" = p."socialAccountId"
-      LEFT JOIN "Comment" r ON r."parentId" = c."id"
+      LEFT JOIN "Comment" r
+        ON r."parentId" = c."id"
+        AND r."postPublicationId" = c."postPublicationId"
       WHERE ${Prisma.join(conditions, ' AND ')}
       GROUP BY c."id", sa."platform"
       ORDER BY "effectiveCreatedAt" DESC, c."id" DESC
@@ -152,11 +157,11 @@ export class PrismaCommentRepository implements CommentRepository {
   }
 
   async findByIdempotencyKey(
-    publicationId: string,
+    parentId: string,
     idempotencyKey: string,
   ): Promise<CommentRecord | null> {
-    const comment = await this.prisma.comment.findFirst({
-      where: { postPublicationId: publicationId, idempotencyKey },
+    const comment = await this.prisma.comment.findUnique({
+      where: { parentId_idempotencyKey: { parentId, idempotencyKey } },
     });
     return comment ? this.toRecord(comment) : null;
   }
@@ -171,6 +176,7 @@ export class PrismaCommentRepository implements CommentRepository {
           parentId: input.parentId,
           idempotencyKey: input.idempotencyKey,
           body: input.body,
+          authorExternalId: input.authorExternalId,
           authorDisplayName: input.authorDisplayName,
           direction: PrismaCommentDirection.OUTBOUND,
           deliveryStatus: PrismaDeliveryStatus.PENDING,
@@ -183,7 +189,7 @@ export class PrismaCommentRepository implements CommentRepository {
         error.code === 'P2002'
       ) {
         const existing = await this.findByIdempotencyKey(
-          input.publicationId,
+          input.parentId,
           input.idempotencyKey,
         );
         if (existing) return { reply: existing, created: false };

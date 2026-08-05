@@ -17,6 +17,7 @@ export interface CreatePendingReplyInput {
   parentId: string;
   idempotencyKey: string;
   body: string;
+  authorExternalId: string;
   authorDisplayName: string;
 }
 
@@ -30,7 +31,7 @@ export interface CommentRepository {
   findByIdWithPublication(id: string): Promise<CommentContext | null>;
   findForPost(query: ListCommentsInput): Promise<CursorPage<CommentView>>;
   findByIdempotencyKey(
-    publicationId: string,
+    parentId: string,
     idempotencyKey: string,
   ): Promise<CommentRecord | null>;
   createPendingReply(input: CreatePendingReplyInput): Promise<CreatePendingReplyResult>;

@@ -44,12 +44,6 @@ export class CommentsService {
     if (!parent) {
       throw new ApplicationError('COMMENT_NOT_FOUND', 'The comment was not found.');
     }
-    if (parent.postPublicationId !== parent.publication.id) {
-      throw new ApplicationError(
-        'PARENT_PUBLICATION_MISMATCH',
-        'The parent comment does not belong to the publication.',
-      );
-    }
     if (parent.publication.status !== PublicationStatus.PUBLISHED) {
       throw new ApplicationError(
         'PUBLICATION_NOT_PUBLISHED',
@@ -72,7 +66,7 @@ export class CommentsService {
     }
 
     const existing = await this.repository.findByIdempotencyKey(
-      parent.publication.id,
+      parent.id,
       idempotencyKey,
     );
     if (existing) {
@@ -88,6 +82,7 @@ export class CommentsService {
       parentId: parent.id,
       idempotencyKey,
       body: message,
+      authorExternalId: parent.publication.socialAccount.externalAccountId,
       authorDisplayName: parent.publication.socialAccount.displayName,
     });
     if (!pendingResult.created) {

@@ -116,6 +116,7 @@ describe('CommentsService', () => {
   });
 
   it('creates, sends, and marks a successful reply', async () => {
+    const replySpy = jest.spyOn(instagram, 'replyToComment');
     const result = await service.replyToComment(
       context().id,
       '  Thanks!  ',
@@ -124,14 +125,25 @@ describe('CommentsService', () => {
 
     expect(result.reply.deliveryStatus).toBe(DeliveryStatus.SENT);
     expect(result.replayed).toBe(false);
-    expect(instagram.getCallCount()).toBe(1);
+    expect(replySpy).toHaveBeenCalledTimes(1);
     expect(repository.createPendingReply).toHaveBeenCalledWith(
-      expect.objectContaining({ body: 'Thanks!' }),
+      expect.objectContaining({
+        publicationId: context().publication.id,
+        parentId: context().id,
+        body: 'Thanks!',
+        authorExternalId: 'external-account',
+        authorDisplayName: 'Demo Brand',
+      }),
+    );
+    expect(repository.findByIdempotencyKey).toHaveBeenCalledWith(
+      context().id,
+      'reply-key',
     );
     expect(repository.markReplySent).toHaveBeenCalledTimes(1);
   });
 
   it('returns a successful idempotent replay without a provider call', async () => {
+    const replySpy = jest.spyOn(instagram, 'replyToComment');
     repository.findByIdempotencyKey.mockResolvedValue(
       record({ deliveryStatus: DeliveryStatus.SENT }),
     );
@@ -139,7 +151,7 @@ describe('CommentsService', () => {
     const result = await service.replyToComment(context().id, 'Thanks!', 'reply-key');
 
     expect(result.replayed).toBe(true);
-    expect(instagram.getCallCount()).toBe(0);
+    expect(replySpy).not.toHaveBeenCalled();
     expect(repository.createPendingReply).not.toHaveBeenCalled();
   });
 
@@ -200,16 +212,43 @@ describe('CommentsService', () => {
     ).rejects.toMatchObject({ code: 'PUBLICATION_NOT_PUBLISHED' });
   });
 
-  it('enforces the parent/publication invariant in the application layer', async () => {
-    repository.findByIdWithPublication.mockResolvedValue(
-      context({ postPublicationId: '33333333-3333-4333-8333-333333333399' }),
+  it('scopes the same idempotency key independently to different parents', async () => {
+    const secondParent = context({
+      id: '44444444-4444-4444-8444-444444444442',
+      externalCommentId: 'external-parent-2',
+    });
+    repository.findByIdWithPublication
+      .mockResolvedValueOnce(context())
+      .mockResolvedValueOnce(secondParent);
+    repository.createPendingReply
+      .mockResolvedValueOnce({ reply: record(), created: true })
+      .mockResolvedValueOnce({
+        reply: record({
+          id: '55555555-5555-4555-8555-555555555552',
+          parentId: secondParent.id,
+        }),
+        created: true,
+      });
+    const replySpy = jest.spyOn(instagram, 'replyToComment');
+
+    await service.replyToComment(context().id, 'Thanks!', 'shared-key');
+    await service.replyToComment(secondParent.id, 'Thanks again!', 'shared-key');
+
+    expect(repository.findByIdempotencyKey).toHaveBeenNthCalledWith(
+      1,
+      context().id,
+      'shared-key',
     );
-    await expect(
-      service.replyToComment(context().id, 'Thanks!', 'reply-key'),
-    ).rejects.toMatchObject({ code: 'PARENT_PUBLICATION_MISMATCH' });
+    expect(repository.findByIdempotencyKey).toHaveBeenNthCalledWith(
+      2,
+      secondParent.id,
+      'shared-key',
+    );
+    expect(replySpy).toHaveBeenCalledTimes(2);
   });
 
   it('enforces platform-specific reply limits', async () => {
+    const replySpy = jest.spyOn(linkedin, 'replyToComment');
     repository.findByIdWithPublication.mockResolvedValue(
       context({
         publication: {
@@ -224,7 +263,7 @@ describe('CommentsService', () => {
     await expect(
       service.replyToComment(context().id, 'x'.repeat(1251), 'reply-key'),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-    expect(linkedin.getCallCount()).toBe(0);
+    expect(replySpy).not.toHaveBeenCalled();
   });
 
   it('returns post not found before querying comments', async () => {

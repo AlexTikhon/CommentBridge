@@ -21,7 +21,7 @@ export async function bootstrap(): Promise<void> {
   app.useGlobalFilters(new ProblemDetailsFilter());
 
   const swaggerConfig = new DocumentBuilder()
-    .setTitle('Social Comments API')
+    .setTitle('CommentBridge')
     .setDescription(
       'Normalized comment retrieval and idempotent social-platform replies.',
     )
@@ -34,7 +34,7 @@ export async function bootstrap(): Promise<void> {
 
   const port = Number(process.env.PORT ?? 3000);
   await app.listen(port);
-  Logger.log(`Social Comments API listening on port ${port}`, 'Bootstrap');
+  Logger.log(`CommentBridge listening on port ${port}`, 'Bootstrap');
 }
 
 if (require.main === module) {

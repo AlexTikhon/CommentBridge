@@ -4,8 +4,10 @@ coverage/
 .env
 .env.*
 !.env.example
+!.env.test.example
 *.log
 .idea/
 .vscode/
 postgres-data/
 test-results/
+*.zip

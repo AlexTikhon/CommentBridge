@@ -87,7 +87,5 @@ model Comment {
   replies             Comment[]        @relation("CommentReplies")
 
   @@unique([postPublicationId, externalCommentId])
-  @@unique([postPublicationId, idempotencyKey])
-  @@index([postPublicationId, remoteCreatedAt, createdAt, id])
-  @@index([parentId, remoteCreatedAt, createdAt, id])
+  @@unique([parentId, idempotencyKey])
 }

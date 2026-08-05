@@ -17,5 +17,23 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  postgres-test:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: commentbridge_test
+    ports:
+      - '${POSTGRES_TEST_PORT:-55433}:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d commentbridge_test']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+    restart: unless-stopped
+
 volumes:
   postgres-data:

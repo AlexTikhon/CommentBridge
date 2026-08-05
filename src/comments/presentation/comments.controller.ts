@@ -60,7 +60,7 @@ export class CommentsController {
   @ApiHeader({
     name: 'Idempotency-Key',
     required: true,
-    description: 'Client-generated key, unique within the publication.',
+    description: 'Client-generated key, unique for this parent comment.',
   })
   @ApiCreatedResponse({ type: ReplyResponseDto, description: 'New reply delivered.' })
   @ApiOkResponse({ type: ReplyResponseDto, description: 'Existing reply replayed.' })
@@ -108,7 +108,8 @@ export class CommentsController {
         displayName: comment.authorDisplayName,
       },
       body: comment.body,
-      publishedAt: (comment.remoteCreatedAt ?? comment.createdAt).toISOString(),
+      createdAt: comment.createdAt.toISOString(),
+      remoteCreatedAt: comment.remoteCreatedAt?.toISOString() ?? null,
       replyCount: 'replyCount' in comment ? comment.replyCount : (replyCount ?? 0),
     };
   }

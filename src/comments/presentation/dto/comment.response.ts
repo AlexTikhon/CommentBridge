@@ -41,8 +41,19 @@ export class CommentResponseDto {
   @ApiProperty({ example: 'Great post!' })
   body!: string;
 
-  @ApiProperty({ format: 'date-time' })
-  publishedAt!: string;
+  @ApiProperty({
+    format: 'date-time',
+    description: 'Time the normalized record was created in CommentBridge.',
+  })
+  createdAt!: string;
+
+  @ApiPropertyOptional({
+    format: 'date-time',
+    nullable: true,
+    description:
+      'Provider timestamp when known; may be null for pending or failed replies.',
+  })
+  remoteCreatedAt!: string | null;
 
   @ApiProperty({ minimum: 0 })
   replyCount!: number;
@@ -65,7 +76,7 @@ export class ReplyResponseDto {
 }
 
 export class ProblemDetailsDto {
-  @ApiProperty({ example: 'https://example.local/problems/validation-error' })
+  @ApiProperty({ example: 'https://commentbridge.local/problems/validation-error' })
   type!: string;
 
   @ApiProperty({ example: 'Request validation failed' })

@@ -1,56 +1,90 @@
-# Engineering Decisions
+# CommentBridge Engineering Decisions
 
-## Logical `Post` versus `PostPublication`
+## Logical post and publication
 
-A post represents authored content once; a publication represents delivery to a
-particular social account. Provider post IDs, status, and publication time belong
-to the latter. This prevents platform fields from contaminating scheduling logic
-and supports one post on several platforms.
+`Post` represents authored content once. `PostPublication` represents delivery to
+one social account and owns the provider post ID, status, and publication time.
+This keeps platform delivery state out of the logical content model and supports
+one post across several platforms.
 
-## Normalized comments table
+Comment reads join publications and explicitly require `PUBLISHED`. Platform and
+parent filters, pagination, and reply counts operate inside that visibility rule;
+a direct database row that violates the application parent/publication invariant
+cannot inflate a published comment's reply count.
+
+## One normalized comment table
 
 Inbound comments and outbound replies share identity, text, authorship, timing,
-and delivery metadata, so one table gives a consistent read model. Direction and
-delivery status make lifecycle differences explicit, with a PostgreSQL check
-constraint rejecting invalid combinations.
+and delivery metadata. One self-referencing table therefore provides a consistent
+read model. Direction and delivery status make lifecycle differences explicit,
+with SQL checks rejecting invalid direction/status combinations and outbound rows
+without a parent.
 
-## Self-referencing replies
+`createdAt` is local persistence time. `remoteCreatedAt` is the optional provider
+timestamp. The API exposes both instead of describing the local fallback as a
+remote publication time.
 
-`parentId` models direct reply relationships without a separate reply table. API
-queries remain flat and bounded. The application enforces that parent and child
-use the same publication because Prisma cannot express that cross-row invariant.
+## Parent/publication invariant
 
-## Adapters for social platforms
+CommentBridge uses the small-application option: reply creation loads the parent
+with its publication and derives the child's `postPublicationId` directly from
+that record. The old comparison between the joined comment field and joined
+publication ID was removed because it did not enforce a stronger invariant.
 
-The comment service depends on one capability-aware adapter contract and resolves
-it through a registry. Platform request shapes, limits, failure mapping, and SDKs
-remain outside the core workflow. Adding a platform is enum/configuration,
-implementation, and registration work rather than a service conditional.
+A composite database foreign key could enforce this for arbitrary external SQL
+writers, but it would add schema complexity without improving the application's
+single write path. Direct database writers must preserve the invariant.
 
-## Cursor versus offset pagination
+## Parent-scoped idempotency
 
-Keyset pagination over effective creation time plus UUID gives deterministic order,
-avoids growing offset cost, and is less susceptible to shifts caused by new rows.
-The encoded cursor is intentionally opaque and validated at the boundary.
+Reply idempotency is unique on `(parentId, idempotencyKey)`, and repository lookups
+use the same pair. Identical same-parent requests replay the stored result without
+a provider call; a changed message conflicts; another parent can reuse the key.
+The database constraint protects concurrent creation races.
 
-## Synchronous partial implementation versus outbox/worker
+The upgrade migration first validates that existing outbound rows have parents,
+creates the new unique index, and only then drops publication-scoped uniqueness.
+It rewrites no existing data and fails safely if pre-existing rows violate the
+required parent rule.
 
-The take-home commits `PENDING`, calls the adapter synchronously without an open
-transaction, and stores `SENT` or `FAILED`. It is compact and observable but has an
-ambiguous crash window. Production should atomically write an outbox event and use
-a retrying worker plus reconciliation; implementing that here would add machinery
-without demonstrating more of the requested design.
+## Cursor pagination and indexes
 
-## Idempotency
+Keyset pagination orders by `COALESCE(remoteCreatedAt, createdAt)` and UUID. SQL
+expression indexes match the publication and parent query shapes; they remain in
+the migration because Prisma cannot represent expression indexes. Ordinary
+compound indexes over the separate timestamp columns were removed because they
+did not match the executed ordering expression. Required external-ID and
+idempotency uniqueness indexes remain.
 
-Keys are unique within a publication. A replay with the same normalized message
-returns the existing result; a different message conflicts. The database unique
-index closes concurrent creation races. This is local at-most-one provider call in
-the normal running process, not a distributed exactly-once guarantee.
+## Platform adapters
 
-## Local database as normalized read model
+The service resolves one capability-aware `SocialPlatformAdapter` through a
+registry. The port contains platform identity, capabilities, and reply behavior
+only. Jest spies observe calls in tests, so future real adapters are not required
+to implement counters or reset hooks.
 
-Comment reads do not fan out to providers. Webhooks or polling are assumed to have
-synchronized external comments into PostgreSQL. This produces predictable latency,
-cross-platform filtering, stable pagination, and a consistent public contract while
-allowing provider ingestion to evolve independently.
+## Outbound delivery lifecycle
+
+The application commits `PENDING`, calls the adapter without an open database
+transaction, then stores `SENT` or `FAILED`. Only a safe provider code is persisted
+on failure. This is compact for the assignment but leaves an ambiguous crash
+window after provider acceptance and before the local success update.
+
+An outbox, worker, retries, and reconciliation are possible production evolution,
+not implemented features.
+
+## Error boundary and request IDs
+
+Custom application errors retain explicit RFC 7807-style mappings. General NestJS
+`HttpException` instances preserve their status but receive generic safe messages;
+class-validator details are retained where useful. Unexpected exceptions become a
+safe 500. Responses never include stack traces or raw framework, database, or
+provider details, and every problem includes a correlation ID.
+
+## Test database safety
+
+Integration and E2E suites target a dedicated Compose database named
+`commentbridge_test`. Destructive setup checks `NODE_ENV=test` and the `_test`
+database suffix before issuing any delete. Both conditions are required, and the
+failure message does not echo the connection URL. The test container uses a
+disposable in-memory filesystem to keep this protection simple and local.

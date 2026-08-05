@@ -9,8 +9,6 @@ import type {
 } from '../domain/platform.types';
 
 export abstract class MockAdapterBase implements SocialPlatformAdapter {
-  private callCount = 0;
-
   abstract readonly platform: SocialPlatform;
   protected abstract readonly maxReplyLength: number;
 
@@ -21,8 +19,6 @@ export abstract class MockAdapterBase implements SocialPlatformAdapter {
   async replyToComment(
     input: ReplyToPlatformCommentInput,
   ): Promise<PlatformCommentResult> {
-    this.callCount += 1;
-
     if (input.message === '[test:provider-unavailable]') {
       throw new ProviderAdapterError('PLATFORM_UNAVAILABLE', true);
     }
@@ -41,13 +37,5 @@ export abstract class MockAdapterBase implements SocialPlatformAdapter {
       externalCommentId: `mock-${this.platform.toLowerCase()}-${digest}`,
       remoteCreatedAt: new Date('2026-08-05T12:00:00.000Z'),
     });
-  }
-
-  getCallCount(): number {
-    return this.callCount;
-  }
-
-  resetCallCount(): void {
-    this.callCount = 0;
   }
 }

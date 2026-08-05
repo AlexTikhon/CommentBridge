@@ -25,6 +25,4 @@ export interface SocialPlatformAdapter {
   readonly platform: SocialPlatform;
   getCapabilities(): PlatformCapabilities;
   replyToComment(input: ReplyToPlatformCommentInput): Promise<PlatformCommentResult>;
-  getCallCount(): number;
-  resetCallCount(): void;
 }
