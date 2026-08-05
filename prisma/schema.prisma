@@ -1,0 +1,93 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SocialPlatform {
+  INSTAGRAM
+  LINKEDIN
+}
+
+enum PublicationStatus {
+  DRAFT
+  PUBLISHED
+  FAILED
+}
+
+enum CommentDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum DeliveryStatus {
+  RECEIVED
+  PENDING
+  SENT
+  FAILED
+}
+
+model SocialAccount {
+  id                String            @id @default(uuid()) @db.Uuid
+  platform          SocialPlatform
+  externalAccountId String
+  displayName       String
+  createdAt         DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime          @updatedAt @db.Timestamptz(3)
+  publications      PostPublication[]
+
+  @@unique([platform, externalAccountId])
+}
+
+model Post {
+  id           String            @id @default(uuid()) @db.Uuid
+  content      String
+  createdAt    DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime          @updatedAt @db.Timestamptz(3)
+  publications PostPublication[]
+}
+
+model PostPublication {
+  id              String            @id @default(uuid()) @db.Uuid
+  postId          String            @db.Uuid
+  socialAccountId String            @db.Uuid
+  externalPostId  String
+  status          PublicationStatus
+  publishedAt     DateTime?         @db.Timestamptz(3)
+  createdAt       DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @db.Timestamptz(3)
+  post            Post              @relation(fields: [postId], references: [id], onDelete: Cascade)
+  socialAccount   SocialAccount     @relation(fields: [socialAccountId], references: [id], onDelete: Restrict)
+  comments        Comment[]
+
+  @@unique([socialAccountId, externalPostId])
+  @@index([postId, socialAccountId])
+}
+
+model Comment {
+  id                  String           @id @default(uuid()) @db.Uuid
+  postPublicationId   String           @db.Uuid
+  parentId            String?          @db.Uuid
+  externalCommentId   String?
+  direction           CommentDirection
+  deliveryStatus      DeliveryStatus
+  idempotencyKey      String?
+  authorExternalId    String?
+  authorDisplayName   String
+  body                String
+  providerErrorCode   String?
+  remoteCreatedAt     DateTime?        @db.Timestamptz(3)
+  createdAt           DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime         @updatedAt @db.Timestamptz(3)
+  postPublication     PostPublication  @relation(fields: [postPublicationId], references: [id], onDelete: Cascade)
+  parent              Comment?         @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Restrict)
+  replies             Comment[]        @relation("CommentReplies")
+
+  @@unique([postPublicationId, externalCommentId])
+  @@unique([postPublicationId, idempotencyKey])
+  @@index([postPublicationId, remoteCreatedAt, createdAt, id])
+  @@index([parentId, remoteCreatedAt, createdAt, id])
+}

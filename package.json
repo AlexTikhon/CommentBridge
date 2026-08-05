@@ -1,0 +1,64 @@
+{
+  "name": "social-comments-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-minded social media comments and replies take-home API",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "dev": "nest start --watch",
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "lint": "eslint \"{src,test,prisma}/**/*.ts\"",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "test": "jest --config test/jest-unit.json",
+    "test:integration": "jest --config test/jest-integration.json --runInBand",
+    "test:e2e": "jest --config test/jest-e2e.json --runInBand",
+    "db:migrate": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "db:reset": "prisma migrate reset --force",
+    "prisma:generate": "prisma generate",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.1.28",
+    "@nestjs/core": "11.1.28",
+    "@nestjs/platform-express": "11.1.28",
+    "@nestjs/swagger": "11.4.6",
+    "@prisma/client": "6.19.3",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.14.2",
+    "dotenv": "17.4.2",
+    "helmet": "8.1.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@nestjs/cli": "11.0.24",
+    "@nestjs/testing": "11.1.28",
+    "@types/express": "5.0.6",
+    "@types/jest": "29.5.14",
+    "@types/node": "22.19.11",
+    "@types/supertest": "6.0.3",
+    "eslint": "9.39.5",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-prettier": "5.5.5",
+    "jest": "29.7.0",
+    "prettier": "3.9.0",
+    "prisma": "6.19.3",
+    "supertest": "7.2.2",
+    "ts-jest": "29.4.6",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.53.0"
+  },
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  }
+}
