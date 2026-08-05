@@ -3,12 +3,8 @@
 CommentBridge is a TypeScript/NestJS REST API that reads normalized comments for
 a logical social-media post and sends replies through platform adapters. It covers
 multi-publication reads, stable cursor pagination, parent-scoped idempotency,
-delivery lifecycle tracking, RFC 7807 errors, Swagger, PostgreSQL integration
-tests, and deterministic Instagram and LinkedIn mocks.
-
-To run it: copy `.env.example` to `.env`, run `pnpm install`, start PostgreSQL with
-`docker compose up -d postgres`, then run `pnpm db:migrate`, `pnpm db:seed`, and
-`pnpm dev`.
+delivery lifecycle tracking, RFC 7807 errors, Swagger, PostgreSQL tests, and
+deterministic Instagram and LinkedIn mocks.
 
 ## Implemented requirements
 
@@ -30,8 +26,8 @@ To run it: copy `.env.example` to `.env`, run `pnpm install`, start PostgreSQL w
 ## Architecture
 
 The controller owns HTTP concerns, `CommentsService` owns workflow and invariants,
-and ports isolate persistence and social-platform behavior. Prisma and mock-provider
-details do not cross into the public API contract.
+and ports isolate persistence and platform behavior. Prisma and provider details
+do not cross into the public API contract.
 
 ```mermaid
 flowchart LR
@@ -43,9 +39,6 @@ flowchart LR
   Registry --> Instagram[Instagram mock]
   Registry --> LinkedIn[LinkedIn mock]
 ```
-
-A reply is first committed locally as `PENDING`. The adapter is called without an
-open database transaction, after which the reply becomes `SENT` or `FAILED`.
 
 ## Quick start
 
@@ -65,7 +58,7 @@ PowerShell users can replace the first command with
 at `http://localhost:3000/api/docs`, and OpenAPI JSON at
 `http://localhost:3000/api/docs-json`.
 
-The seed prints the logical post ID. Its stable example IDs are:
+The seed prints the logical post ID. Stable example IDs are:
 
 - post: `11111111-1111-4111-8111-111111111111`
 - Instagram comment: `44444444-4444-4444-8444-444444444441`
@@ -86,7 +79,7 @@ List comments from published publications. Optional query parameters are
 curl "http://localhost:3000/api/v1/posts/11111111-1111-4111-8111-111111111111/comments?platform=INSTAGRAM&limit=20"
 ```
 
-Each comment exposes local and provider time explicitly:
+Each comment exposes local and provider time:
 
 ```json
 {
@@ -95,8 +88,8 @@ Each comment exposes local and provider time explicitly:
 }
 ```
 
-`createdAt` is always local record creation time. `remoteCreatedAt` is the
-provider timestamp and may be `null` for `PENDING` or `FAILED` outbound replies.
+`createdAt` is local persistence time. `remoteCreatedAt` is the provider timestamp
+and may be `null` for `PENDING` or `FAILED` replies.
 
 Create a reply with a key scoped to this parent comment:
 
@@ -112,10 +105,9 @@ A new reply returns `201`; an identical replay returns `200` and `replayed: true
 
 ## Database model
 
-`Post` is platform-neutral content. A `PostPublication` represents its delivery to
-one `SocialAccount` and owns the platform post ID and publication status. Inbound
-comments and outbound replies share `Comment`; `parentId` links a reply to its
-direct parent.
+`Post` is platform-neutral content. `PostPublication` represents delivery to one
+`SocialAccount` and owns the platform post ID and status. Inbound comments and
+outbound replies share `Comment`; `parentId` links a reply to its direct parent.
 
 PostgreSQL constraints enforce account/publication uniqueness, external-comment
 uniqueness per publication, reply idempotency per parent, valid direction/delivery
@@ -125,16 +117,15 @@ writers must also preserve the same-parent/same-publication invariant because
 Prisma cannot express that cross-row relationship without a more complex composite
 foreign key.
 
-The read query orders by `COALESCE(remoteCreatedAt, createdAt), id`. Matching SQL
-expression indexes live in the migration because Prisma cannot represent them.
-Ordinary compound timestamp indexes were omitted after comparison with the actual
-query; required uniqueness and expression indexes remain.
+Reads order by `COALESCE(remoteCreatedAt, createdAt), id`. Matching SQL expression
+indexes live in migrations because Prisma cannot represent them; required
+uniqueness indexes remain.
 
 ## Platform adapter extension
 
-`SocialPlatformAdapter` contains only production behavior: platform identity,
-capabilities, and `replyToComment`. Test call assertions use Jest spies rather than
-adding counters to the port.
+`SocialPlatformAdapter` contains platform identity, capabilities, and
+`replyToComment`. Tests use Jest spies rather than adding instrumentation to the
+port.
 
 To add a platform:
 
@@ -150,8 +141,10 @@ The database unique key is `(parentId, idempotencyKey)`, and every lookup uses t
 same pair. The same key and normalized message on the same parent returns the
 stored reply without calling the provider again; a different message returns
 `409`. The same key can be used independently on another parent. The unique index
-also closes concurrent-create races, so only the winning request calls the
-adapter.
+closes concurrent-create races, so only the winning request calls the adapter. A
+concurrent duplicate request may receive `409` while the original reply is still
+pending. After successful delivery, the same request is returned as an idempotent
+`200` replay.
 
 This is local at-most-one provider call during normal process execution, not a
 claim of distributed exactly-once delivery. A crash after provider acceptance but
@@ -159,20 +152,18 @@ before `SENT` is stored can leave an ambiguous `PENDING` record.
 
 ## Pagination
 
-Pages use descending keyset pagination over effective creation time and UUID. The
-opaque base64url cursor contains that validated tuple. This avoids growing offset
-cost and prevents new rows ahead of a cursor from shifting later pages. Cursor
-behavior remains deterministic when provider time is absent because local
-`createdAt` is the fallback.
+Pages use descending keyset pagination over effective creation time and UUID. An
+opaque base64url cursor contains that validated tuple, avoiding growing offset
+cost and page shifts from newer rows. Local `createdAt` is the deterministic
+fallback when provider time is absent.
 
 ## Errors
 
 Errors use `application/problem+json` with `type`, `title`, `status`, `detail`,
-`code`, and `requestId`. Validation errors may include safe field messages;
-provider failures may include `replyId` and `retryable`. Custom application errors
-retain their mappings, while ordinary NestJS exceptions preserve their HTTP status
-with generic safe text. Stack traces, raw framework/database/provider details, and
-credentials are never returned.
+`code`, and `requestId`. Validation errors may include safe field messages, and
+provider failures may include `replyId` and `retryable`. NestJS exceptions preserve
+their HTTP status with safe text. Stack traces and raw framework, database, or
+provider details are never returned.
 
 Every response includes or echoes `X-Request-Id`.
 
@@ -184,11 +175,10 @@ Unit tests require no services:
 pnpm test
 ```
 
-Integration and E2E suites use the dedicated `commentbridge_test` database. The
-Compose service stores its data in a disposable `tmpfs`; the scripts load only
-`.env.test.example`. Before any `deleteMany()`, the guard requires both
-`NODE_ENV=test` and a database name ending in `_test`. It refuses unsafe settings
-without printing the connection URL or credentials.
+Integration and E2E suites use a disposable `commentbridge_test` database and load
+only `.env.test.example`. Before any `deleteMany()`, the guard requires
+`NODE_ENV=test` and a database name ending in `_test`; unsafe settings are refused
+without exposing the connection URL.
 
 ```bash
 docker compose up -d postgres-test
@@ -204,10 +194,12 @@ pnpm format:check
 pnpm lint
 pnpm typecheck
 pnpm test
+docker compose config
+docker compose up -d postgres-test
+pnpm db:test:migrate
 pnpm test:integration
 pnpm test:e2e
 pnpm build
-docker compose config
 git diff --check
 ```
 
@@ -215,33 +207,31 @@ git diff --check
 
 - Authentication, authorization, OAuth, and real provider credentials are outside
   the assignment scope.
-- Posts, accounts, publications, and synchronized inbound comments already exist;
-  reads use PostgreSQL as the normalized local read model.
+- Posts, accounts, publications, and synchronized inbound comments already exist
+  in PostgreSQL as the normalized read model.
 - The API returns a bounded flat list rather than recursively expanding threads.
 - Mock adapters are deterministic and make no external requests.
 - Synchronous outbound delivery is concise and observable but has the crash window
   described under idempotency. Failed rows are not retried automatically.
-- Parent/publication consistency is enforced by the only application write path;
-  direct database writers must preserve it.
+- The application write path enforces parent/publication consistency; direct
+  database writers must preserve it.
 
-See [docs/DECISIONS.md](docs/DECISIONS.md) for concise engineering decisions and
-[FINAL_REVIEW_PLAN.md](FINAL_REVIEW_PLAN.md) for the verified final-review scope.
+See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 
 ## Production evolution
 
-These items are not implemented. If product requirements justify them, outbound
-delivery could evolve to a transactional outbox and retrying worker with provider
-idempotency and reconciliation. Inbound synchronization could add authenticated
-webhooks or polling. Tenant authorization, encrypted provider credentials,
-throttling, tracing/metrics, and retention policies should follow concrete
-operational requirements.
+Not implemented: outbound delivery could evolve to a transactional outbox and
+retrying worker with provider idempotency and reconciliation. Inbound sync could
+add authenticated webhooks or polling. Tenant authorization, encrypted provider
+credentials, throttling, observability, and retention policies should follow
+concrete operational requirements.
 
 ## AI-assisted development
 
 I designed the solution and made the final engineering decisions with AI-assisted
 support. Claude was used as a collaborator during the initial architecture and
-design phase, GitHub Copilot assisted with implementation, and ChatGPT assisted
-with the final architecture and code review.
+design phase, GitHub Copilot assisted me with implementation, and Codex assisted
+with the code review.
 
 I reviewed, adapted, tested, and validated all submitted code and remain fully
 responsible for the implementation and its engineering decisions.
