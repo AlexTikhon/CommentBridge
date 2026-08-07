@@ -13,6 +13,7 @@ import {
 import {
   ApiBadGatewayResponse,
   ApiBadRequestResponse,
+  ApiAcceptedResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiHeader,
@@ -24,7 +25,11 @@ import {
 } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { CommentsService } from '../application/comments.service';
-import type { CommentRecord, CommentView } from '../domain/comment.types';
+import {
+  DeliveryStatus,
+  type CommentRecord,
+  type CommentView,
+} from '../domain/comment.types';
 import { CreateReplyDto } from './dto/create-reply.dto';
 import { ListCommentsQueryDto } from './dto/list-comments.query';
 import {
@@ -64,6 +69,10 @@ export class CommentsController {
   })
   @ApiCreatedResponse({ type: ReplyResponseDto, description: 'New reply delivered.' })
   @ApiOkResponse({ type: ReplyResponseDto, description: 'Existing reply replayed.' })
+  @ApiAcceptedResponse({
+    type: ReplyResponseDto,
+    description: 'An existing reply is still pending delivery reconciliation.',
+  })
   @ApiBadRequestResponse({ type: ProblemDetailsDto })
   @ApiNotFoundResponse({ type: ProblemDetailsDto })
   @ApiConflictResponse({ type: ProblemDetailsDto })
@@ -80,7 +89,13 @@ export class CommentsController {
       body.message,
       idempotencyKey ?? '',
     );
-    response.status(result.replayed ? HttpStatus.OK : HttpStatus.CREATED);
+    response.status(
+      result.reply.deliveryStatus === DeliveryStatus.PENDING
+        ? HttpStatus.ACCEPTED
+        : result.replayed
+          ? HttpStatus.OK
+          : HttpStatus.CREATED,
+    );
     return {
       reply: this.toResponse({
         ...result.reply,

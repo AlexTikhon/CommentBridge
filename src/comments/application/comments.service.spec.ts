@@ -142,6 +142,35 @@ describe('CommentsService', () => {
     expect(repository.markReplySent).toHaveBeenCalledTimes(1);
   });
 
+  it('does not mark a provider-accepted reply as failed when persisting SENT fails', async () => {
+    const persistenceError = new Error('database write failed');
+    const replySpy = jest.spyOn(instagram, 'replyToComment');
+    repository.markReplySent.mockRejectedValue(persistenceError);
+
+    await expect(
+      service.replyToComment(context().id, 'Thanks!', 'reply-key'),
+    ).rejects.toBe(persistenceError);
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    expect(repository.markReplySent).toHaveBeenCalledTimes(1);
+    expect(repository.markReplyFailed).not.toHaveBeenCalled();
+  });
+
+  it('returns an existing pending reply without another provider call', async () => {
+    const replySpy = jest.spyOn(instagram, 'replyToComment');
+    repository.findByIdempotencyKey.mockResolvedValue(record());
+
+    const result = await service.replyToComment(context().id, 'Thanks!', 'reply-key');
+
+    expect(result).toMatchObject({
+      reply: { deliveryStatus: DeliveryStatus.PENDING },
+      replayed: true,
+      platform: SocialPlatform.INSTAGRAM,
+    });
+    expect(replySpy).not.toHaveBeenCalled();
+    expect(repository.createPendingReply).not.toHaveBeenCalled();
+  });
+
   it('returns a successful idempotent replay without a provider call', async () => {
     const replySpy = jest.spyOn(instagram, 'replyToComment');
     repository.findByIdempotencyKey.mockResolvedValue(
@@ -173,11 +202,30 @@ describe('CommentsService', () => {
       ),
     ).rejects.toMatchObject({
       code: 'PLATFORM_UNAVAILABLE',
-      metadata: { replyId: record().id, retryable: true },
+      metadata: { replyId: record().id, retryable: false },
     });
     expect(repository.markReplyFailed).toHaveBeenCalledWith(record().id, {
       code: 'PLATFORM_UNAVAILABLE',
     });
+  });
+
+  it('does not advertise a retry path for an existing failed reply', async () => {
+    const replySpy = jest.spyOn(instagram, 'replyToComment');
+    repository.findByIdempotencyKey.mockResolvedValue(
+      record({
+        deliveryStatus: DeliveryStatus.FAILED,
+        providerErrorCode: 'PLATFORM_UNAVAILABLE',
+      }),
+    );
+
+    await expect(
+      service.replyToComment(context().id, 'Thanks!', 'reply-key'),
+    ).rejects.toMatchObject({
+      code: 'PLATFORM_UNAVAILABLE',
+      metadata: { replyId: record().id, retryable: false },
+    });
+    expect(replySpy).not.toHaveBeenCalled();
+    expect(repository.createPendingReply).not.toHaveBeenCalled();
   });
 
   it('maps an unknown provider exception to a safe unavailable error', async () => {

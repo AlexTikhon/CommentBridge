@@ -1,6 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
-import type { SafeProviderError } from '../../platforms/domain/platform.types';
+import type {
+  PlatformCommentResult,
+  SafeProviderError,
+} from '../../platforms/domain/platform.types';
 import { ApplicationError, ProviderAdapterError } from '../domain/comment.errors';
 import {
   DeliveryStatus,
@@ -93,22 +96,15 @@ export class CommentsService {
       );
     }
 
+    let providerResult: PlatformCommentResult;
     try {
-      const providerResult = await adapter.replyToComment({
+      providerResult = await adapter.replyToComment({
         publicationExternalId: parent.publication.externalPostId,
         parentExternalCommentId: parent.externalCommentId,
         accountExternalId: parent.publication.socialAccount.externalAccountId,
         message,
         idempotencyKey,
       });
-      return {
-        reply: await this.repository.markReplySent(
-          pendingResult.reply.id,
-          providerResult,
-        ),
-        replayed: false,
-        platform: parent.publication.socialAccount.platform,
-      };
     } catch (error: unknown) {
       const safeError: SafeProviderError = {
         code:
@@ -122,10 +118,24 @@ export class CommentsService {
         'The reply could not be delivered to the social platform.',
         {
           replyId: pendingResult.reply.id,
-          retryable: error instanceof ProviderAdapterError ? error.retryable : true,
+          // This synchronous API has no safe retry path yet. Retrying with a new
+          // key could duplicate an ambiguously accepted provider request.
+          retryable: false,
         },
       );
     }
+
+    // Keep persistence outside the provider error boundary. If this update fails
+    // after the provider accepted the reply, the durable PENDING row truthfully
+    // represents an operation that must be reconciled; it must not become FAILED.
+    return {
+      reply: await this.repository.markReplySent(
+        pendingResult.reply.id,
+        providerResult,
+      ),
+      replayed: false,
+      platform: parent.publication.socialAccount.platform,
+    };
   }
 
   private validateBaseInput(message: string, idempotencyKey: string): void {
@@ -165,15 +175,11 @@ export class CommentsService {
       throw new ApplicationError(
         code,
         'The earlier reply attempt failed at the social platform.',
-        { replyId: existing.id, retryable: true },
+        { replyId: existing.id, retryable: false },
       );
     }
     if (existing.deliveryStatus === DeliveryStatus.PENDING) {
-      throw new ApplicationError(
-        'IDEMPOTENCY_CONFLICT',
-        'A reply with this idempotency key is still pending.',
-        { replyId: existing.id, retryable: true },
-      );
+      return { reply: existing, replayed: true, platform };
     }
     return { reply: existing, replayed: true, platform };
   }

@@ -142,13 +142,16 @@ same pair. The same key and normalized message on the same parent returns the
 stored reply without calling the provider again; a different message returns
 `409`. The same key can be used independently on another parent. The unique index
 closes concurrent-create races, so only the winning request calls the adapter. A
-concurrent duplicate request may receive `409` while the original reply is still
-pending. After successful delivery, the same request is returned as an idempotent
-`200` replay.
+concurrent duplicate request receives the existing `PENDING` reply with `202`.
+After successful delivery, the same request is returned as an idempotent `200`
+replay.
 
 This is local at-most-one provider call during normal process execution, not a
 claim of distributed exactly-once delivery. A crash after provider acceptance but
-before `SENT` is stored can leave an ambiguous `PENDING` record.
+before `SENT` is stored can leave an ambiguous `PENDING` record. A persistence
+failure after provider acceptance is not misclassified as a provider failure and
+does not transition that row to `FAILED`; it remains available for future
+reconciliation.
 
 ## Pagination
 

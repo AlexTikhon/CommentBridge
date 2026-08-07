@@ -169,7 +169,10 @@ describe('comments persistence integration', () => {
       'concurrent-key',
     );
 
-    await expect(second).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(second).resolves.toMatchObject({
+      reply: { deliveryStatus: DomainDeliveryStatus.PENDING },
+      replayed: true,
+    });
     releaseProvider();
     await expect(first).resolves.toMatchObject({ replayed: false });
     expect(instagramReplySpy).toHaveBeenCalledTimes(1);

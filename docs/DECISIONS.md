@@ -70,6 +70,13 @@ transaction, then stores `SENT` or `FAILED`. Only a safe provider code is persis
 on failure. This is compact for the assignment but leaves an ambiguous crash
 window after provider acceptance and before the local success update.
 
+The provider call and the `SENT` persistence update use separate error boundaries.
+If the provider succeeds but persistence fails, the reply remains `PENDING`; it is
+never falsely marked `FAILED`. An identical request that encounters `PENDING`
+receives the stored operation with HTTP `202` and does not call the provider again.
+Until a worker-based retry path exists, failed delivery responses advertise
+`retryable: false`.
+
 An outbox, worker, retries, and reconciliation are possible production evolution,
 not implemented features.
 

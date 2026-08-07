@@ -1,7 +1,7 @@
 import { ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
-import type { PrismaClient } from '@prisma/client';
+import { CommentDirection, DeliveryStatus, type PrismaClient } from '@prisma/client';
 import * as request from 'supertest';
 import { AppModule } from '../../src/app.module';
 import { ProblemDetailsFilter } from '../../src/common/errors/problem-details.filter';
@@ -101,6 +101,37 @@ describe('comments API (e2e)', () => {
     expect(instagramReplySpy).toHaveBeenCalledTimes(1);
   });
 
+  it('returns 202 for an existing pending reply without another provider call', async () => {
+    const pending = await prisma.comment.create({
+      data: {
+        postPublicationId: SEED_IDS.instagramPublication,
+        parentId: SEED_IDS.instagramComment,
+        direction: CommentDirection.OUTBOUND,
+        deliveryStatus: DeliveryStatus.PENDING,
+        idempotencyKey: 'e2e-pending',
+        authorDisplayName: 'Demo Brand',
+        body: 'Pending reply',
+      },
+    });
+
+    const response = await request(app.getHttpServer())
+      .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
+      .set('Idempotency-Key', 'e2e-pending')
+      .send({ message: 'Pending reply' })
+      .expect(202);
+
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        reply: expect.objectContaining({
+          id: pending.id,
+          deliveryStatus: 'PENDING',
+        }),
+        replayed: true,
+      }),
+    );
+    expect(instagramReplySpy).not.toHaveBeenCalled();
+  });
+
   it('allows the same idempotency key on another parent comment', async () => {
     const first = await request(app.getHttpServer())
       .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
@@ -146,7 +177,7 @@ describe('comments API (e2e)', () => {
       expect.objectContaining({
         code: 'PLATFORM_UNAVAILABLE',
         replyId: expect.any(String),
-        retryable: true,
+        retryable: false,
         requestId: expect.any(String),
       }),
     );
