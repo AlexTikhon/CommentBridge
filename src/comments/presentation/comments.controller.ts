@@ -15,7 +15,6 @@ import {
   ApiBadRequestResponse,
   ApiAcceptedResponse,
   ApiConflictResponse,
-  ApiCreatedResponse,
   ApiHeader,
   ApiNotFoundResponse,
   ApiOkResponse,
@@ -67,11 +66,10 @@ export class CommentsController {
     required: true,
     description: 'Client-generated key, unique for this parent comment.',
   })
-  @ApiCreatedResponse({ type: ReplyResponseDto, description: 'New reply delivered.' })
   @ApiOkResponse({ type: ReplyResponseDto, description: 'Existing reply replayed.' })
   @ApiAcceptedResponse({
     type: ReplyResponseDto,
-    description: 'An existing reply is still pending delivery reconciliation.',
+    description: 'The reply is durably queued or is already pending delivery.',
   })
   @ApiBadRequestResponse({ type: ProblemDetailsDto })
   @ApiNotFoundResponse({ type: ProblemDetailsDto })
@@ -92,9 +90,7 @@ export class CommentsController {
     response.status(
       result.reply.deliveryStatus === DeliveryStatus.PENDING
         ? HttpStatus.ACCEPTED
-        : result.replayed
-          ? HttpStatus.OK
-          : HttpStatus.CREATED,
+        : HttpStatus.OK,
     );
     return {
       reply: this.toResponse({

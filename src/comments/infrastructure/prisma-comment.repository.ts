@@ -22,10 +22,6 @@ import {
   type CursorPage,
   type ListCommentsInput,
 } from '../domain/comment.types';
-import type {
-  PlatformCommentResult,
-  SafeProviderError,
-} from '../../platforms/domain/platform.types';
 
 interface CommentRow {
   id: string;
@@ -170,18 +166,21 @@ export class PrismaCommentRepository implements CommentRepository {
     input: CreatePendingReplyInput,
   ): Promise<CreatePendingReplyResult> {
     try {
-      const reply = await this.prisma.comment.create({
-        data: {
-          postPublicationId: input.publicationId,
-          parentId: input.parentId,
-          idempotencyKey: input.idempotencyKey,
-          body: input.body,
-          authorExternalId: input.authorExternalId,
-          authorDisplayName: input.authorDisplayName,
-          direction: PrismaCommentDirection.OUTBOUND,
-          deliveryStatus: PrismaDeliveryStatus.PENDING,
-        },
-      });
+      const reply = await this.prisma.$transaction(async (transaction) =>
+        transaction.comment.create({
+          data: {
+            postPublicationId: input.publicationId,
+            parentId: input.parentId,
+            idempotencyKey: input.idempotencyKey,
+            body: input.body,
+            authorExternalId: input.authorExternalId,
+            authorDisplayName: input.authorDisplayName,
+            direction: PrismaCommentDirection.OUTBOUND,
+            deliveryStatus: PrismaDeliveryStatus.PENDING,
+            delivery: { create: {} },
+          },
+        }),
+      );
       return { reply: this.toRecord(reply), created: true };
     } catch (error: unknown) {
       if (
@@ -196,35 +195,6 @@ export class PrismaCommentRepository implements CommentRepository {
       }
       throw error;
     }
-  }
-
-  async markReplySent(
-    id: string,
-    result: PlatformCommentResult,
-  ): Promise<CommentRecord> {
-    return this.toRecord(
-      await this.prisma.comment.update({
-        where: { id },
-        data: {
-          deliveryStatus: PrismaDeliveryStatus.SENT,
-          externalCommentId: result.externalCommentId,
-          remoteCreatedAt: result.remoteCreatedAt,
-          providerErrorCode: null,
-        },
-      }),
-    );
-  }
-
-  async markReplyFailed(id: string, error: SafeProviderError): Promise<CommentRecord> {
-    return this.toRecord(
-      await this.prisma.comment.update({
-        where: { id },
-        data: {
-          deliveryStatus: PrismaDeliveryStatus.FAILED,
-          providerErrorCode: error.code,
-        },
-      }),
-    );
   }
 
   private rowToRecord(row: CommentRow): CommentRecord {

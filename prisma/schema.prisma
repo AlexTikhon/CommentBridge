@@ -30,6 +30,23 @@ enum DeliveryStatus {
   FAILED
 }
 
+enum ReplyDeliveryStatus {
+  PENDING
+  PROCESSING
+  RETRY
+  SUCCEEDED
+  FAILED
+  UNKNOWN
+}
+
+enum ReplyDeliveryAttemptStatus {
+  PROCESSING
+  SUCCEEDED
+  RETRYABLE_FAILURE
+  TERMINAL_FAILURE
+  UNKNOWN
+}
+
 model SocialAccount {
   id                String            @id @default(uuid()) @db.Uuid
   platform          SocialPlatform
@@ -68,24 +85,56 @@ model PostPublication {
 }
 
 model Comment {
-  id                  String           @id @default(uuid()) @db.Uuid
-  postPublicationId   String           @db.Uuid
-  parentId            String?          @db.Uuid
-  externalCommentId   String?
-  direction           CommentDirection
-  deliveryStatus      DeliveryStatus
-  idempotencyKey      String?
-  authorExternalId    String?
-  authorDisplayName   String
-  body                String
-  providerErrorCode   String?
-  remoteCreatedAt     DateTime?        @db.Timestamptz(3)
-  createdAt           DateTime         @default(now()) @db.Timestamptz(3)
-  updatedAt           DateTime         @updatedAt @db.Timestamptz(3)
-  postPublication     PostPublication  @relation(fields: [postPublicationId], references: [id], onDelete: Cascade)
-  parent              Comment?         @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Restrict)
-  replies             Comment[]        @relation("CommentReplies")
+  id                String           @id @default(uuid()) @db.Uuid
+  postPublicationId String           @db.Uuid
+  parentId          String?          @db.Uuid
+  externalCommentId String?
+  direction         CommentDirection
+  deliveryStatus    DeliveryStatus
+  idempotencyKey    String?
+  authorExternalId  String?
+  authorDisplayName String
+  body              String
+  providerErrorCode String?
+  remoteCreatedAt   DateTime?        @db.Timestamptz(3)
+  createdAt         DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime         @updatedAt @db.Timestamptz(3)
+  postPublication   PostPublication  @relation(fields: [postPublicationId], references: [id], onDelete: Cascade)
+  parent            Comment?         @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Restrict)
+  replies           Comment[]        @relation("CommentReplies")
+  delivery          ReplyDelivery?
 
   @@unique([postPublicationId, externalCommentId])
   @@unique([parentId, idempotencyKey])
+}
+
+model ReplyDelivery {
+  id            String                 @id @default(uuid()) @db.Uuid
+  replyId       String                 @unique @db.Uuid
+  status        ReplyDeliveryStatus    @default(PENDING)
+  attemptCount  Int                    @default(0)
+  nextAttemptAt DateTime               @default(now()) @db.Timestamptz(3)
+  leaseUntil    DateTime?              @db.Timestamptz(3)
+  lastErrorCode String?
+  createdAt     DateTime               @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime               @updatedAt @db.Timestamptz(3)
+  reply         Comment                @relation(fields: [replyId], references: [id], onDelete: Cascade)
+  attempts      ReplyDeliveryAttempt[]
+
+  @@index([status, nextAttemptAt, id])
+  @@index([status, leaseUntil])
+}
+
+model ReplyDeliveryAttempt {
+  id            String                     @id @default(uuid()) @db.Uuid
+  deliveryId    String                     @db.Uuid
+  attemptNumber Int
+  status        ReplyDeliveryAttemptStatus @default(PROCESSING)
+  errorCode     String?
+  startedAt     DateTime                   @default(now()) @db.Timestamptz(3)
+  finishedAt    DateTime?                  @db.Timestamptz(3)
+  delivery      ReplyDelivery              @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  @@unique([deliveryId, attemptNumber])
+  @@index([status, startedAt])
 }

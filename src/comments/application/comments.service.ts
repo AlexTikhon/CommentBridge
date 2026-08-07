@@ -1,10 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
-import type {
-  PlatformCommentResult,
-  SafeProviderError,
-} from '../../platforms/domain/platform.types';
-import { ApplicationError, ProviderAdapterError } from '../domain/comment.errors';
+import { ApplicationError } from '../domain/comment.errors';
 import {
   DeliveryStatus,
   PublicationStatus,
@@ -96,43 +92,8 @@ export class CommentsService {
       );
     }
 
-    let providerResult: PlatformCommentResult;
-    try {
-      providerResult = await adapter.replyToComment({
-        publicationExternalId: parent.publication.externalPostId,
-        parentExternalCommentId: parent.externalCommentId,
-        accountExternalId: parent.publication.socialAccount.externalAccountId,
-        message,
-        idempotencyKey,
-      });
-    } catch (error: unknown) {
-      const safeError: SafeProviderError = {
-        code:
-          error instanceof ProviderAdapterError
-            ? error.safeCode
-            : 'PLATFORM_UNAVAILABLE',
-      };
-      await this.repository.markReplyFailed(pendingResult.reply.id, safeError);
-      throw new ApplicationError(
-        safeError.code,
-        'The reply could not be delivered to the social platform.',
-        {
-          replyId: pendingResult.reply.id,
-          // This synchronous API has no safe retry path yet. Retrying with a new
-          // key could duplicate an ambiguously accepted provider request.
-          retryable: false,
-        },
-      );
-    }
-
-    // Keep persistence outside the provider error boundary. If this update fails
-    // after the provider accepted the reply, the durable PENDING row truthfully
-    // represents an operation that must be reconciled; it must not become FAILED.
     return {
-      reply: await this.repository.markReplySent(
-        pendingResult.reply.id,
-        providerResult,
-      ),
+      reply: pendingResult.reply,
       replayed: false,
       platform: parent.publication.socialAccount.platform,
     };

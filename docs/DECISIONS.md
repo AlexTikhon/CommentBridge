@@ -65,20 +65,23 @@ to implement counters or reset hooks.
 
 ## Outbound delivery lifecycle
 
-The application commits `PENDING`, calls the adapter without an open database
-transaction, then stores `SENT` or `FAILED`. Only a safe provider code is persisted
-on failure. This is compact for the assignment but leaves an ambiguous crash
-window after provider acceptance and before the local success update.
+Reply creation atomically inserts the normalized `PENDING` comment and its
+one-to-one `ReplyDelivery` job. The API returns `202` without calling a provider.
+Workers claim due jobs through `FOR UPDATE SKIP LOCKED`, increment the attempt
+number, and acquire a finite lease, so concurrent workers cannot deliver the same
+attempt.
 
-The provider call and the `SENT` persistence update use separate error boundaries.
-If the provider succeeds but persistence fails, the reply remains `PENDING`; it is
-never falsely marked `FAILED`. An identical request that encounters `PENDING`
-receives the stored operation with HTTP `202` and does not call the provider again.
-Until a worker-based retry path exists, failed delivery responses advertise
-`retryable: false`.
+Each provider call has a durable `ReplyDeliveryAttempt`. Explicitly retryable
+adapter errors schedule bounded exponential backoff and reuse the original
+idempotency key. Terminal errors move both job and comment to `FAILED`. Unknown
+exceptions and timeouts become `UNKNOWN` because provider acceptance may be
+ambiguous.
 
-An outbox, worker, retries, and reconciliation are possible production evolution,
-not implemented features.
+Provider calls and success persistence remain separate error boundaries. If the
+provider succeeds but the success transaction fails, the job stays `PROCESSING`.
+After its lease expires, reconciliation moves the job and open attempt to `UNKNOWN`
+instead of retrying blindly; the public comment remains `PENDING`. Provider-specific
+reconciliation can later resolve that quarantine to `SENT` or a safe retry.
 
 ## Error boundary and request IDs
 

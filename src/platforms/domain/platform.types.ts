@@ -10,6 +10,7 @@ export interface ReplyToPlatformCommentInput {
   accountExternalId: string;
   message: string;
   idempotencyKey: string;
+  signal?: AbortSignal;
 }
 
 export interface PlatformCommentResult {

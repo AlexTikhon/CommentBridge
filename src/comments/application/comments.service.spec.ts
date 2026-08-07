@@ -3,7 +3,6 @@ import { CommentsService } from './comments.service';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../platforms/infrastructure/mock-instagram.adapter';
 import { MockLinkedInAdapter } from '../../platforms/infrastructure/mock-linkedin.adapter';
-import { ApplicationError } from '../domain/comment.errors';
 import {
   CommentDirection,
   DeliveryStatus,
@@ -69,8 +68,6 @@ function repositoryMock(): jest.Mocked<CommentRepository> {
     findForPost: jest.fn(),
     findByIdempotencyKey: jest.fn(),
     createPendingReply: jest.fn(),
-    markReplySent: jest.fn(),
-    markReplyFailed: jest.fn(),
   };
 }
 
@@ -94,28 +91,9 @@ describe('CommentsService', () => {
       reply: record(),
       created: true,
     });
-    repository.markReplySent.mockImplementation((id, result) =>
-      Promise.resolve(
-        record({
-          id,
-          externalCommentId: result.externalCommentId,
-          remoteCreatedAt: result.remoteCreatedAt,
-          deliveryStatus: DeliveryStatus.SENT,
-        }),
-      ),
-    );
-    repository.markReplyFailed.mockImplementation((id, error) =>
-      Promise.resolve(
-        record({
-          id,
-          deliveryStatus: DeliveryStatus.FAILED,
-          providerErrorCode: error.code,
-        }),
-      ),
-    );
   });
 
-  it('creates, sends, and marks a successful reply', async () => {
+  it('durably queues a pending reply without calling the provider', async () => {
     const replySpy = jest.spyOn(instagram, 'replyToComment');
     const result = await service.replyToComment(
       context().id,
@@ -123,9 +101,9 @@ describe('CommentsService', () => {
       'reply-key',
     );
 
-    expect(result.reply.deliveryStatus).toBe(DeliveryStatus.SENT);
+    expect(result.reply.deliveryStatus).toBe(DeliveryStatus.PENDING);
     expect(result.replayed).toBe(false);
-    expect(replySpy).toHaveBeenCalledTimes(1);
+    expect(replySpy).not.toHaveBeenCalled();
     expect(repository.createPendingReply).toHaveBeenCalledWith(
       expect.objectContaining({
         publicationId: context().publication.id,
@@ -139,21 +117,6 @@ describe('CommentsService', () => {
       context().id,
       'reply-key',
     );
-    expect(repository.markReplySent).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not mark a provider-accepted reply as failed when persisting SENT fails', async () => {
-    const persistenceError = new Error('database write failed');
-    const replySpy = jest.spyOn(instagram, 'replyToComment');
-    repository.markReplySent.mockRejectedValue(persistenceError);
-
-    await expect(
-      service.replyToComment(context().id, 'Thanks!', 'reply-key'),
-    ).rejects.toBe(persistenceError);
-
-    expect(replySpy).toHaveBeenCalledTimes(1);
-    expect(repository.markReplySent).toHaveBeenCalledTimes(1);
-    expect(repository.markReplyFailed).not.toHaveBeenCalled();
   });
 
   it('returns an existing pending reply without another provider call', async () => {
@@ -193,22 +156,6 @@ describe('CommentsService', () => {
     ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
   });
 
-  it('persists a safe provider failure without retaining a raw error', async () => {
-    await expect(
-      service.replyToComment(
-        context().id,
-        '[test:provider-unavailable]',
-        'failure-key',
-      ),
-    ).rejects.toMatchObject({
-      code: 'PLATFORM_UNAVAILABLE',
-      metadata: { replyId: record().id, retryable: false },
-    });
-    expect(repository.markReplyFailed).toHaveBeenCalledWith(record().id, {
-      code: 'PLATFORM_UNAVAILABLE',
-    });
-  });
-
   it('does not advertise a retry path for an existing failed reply', async () => {
     const replySpy = jest.spyOn(instagram, 'replyToComment');
     repository.findByIdempotencyKey.mockResolvedValue(
@@ -226,24 +173,6 @@ describe('CommentsService', () => {
     });
     expect(replySpy).not.toHaveBeenCalled();
     expect(repository.createPendingReply).not.toHaveBeenCalled();
-  });
-
-  it('maps an unknown provider exception to a safe unavailable error', async () => {
-    jest
-      .spyOn(instagram, 'replyToComment')
-      .mockRejectedValue(new Error('raw provider body with a secret'));
-    let caught: unknown;
-    try {
-      await service.replyToComment(context().id, 'Thanks!', 'failure-key');
-    } catch (error: unknown) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(ApplicationError);
-    expect(caught).toMatchObject({
-      code: 'PLATFORM_UNAVAILABLE',
-      message: 'The reply could not be delivered to the social platform.',
-    });
-    expect(JSON.stringify(caught)).not.toContain('secret');
   });
 
   it('rejects a reply to an unpublished publication', async () => {
@@ -292,7 +221,7 @@ describe('CommentsService', () => {
       secondParent.id,
       'shared-key',
     );
-    expect(replySpy).toHaveBeenCalledTimes(2);
+    expect(replySpy).not.toHaveBeenCalled();
   });
 
   it('enforces platform-specific reply limits', async () => {

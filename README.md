@@ -14,8 +14,8 @@ deterministic Instagram and LinkedIn mocks.
 - Reads from `PUBLISHED` publications only, with platform and direct-parent
   filters and reply counts under the same visibility rule.
 - Parent-scoped idempotent replies with a database uniqueness constraint.
-- `PENDING` → `SENT`/`FAILED` outbound lifecycle; no provider call in a long
-  database transaction.
+- Durable `PENDING` delivery jobs, leased worker claims, attempt history, bounded
+  retries, and `UNKNOWN` quarantine for ambiguous outcomes.
 - Platform adapter registry with deterministic Instagram and LinkedIn mocks and
   platform-specific message limits.
 - RFC 7807-style errors, safe NestJS HTTP exception handling, validation details,
@@ -34,7 +34,9 @@ flowchart LR
   Client --> Controller[REST controller]
   Controller --> Service[CommentsService]
   Service --> Repository[CommentRepository]
-  Service --> Registry[Adapter registry]
+  Repository --> Queue[(ReplyDelivery jobs)]
+  Worker[ReplyDeliveryWorker] --> Queue
+  Worker --> Registry[Adapter registry]
   Repository --> PostgreSQL[(PostgreSQL)]
   Registry --> Instagram[Instagram mock]
   Registry --> LinkedIn[LinkedIn mock]
@@ -101,7 +103,8 @@ curl -i -X POST \
   -d '{"message":"Thank you for your feedback!"}'
 ```
 
-A new reply returns `201`; an identical replay returns `200` and `replayed: true`.
+A new reply is durably queued and returns `202`. A replay remains `202` while
+delivery is pending and returns `200` after delivery reaches `SENT`.
 
 ## Database model
 
@@ -141,17 +144,17 @@ The database unique key is `(parentId, idempotencyKey)`, and every lookup uses t
 same pair. The same key and normalized message on the same parent returns the
 stored reply without calling the provider again; a different message returns
 `409`. The same key can be used independently on another parent. The unique index
-closes concurrent-create races, so only the winning request calls the adapter. A
+closes concurrent-create races, so only one durable delivery job is created. A
 concurrent duplicate request receives the existing `PENDING` reply with `202`.
 After successful delivery, the same request is returned as an idempotent `200`
 replay.
 
-This is local at-most-one provider call during normal process execution, not a
-claim of distributed exactly-once delivery. A crash after provider acceptance but
-before `SENT` is stored can leave an ambiguous `PENDING` record. A persistence
-failure after provider acceptance is not misclassified as a provider failure and
-does not transition that row to `FAILED`; it remains available for future
-reconciliation.
+The worker claims due jobs with `FOR UPDATE SKIP LOCKED` and a lease. Explicitly
+retryable provider failures use bounded exponential backoff and reuse the same
+provider idempotency key. Unknown exceptions, timeouts, expired leases, and a crash
+after provider acceptance are quarantined as delivery `UNKNOWN`; the public reply
+remains `PENDING` until reconciliation. They are never retried blindly. Exactly-once
+delivery still depends on provider-side idempotency and reconciliation support.
 
 ## Pagination
 
@@ -214,8 +217,9 @@ git diff --check
   in PostgreSQL as the normalized read model.
 - The API returns a bounded flat list rather than recursively expanding threads.
 - Mock adapters are deterministic and make no external requests.
-- Synchronous outbound delivery is concise and observable but has the crash window
-  described under idempotency. Failed rows are not retried automatically.
+- Outbound jobs are polled by an in-process worker. Production deployments can run
+  the same worker separately; set `DELIVERY_WORKER_ENABLED=false` on API-only
+  instances.
 - The application write path enforces parent/publication consistency; direct
   database writers must preserve it.
 
@@ -223,9 +227,10 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 
 ## Production evolution
 
-Not implemented: outbound delivery could evolve to a transactional outbox and
-retrying worker with provider idempotency and reconciliation. Inbound sync could
-add authenticated webhooks or polling. Tenant authorization, encrypted provider
+The durable delivery state machine is implemented. Production evolution should add
+provider-specific reconciliation for `UNKNOWN`, operational retry/dead-letter
+controls, and optionally separate worker deployment. Inbound sync could add
+authenticated webhooks or polling. Tenant authorization, encrypted provider
 credentials, throttling, observability, and retention policies should follow
 concrete operational requirements.
 

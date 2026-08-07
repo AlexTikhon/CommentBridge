@@ -5,10 +5,6 @@ import type {
   CursorPage,
   ListCommentsInput,
 } from '../../domain/comment.types';
-import type {
-  PlatformCommentResult,
-  SafeProviderError,
-} from '../../../platforms/domain/platform.types';
 
 export const COMMENT_REPOSITORY = Symbol('COMMENT_REPOSITORY');
 
@@ -35,6 +31,4 @@ export interface CommentRepository {
     idempotencyKey: string,
   ): Promise<CommentRecord | null>;
   createPendingReply(input: CreatePendingReplyInput): Promise<CreatePendingReplyResult>;
-  markReplySent(id: string, result: PlatformCommentResult): Promise<CommentRecord>;
-  markReplyFailed(id: string, error: SafeProviderError): Promise<CommentRecord>;
 }

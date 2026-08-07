@@ -4,6 +4,7 @@ import type { INestApplication } from '@nestjs/common';
 import { CommentDirection, DeliveryStatus, type PrismaClient } from '@prisma/client';
 import * as request from 'supertest';
 import { AppModule } from '../../src/app.module';
+import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
 import { ProblemDetailsFilter } from '../../src/common/errors/problem-details.filter';
 import { PrismaService } from '../../src/database/prisma.service';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
@@ -14,6 +15,7 @@ describe('comments API (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaClient;
   let instagram: MockInstagramAdapter;
+  let worker: ReplyDeliveryWorker;
   let instagramReplySpy: jest.SpiedFunction<MockInstagramAdapter['replyToComment']>;
 
   beforeAll(async () => {
@@ -32,6 +34,7 @@ describe('comments API (e2e)', () => {
     await app.init();
     prisma = moduleRef.get(PrismaService);
     instagram = moduleRef.get(MockInstagramAdapter);
+    worker = moduleRef.get(ReplyDeliveryWorker);
     instagramReplySpy = jest.spyOn(instagram, 'replyToComment');
   });
 
@@ -75,26 +78,32 @@ describe('comments API (e2e)', () => {
     expect(response.body.items).toHaveLength(4);
   });
 
-  it('creates a reply with 201 and replays it with 200', async () => {
+  it('accepts a durable reply with 202, delivers it, and replays it with 200', async () => {
     const path = `/api/v1/comments/${SEED_IDS.instagramComment}/replies`;
     const first = await request(app.getHttpServer())
       .post(path)
       .set('Idempotency-Key', 'e2e-success')
       .send({ message: 'E2E thanks' })
-      .expect(201);
+      .expect(202);
+    expect(first.body.reply.deliveryStatus).toBe('PENDING');
+    expect(instagramReplySpy).not.toHaveBeenCalled();
+
+    await worker.processNext(new Date('2100-01-01T00:00:00.000Z'));
+
     const replay = await request(app.getHttpServer())
       .post(path)
       .set('Idempotency-Key', 'e2e-success')
       .send({ message: 'E2E thanks' })
       .expect(200);
 
-    expect(first.body.reply.deliveryStatus).toBe('SENT');
+    expect(replay.body.reply.deliveryStatus).toBe('SENT');
     expect(first.body.reply.author).toEqual({
       externalId: 'mock-instagram-account-1',
       displayName: 'Demo Brand Instagram',
     });
     expect(first.body.reply.createdAt).toEqual(expect.any(String));
-    expect(first.body.reply.remoteCreatedAt).toBe('2026-08-05T12:00:00.000Z');
+    expect(first.body.reply.remoteCreatedAt).toBeNull();
+    expect(replay.body.reply.remoteCreatedAt).toBe('2026-08-05T12:00:00.000Z');
     expect(first.body.reply.publishedAt).toBeUndefined();
     expect(replay.body.reply.id).toBe(first.body.reply.id);
     expect(replay.body.replayed).toBe(true);
@@ -137,15 +146,15 @@ describe('comments API (e2e)', () => {
       .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
       .set('Idempotency-Key', 'e2e-shared-parent-key')
       .send({ message: 'First parent' })
-      .expect(201);
+      .expect(202);
     const second = await request(app.getHttpServer())
       .post(`/api/v1/comments/${SEED_IDS.instagramSecondComment}/replies`)
       .set('Idempotency-Key', 'e2e-shared-parent-key')
       .send({ message: 'Second parent' })
-      .expect(201);
+      .expect(202);
 
     expect(second.body.reply.id).not.toBe(first.body.reply.id);
-    expect(instagramReplySpy).toHaveBeenCalledTimes(2);
+    expect(instagramReplySpy).not.toHaveBeenCalled();
   });
 
   it('returns 409 when a same-parent idempotency key has a different message', async () => {
@@ -154,7 +163,7 @@ describe('comments API (e2e)', () => {
       .post(path)
       .set('Idempotency-Key', 'e2e-conflict')
       .send({ message: 'Original' })
-      .expect(201);
+      .expect(202);
     const response = await request(app.getHttpServer())
       .post(path)
       .set('Idempotency-Key', 'e2e-conflict')
@@ -162,27 +171,31 @@ describe('comments API (e2e)', () => {
       .expect(409);
 
     expect(response.body.code).toBe('IDEMPOTENCY_CONFLICT');
-    expect(instagramReplySpy).toHaveBeenCalledTimes(1);
+    expect(instagramReplySpy).not.toHaveBeenCalled();
   });
 
-  it('returns safe problem details and persists a failed provider reply', async () => {
+  it('retries a provider failure asynchronously and records safe terminal state', async () => {
     const response = await request(app.getHttpServer())
       .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
       .set('Idempotency-Key', 'e2e-failure')
       .send({ message: '[test:provider-unavailable]' })
-      .expect(502);
+      .expect(202);
 
-    expect(response.headers['content-type']).toMatch(/application\/problem\+json/);
-    expect(response.body).toEqual(
-      expect.objectContaining({
-        code: 'PLATFORM_UNAVAILABLE',
-        replyId: expect.any(String),
-        retryable: false,
-        requestId: expect.any(String),
-      }),
-    );
-    expect(response.headers['x-request-id']).toBe(response.body.requestId);
-    expect(JSON.stringify(response.body)).not.toContain('stack');
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await worker.processNext(
+        new Date(Date.parse('2100-01-01T00:00:00.000Z') + attempt * 86_400_000),
+      );
+    }
+
+    const stored = await prisma.comment.findUniqueOrThrow({
+      where: { id: response.body.reply.id as string },
+      include: { delivery: { include: { attempts: true } } },
+    });
+    expect(stored.deliveryStatus).toBe(DeliveryStatus.FAILED);
+    expect(stored.providerErrorCode).toBe('PLATFORM_UNAVAILABLE');
+    expect(stored.delivery?.attemptCount).toBe(5);
+    expect(stored.delivery?.attempts).toHaveLength(5);
+    expect(JSON.stringify(stored)).not.toContain('provider body');
   });
 
   it('rejects an empty message through global validation', async () => {

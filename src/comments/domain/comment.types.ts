@@ -76,3 +76,15 @@ export interface ReplyResult {
   replayed: boolean;
   platform: SocialPlatform;
 }
+
+export interface ReplyDeliveryWorkItem {
+  deliveryId: string;
+  replyId: string;
+  attemptNumber: number;
+  platform: SocialPlatform;
+  publicationExternalId: string;
+  parentExternalCommentId: string | null;
+  accountExternalId: string;
+  message: string;
+  idempotencyKey: string | null;
+}
