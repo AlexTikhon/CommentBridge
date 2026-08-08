@@ -48,17 +48,6 @@ describe('comments persistence integration', () => {
   afterAll(async () => prisma.$disconnect());
 
   it('retrieves publications, filters by platform and parent, and counts replies', async () => {
-    await prisma.comment.create({
-      data: {
-        postPublicationId: SEED_IDS.draftPublication,
-        parentId: SEED_IDS.instagramComment,
-        direction: CommentDirection.OUTBOUND,
-        deliveryStatus: DeliveryStatus.SENT,
-        idempotencyKey: 'cross-publication-count',
-        authorDisplayName: 'Direct database writer',
-        body: 'Must not affect a published publication reply count.',
-      },
-    });
     const all = await service.listComments({ postId: SEED_IDS.post, limit: 20 });
     expect(new Set(all.items.map((item) => item.platform))).toEqual(
       new Set([SocialPlatform.INSTAGRAM, SocialPlatform.LINKEDIN]),
@@ -287,6 +276,7 @@ describe('comments persistence integration', () => {
       deliveryStatus: DeliveryStatus.SENT,
       authorDisplayName: 'Demo Brand',
       body: 'Constraint test',
+      remoteCreatedAt: new Date('2026-08-08T10:00:00.000Z'),
     } as const;
     await prisma.comment.create({
       data: {
@@ -313,5 +303,56 @@ describe('comments persistence integration', () => {
         },
       }),
     ).rejects.toBeInstanceOf(Prisma.PrismaClientKnownRequestError);
+  });
+
+  it('rejects cross-publication parent relationships at the database boundary', async () => {
+    await expect(
+      prisma.comment.create({
+        data: {
+          postPublicationId: SEED_IDS.draftPublication,
+          parentId: SEED_IDS.instagramComment,
+          direction: CommentDirection.OUTBOUND,
+          deliveryStatus: DeliveryStatus.PENDING,
+          idempotencyKey: 'cross-publication-reply',
+          authorDisplayName: 'Direct database writer',
+          body: 'Must be rejected by the composite foreign key.',
+        },
+      }),
+    ).rejects.toBeInstanceOf(Prisma.PrismaClientKnownRequestError);
+  });
+
+  it('rejects inconsistent comment lifecycle fields and publication timestamps', async () => {
+    await expect(
+      prisma.comment.create({
+        data: {
+          postPublicationId: SEED_IDS.instagramPublication,
+          direction: CommentDirection.INBOUND,
+          deliveryStatus: DeliveryStatus.RECEIVED,
+          authorDisplayName: 'Missing provider identity',
+          body: 'Invalid inbound row',
+        },
+      }),
+    ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
+
+    await expect(
+      prisma.comment.create({
+        data: {
+          postPublicationId: SEED_IDS.instagramPublication,
+          parentId: SEED_IDS.instagramComment,
+          direction: CommentDirection.OUTBOUND,
+          deliveryStatus: DeliveryStatus.SENT,
+          idempotencyKey: 'sent-without-provider-fields',
+          authorDisplayName: 'Invalid sender',
+          body: 'Invalid sent row',
+        },
+      }),
+    ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
+
+    await expect(
+      prisma.postPublication.update({
+        where: { id: SEED_IDS.instagramPublication },
+        data: { publishedAt: null },
+      }),
+    ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
   });
 });

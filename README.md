@@ -115,10 +115,11 @@ outbound replies share `Comment`; `parentId` links a reply to its direct parent.
 PostgreSQL constraints enforce account/publication uniqueness, external-comment
 uniqueness per publication, reply idempotency per parent, valid direction/delivery
 combinations, and a parent for every outbound reply. The application always
-derives a reply's `postPublicationId` from the loaded parent. Direct database
-writers must also preserve the same-parent/same-publication invariant because
-Prisma cannot express that cross-row relationship without a more complex composite
-foreign key.
+derives a reply's `postPublicationId` from the loaded parent, while a composite
+foreign key on `(parentId, postPublicationId)` prevents every database writer from
+linking comments across publications. Additional checks require provider identity
+for inbound and sent comments and keep publication status aligned with
+`publishedAt`.
 
 Reads order by `COALESCE(remoteCreatedAt, createdAt), id`. Matching SQL expression
 indexes live in migrations because Prisma cannot represent them; required
@@ -220,8 +221,8 @@ git diff --check
 - Outbound jobs are polled by an in-process worker. Production deployments can run
   the same worker separately; set `DELIVERY_WORKER_ENABLED=false` on API-only
   instances.
-- The application write path enforces parent/publication consistency; direct
-  database writers must preserve it.
+- Parent/publication consistency and delivery-field invariants are enforced by
+  PostgreSQL as well as the application workflow.
 
 See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 

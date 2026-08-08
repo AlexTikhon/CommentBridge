@@ -8,9 +8,7 @@ This keeps platform delivery state out of the logical content model and supports
 one post across several platforms.
 
 Comment reads join publications and explicitly require `PUBLISHED`. Platform and
-parent filters, pagination, and reply counts operate inside that visibility rule;
-a direct database row that violates the application parent/publication invariant
-cannot inflate a published comment's reply count.
+parent filters, pagination, and reply counts operate inside that visibility rule.
 
 ## One normalized comment table
 
@@ -26,14 +24,17 @@ remote publication time.
 
 ## Parent/publication invariant
 
-CommentBridge uses the small-application option: reply creation loads the parent
-with its publication and derives the child's `postPublicationId` directly from
-that record. The old comparison between the joined comment field and joined
-publication ID was removed because it did not enforce a stronger invariant.
+Reply creation loads the parent with its publication and derives the child's
+`postPublicationId` directly from that record. PostgreSQL independently enforces
+the same rule through a composite foreign key from
+`(parentId, postPublicationId)` to `(id, postPublicationId)`. Root comments remain
+valid because nullable `parentId` bypasses the self-reference, while no writer can
+link a reply to a parent from another publication.
 
-A composite database foreign key could enforce this for arbitrary external SQL
-writers, but it would add schema complexity without improving the application's
-single write path. Direct database writers must preserve the invariant.
+Migration preflight checks fail before changing constraints if historical rows
+violate the relationship. Additional validated checks require external identity
+for inbound comments, coherent provider fields for each outbound lifecycle state,
+and agreement between publication status and `publishedAt`.
 
 ## Parent-scoped idempotency
 

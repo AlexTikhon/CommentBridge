@@ -100,12 +100,13 @@ model Comment {
   createdAt         DateTime         @default(now()) @db.Timestamptz(3)
   updatedAt         DateTime         @updatedAt @db.Timestamptz(3)
   postPublication   PostPublication  @relation(fields: [postPublicationId], references: [id], onDelete: Cascade)
-  parent            Comment?         @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Restrict)
+  parent            Comment?         @relation("CommentReplies", fields: [parentId, postPublicationId], references: [id, postPublicationId], onDelete: Restrict)
   replies           Comment[]        @relation("CommentReplies")
   delivery          ReplyDelivery?
 
   @@unique([postPublicationId, externalCommentId])
   @@unique([parentId, idempotencyKey])
+  @@unique([id, postPublicationId])
 }
 
 model ReplyDelivery {
