@@ -87,6 +87,13 @@ using the original idempotency context. A found reply completes the original att
 only authoritative absence schedules a bounded retry. Lookup errors remain UNKNOWN
 with backoff, so an inconclusive reconciliation never causes duplicate delivery.
 
+The operational API exposes current delivery state and at most the 20 most recent
+attempts. Manual retry is a database-conditional `FAILED` to `RETRY` transition in
+the same transaction that changes the public comment from `FAILED` to `PENDING`.
+The attempt counter and history remain monotonic. Competing retry requests cannot
+both succeed, and `UNKNOWN` is deliberately excluded so operators cannot bypass
+provider reconciliation.
+
 ## Error boundary and request IDs
 
 Custom application errors retain explicit RFC 7807-style mappings. General NestJS

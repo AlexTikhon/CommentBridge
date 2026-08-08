@@ -1,9 +1,15 @@
 import type { PlatformCommentResult } from '../../../platforms/domain/platform.types';
-import type { ReplyDeliveryWorkItem } from '../../domain/comment.types';
+import type {
+  ReplyDeliveryView,
+  ReplyDeliveryWorkItem,
+  RetryFailedDeliveryResult,
+} from '../../domain/comment.types';
 
 export const REPLY_DELIVERY_REPOSITORY = Symbol('REPLY_DELIVERY_REPOSITORY');
 
 export interface ReplyDeliveryRepository {
+  findByReplyId(replyId: string): Promise<ReplyDeliveryView | null>;
+  retryFailed(replyId: string, now: Date): Promise<RetryFailedDeliveryResult>;
   claimNext(now: Date, leaseUntil: Date): Promise<ReplyDeliveryWorkItem | null>;
   claimUnknown(now: Date, leaseUntil: Date): Promise<ReplyDeliveryWorkItem | null>;
   markSucceeded(

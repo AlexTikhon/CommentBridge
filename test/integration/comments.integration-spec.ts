@@ -7,6 +7,7 @@ import {
   ReplyDeliveryStatus,
 } from '@prisma/client';
 import { CommentsService } from '../../src/comments/application/comments.service';
+import { ReplyDeliveriesService } from '../../src/comments/application/reply-deliveries.service';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
 import {
   DeliveryStatus as DomainDeliveryStatus,
@@ -32,6 +33,7 @@ describe('comments persistence integration', () => {
   let deliverWithInstagram: MockInstagramAdapter['replyToComment'];
   let instagramReplySpy: jest.SpiedFunction<MockInstagramAdapter['replyToComment']>;
   let service: CommentsService;
+  let deliveries: ReplyDeliveriesService;
   let worker: ReplyDeliveryWorker;
 
   beforeAll(async () => prisma.$connect());
@@ -45,6 +47,7 @@ describe('comments persistence integration', () => {
       new MockLinkedInAdapter(),
     ]);
     service = new CommentsService(repository, adapters);
+    deliveries = new ReplyDeliveriesService(deliveryRepository);
     worker = new ReplyDeliveryWorker(deliveryRepository, adapters);
   });
   afterAll(async () => prisma.$disconnect());
@@ -264,6 +267,83 @@ describe('comments persistence integration', () => {
         status: ReplyDeliveryAttemptStatus.SUCCEEDED,
       }),
     ]);
+    expect(instagramReplySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads delivery history and conditionally schedules one concurrent retry', async () => {
+    const accepted = await service.replyToComment(
+      SEED_IDS.instagramComment,
+      'Manual recovery',
+      'integration-manual-retry',
+    );
+    await prisma.$transaction([
+      prisma.comment.update({
+        where: { id: accepted.reply.id },
+        data: {
+          deliveryStatus: DeliveryStatus.FAILED,
+          providerErrorCode: 'PLATFORM_UNAVAILABLE',
+        },
+      }),
+      prisma.replyDelivery.update({
+        where: { replyId: accepted.reply.id },
+        data: {
+          status: ReplyDeliveryStatus.FAILED,
+          attemptCount: 1,
+          lastErrorCode: 'PLATFORM_UNAVAILABLE',
+          attempts: {
+            create: {
+              attemptNumber: 1,
+              status: ReplyDeliveryAttemptStatus.TERMINAL_FAILURE,
+              errorCode: 'PLATFORM_UNAVAILABLE',
+              finishedAt: workerNow,
+            },
+          },
+        },
+      }),
+    ]);
+
+    await expect(deliveries.getStatus(accepted.reply.id)).resolves.toMatchObject({
+      replyId: accepted.reply.id,
+      status: ReplyDeliveryStatus.FAILED,
+      attemptCount: 1,
+      attempts: [
+        expect.objectContaining({
+          attemptNumber: 1,
+          status: ReplyDeliveryAttemptStatus.TERMINAL_FAILURE,
+        }),
+      ],
+    });
+
+    const retryAt = new Date(workerNow.getTime() + 5_000);
+    const results = await Promise.all([
+      deliveryRepository.retryFailed(accepted.reply.id, retryAt),
+      deliveryRepository.retryFailed(accepted.reply.id, retryAt),
+    ]);
+    expect(results.map((result) => result.outcome).sort()).toEqual([
+      'INVALID_STATE',
+      'RETRIED',
+    ]);
+
+    const queued = await prisma.comment.findUniqueOrThrow({
+      where: { id: accepted.reply.id },
+      include: { delivery: true },
+    });
+    expect(queued.deliveryStatus).toBe(DeliveryStatus.PENDING);
+    expect(queued.providerErrorCode).toBeNull();
+    expect(queued.delivery).toMatchObject({
+      status: ReplyDeliveryStatus.RETRY,
+      attemptCount: 1,
+      nextAttemptAt: retryAt,
+      lastErrorCode: null,
+    });
+
+    await worker.processNext(retryAt);
+    const delivered = await deliveries.getStatus(accepted.reply.id);
+    expect(delivered).toMatchObject({
+      status: ReplyDeliveryStatus.SUCCEEDED,
+      attemptCount: 2,
+    });
+    expect(delivered.attempts.map((attempt) => attempt.attemptNumber)).toEqual([2, 1]);
     expect(instagramReplySpy).toHaveBeenCalledTimes(1);
   });
 

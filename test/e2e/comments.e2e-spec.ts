@@ -2,6 +2,7 @@ import { ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
 import { CommentDirection, DeliveryStatus, type PrismaClient } from '@prisma/client';
+import { ReplyDeliveryAttemptStatus, ReplyDeliveryStatus } from '@prisma/client';
 import * as request from 'supertest';
 import { AppModule } from '../../src/app.module';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
@@ -196,6 +197,122 @@ describe('comments API (e2e)', () => {
     expect(stored.delivery?.attemptCount).toBe(5);
     expect(stored.delivery?.attempts).toHaveLength(5);
     expect(JSON.stringify(stored)).not.toContain('provider body');
+  });
+
+  it('reports delivery status and accepts only one concurrent manual retry', async () => {
+    const failed = await prisma.comment.create({
+      data: {
+        postPublicationId: SEED_IDS.instagramPublication,
+        parentId: SEED_IDS.instagramComment,
+        direction: CommentDirection.OUTBOUND,
+        deliveryStatus: DeliveryStatus.FAILED,
+        idempotencyKey: 'e2e-manual-retry',
+        authorDisplayName: 'Demo Brand',
+        body: 'Recover this reply',
+        providerErrorCode: 'PLATFORM_UNAVAILABLE',
+        delivery: {
+          create: {
+            status: ReplyDeliveryStatus.FAILED,
+            attemptCount: 1,
+            lastErrorCode: 'PLATFORM_UNAVAILABLE',
+            attempts: {
+              create: {
+                attemptNumber: 1,
+                status: ReplyDeliveryAttemptStatus.TERMINAL_FAILURE,
+                errorCode: 'PLATFORM_UNAVAILABLE',
+                finishedAt: new Date('2026-08-08T10:00:00.000Z'),
+              },
+            },
+          },
+        },
+      },
+    });
+    const deliveryPath = `/api/v1/replies/${failed.id}/delivery`;
+
+    const status = await request(app.getHttpServer()).get(deliveryPath).expect(200);
+    expect(status.body).toEqual(
+      expect.objectContaining({
+        replyId: failed.id,
+        status: 'FAILED',
+        attemptCount: 1,
+        lastErrorCode: 'PLATFORM_UNAVAILABLE',
+        attempts: [
+          expect.objectContaining({
+            attemptNumber: 1,
+            status: 'TERMINAL_FAILURE',
+          }),
+        ],
+      }),
+    );
+
+    const retries = await Promise.all([
+      request(app.getHttpServer()).post(`${deliveryPath}/retry`),
+      request(app.getHttpServer()).post(`${deliveryPath}/retry`),
+    ]);
+    expect(retries.map((response) => response.status).sort()).toEqual([202, 409]);
+    expect(retries.find((response) => response.status === 202)?.body).toMatchObject({
+      status: 'RETRY',
+      attemptCount: 1,
+      lastErrorCode: null,
+    });
+    expect(retries.find((response) => response.status === 409)?.body).toMatchObject({
+      code: 'DELIVERY_RETRY_NOT_ALLOWED',
+    });
+
+    await worker.processNext(new Date('2100-01-01T00:00:00.000Z'));
+    const delivered = await request(app.getHttpServer()).get(deliveryPath).expect(200);
+    expect(delivered.body).toMatchObject({
+      status: 'SUCCEEDED',
+      attemptCount: 2,
+      lastErrorCode: null,
+    });
+    const attempts = (delivered.body as { attempts: Array<{ attemptNumber: number }> })
+      .attempts;
+    expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([2, 1]);
+  });
+
+  it('does not allow manual retry to bypass UNKNOWN reconciliation', async () => {
+    const unknown = await prisma.comment.create({
+      data: {
+        postPublicationId: SEED_IDS.instagramPublication,
+        parentId: SEED_IDS.instagramComment,
+        direction: CommentDirection.OUTBOUND,
+        deliveryStatus: DeliveryStatus.PENDING,
+        idempotencyKey: 'e2e-unknown-retry',
+        authorDisplayName: 'Demo Brand',
+        body: 'Ambiguous delivery',
+        delivery: {
+          create: {
+            status: ReplyDeliveryStatus.UNKNOWN,
+            attemptCount: 1,
+            lastErrorCode: 'AMBIGUOUS_PROVIDER_RESULT',
+            attempts: {
+              create: {
+                attemptNumber: 1,
+                status: ReplyDeliveryAttemptStatus.UNKNOWN,
+                errorCode: 'AMBIGUOUS_PROVIDER_RESULT',
+                finishedAt: new Date('2026-08-08T10:00:00.000Z'),
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const response = await request(app.getHttpServer())
+      .post(`/api/v1/replies/${unknown.id}/delivery/retry`)
+      .expect(409);
+    expect(response.body).toMatchObject({
+      code: 'DELIVERY_RETRY_NOT_ALLOWED',
+      detail: 'UNKNOWN deliveries must be resolved through provider reconciliation.',
+    });
+  });
+
+  it('returns 404 for a missing reply delivery', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/api/v1/replies/99999999-9999-4999-8999-999999999999/delivery')
+      .expect(404);
+    expect(response.body.code).toBe('DELIVERY_NOT_FOUND');
   });
 
   it('rejects an empty message through global validation', async () => {

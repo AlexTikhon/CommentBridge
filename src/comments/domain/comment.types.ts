@@ -21,6 +21,23 @@ export enum DeliveryStatus {
   FAILED = 'FAILED',
 }
 
+export enum ReplyDeliveryStatus {
+  PENDING = 'PENDING',
+  PROCESSING = 'PROCESSING',
+  RETRY = 'RETRY',
+  SUCCEEDED = 'SUCCEEDED',
+  FAILED = 'FAILED',
+  UNKNOWN = 'UNKNOWN',
+}
+
+export enum ReplyDeliveryAttemptStatus {
+  PROCESSING = 'PROCESSING',
+  SUCCEEDED = 'SUCCEEDED',
+  RETRYABLE_FAILURE = 'RETRYABLE_FAILURE',
+  TERMINAL_FAILURE = 'TERMINAL_FAILURE',
+  UNKNOWN = 'UNKNOWN',
+}
+
 export interface CommentRecord {
   id: string;
   postPublicationId: string;
@@ -88,3 +105,30 @@ export interface ReplyDeliveryWorkItem {
   message: string;
   idempotencyKey: string | null;
 }
+
+export interface ReplyDeliveryAttemptView {
+  id: string;
+  attemptNumber: number;
+  status: ReplyDeliveryAttemptStatus;
+  errorCode: string | null;
+  startedAt: Date;
+  finishedAt: Date | null;
+}
+
+export interface ReplyDeliveryView {
+  id: string;
+  replyId: string;
+  status: ReplyDeliveryStatus;
+  attemptCount: number;
+  nextAttemptAt: Date;
+  leaseUntil: Date | null;
+  lastErrorCode: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  attempts: ReplyDeliveryAttemptView[];
+}
+
+export type RetryFailedDeliveryResult =
+  | { outcome: 'RETRIED'; delivery: ReplyDeliveryView }
+  | { outcome: 'NOT_FOUND' }
+  | { outcome: 'INVALID_STATE'; status: ReplyDeliveryStatus };

@@ -26,6 +26,8 @@ function workItem(
 
 function repositoryMock(): jest.Mocked<ReplyDeliveryRepository> {
   return {
+    findByReplyId: jest.fn(),
+    retryFailed: jest.fn(),
     claimNext: jest.fn(),
     claimUnknown: jest.fn().mockResolvedValue(null),
     markSucceeded: jest.fn(),

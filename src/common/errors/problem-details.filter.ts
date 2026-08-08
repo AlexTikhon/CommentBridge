@@ -49,6 +49,16 @@ const ERROR_HTTP: Record<
     title: 'Comment not found',
     slug: 'comment-not-found',
   },
+  DELIVERY_NOT_FOUND: {
+    status: HttpStatus.NOT_FOUND,
+    title: 'Reply delivery not found',
+    slug: 'delivery-not-found',
+  },
+  DELIVERY_RETRY_NOT_ALLOWED: {
+    status: HttpStatus.CONFLICT,
+    title: 'Reply delivery cannot be retried',
+    slug: 'delivery-retry-not-allowed',
+  },
   UNSUPPORTED_PLATFORM: {
     status: HttpStatus.UNPROCESSABLE_ENTITY,
     title: 'Unsupported social platform',

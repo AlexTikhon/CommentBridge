@@ -16,6 +16,7 @@ deterministic Instagram and LinkedIn mocks.
 - Parent-scoped idempotent replies with a database uniqueness constraint.
 - Durable `PENDING` delivery jobs, leased worker claims, attempt history, bounded
   retries, and `UNKNOWN` quarantine for ambiguous outcomes.
+- Operational delivery status and database-conditional retry for failed replies.
 - Platform adapter registry with deterministic Instagram and LinkedIn mocks and
   platform-specific message limits.
 - RFC 7807-style errors, safe NestJS HTTP exception handling, validation details,
@@ -106,6 +107,23 @@ curl -i -X POST \
 A new reply is durably queued and returns `202`. A replay remains `202` while
 delivery is pending and returns `200` after delivery reaches `SENT`.
 
+Inspect the delivery state and its 20 most recent attempts:
+
+```bash
+curl "http://localhost:3000/api/v1/replies/<reply-id>/delivery"
+```
+
+Conditionally schedule a failed reply for another attempt:
+
+```bash
+curl -i -X POST \
+  "http://localhost:3000/api/v1/replies/<reply-id>/delivery/retry"
+```
+
+Retry returns `202` only for `FAILED`. Concurrent or otherwise invalid transitions
+return `409`. In particular, `UNKNOWN` cannot be retried through this endpoint and
+must remain on the provider-reconciliation path.
+
 ## Database model
 
 `Post` is platform-neutral content. `PostPublication` represents delivery to one
@@ -127,9 +145,9 @@ uniqueness indexes remain.
 
 ## Platform adapter extension
 
-`SocialPlatformAdapter` contains platform identity, capabilities, and
-`replyToComment`. Tests use Jest spies rather than adding instrumentation to the
-port.
+`SocialPlatformAdapter` contains platform identity, capabilities, reply delivery,
+and authoritative reply lookup. Tests use Jest spies rather than adding
+instrumentation to the port.
 
 To add a platform:
 
@@ -230,12 +248,13 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 
 ## Production evolution
 
-The durable delivery state machine and provider lookup reconciliation are
-implemented. Production evolution should add operational status, manual
-retry/dead-letter controls, and optionally separate worker deployment. Inbound sync could add
-authenticated webhooks or polling. Tenant authorization, encrypted provider
-credentials, throttling, observability, and retention policies should follow
-concrete operational requirements.
+The durable delivery state machine, provider lookup reconciliation, delivery status,
+and conditional manual retry are implemented. Production evolution should add
+dead-letter/admin controls, an audit trail for manual actions, and optionally
+separate worker deployment. Inbound sync could add authenticated webhooks or
+polling. Tenant authorization, encrypted provider credentials, throttling,
+observability, and retention policies should follow concrete operational
+requirements.
 
 ## AI-assisted development
 

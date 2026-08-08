@@ -7,7 +7,14 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import type { ReplyDeliveryRepository } from '../application/ports/reply-delivery.repository';
-import { SocialPlatform, type ReplyDeliveryWorkItem } from '../domain/comment.types';
+import {
+  ReplyDeliveryAttemptStatus as DomainReplyDeliveryAttemptStatus,
+  ReplyDeliveryStatus as DomainReplyDeliveryStatus,
+  SocialPlatform,
+  type ReplyDeliveryView,
+  type ReplyDeliveryWorkItem,
+  type RetryFailedDeliveryResult,
+} from '../domain/comment.types';
 import type { PlatformCommentResult } from '../../platforms/domain/platform.types';
 
 interface ClaimedDeliveryRow {
@@ -16,9 +23,84 @@ interface ClaimedDeliveryRow {
   attemptCount: number;
 }
 
+type DeliveryWithAttempts = Prisma.ReplyDeliveryGetPayload<{
+  include: { attempts: true };
+}>;
+
 @Injectable()
 export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
   constructor(private readonly prisma: PrismaService) {}
+
+  async findByReplyId(replyId: string): Promise<ReplyDeliveryView | null> {
+    const delivery = await this.prisma.replyDelivery.findUnique({
+      where: { replyId },
+      include: {
+        attempts: {
+          orderBy: [{ attemptNumber: 'desc' }],
+          take: 20,
+        },
+      },
+    });
+    return delivery ? this.toView(delivery) : null;
+  }
+
+  async retryFailed(replyId: string, now: Date): Promise<RetryFailedDeliveryResult> {
+    return this.prisma.$transaction(async (transaction) => {
+      const transitioned = await transaction.replyDelivery.updateMany({
+        where: {
+          replyId,
+          status: ReplyDeliveryStatus.FAILED,
+        },
+        data: {
+          status: ReplyDeliveryStatus.RETRY,
+          nextAttemptAt: now,
+          leaseUntil: null,
+          lastErrorCode: null,
+          updatedAt: now,
+        },
+      });
+
+      if (transitioned.count === 0) {
+        const existing = await transaction.replyDelivery.findUnique({
+          where: { replyId },
+          select: { status: true },
+        });
+        return existing
+          ? {
+              outcome: 'INVALID_STATE' as const,
+              status: existing.status as DomainReplyDeliveryStatus,
+            }
+          : { outcome: 'NOT_FOUND' as const };
+      }
+
+      const comment = await transaction.comment.updateMany({
+        where: {
+          id: replyId,
+          deliveryStatus: DeliveryStatus.FAILED,
+        },
+        data: {
+          deliveryStatus: DeliveryStatus.PENDING,
+          providerErrorCode: null,
+        },
+      });
+      if (comment.count !== 1) {
+        throw new Error(
+          `Reply ${replyId} is inconsistent with its failed delivery state.`,
+        );
+      }
+
+      const delivery = await transaction.replyDelivery.findUniqueOrThrow({
+        where: { replyId },
+        include: {
+          attempts: {
+            orderBy: [{ attemptNumber: 'desc' }],
+            take: 20,
+          },
+        },
+      });
+      return { outcome: 'RETRIED', delivery: this.toView(delivery) };
+    });
+  }
 
   async claimNext(now: Date, leaseUntil: Date): Promise<ReplyDeliveryWorkItem | null> {
     return this.prisma.$transaction(async (transaction) => {
@@ -305,6 +387,28 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
       accountExternalId: reply.postPublication.socialAccount.externalAccountId,
       message: reply.body,
       idempotencyKey: reply.idempotencyKey,
+    };
+  }
+
+  private toView(delivery: DeliveryWithAttempts): ReplyDeliveryView {
+    return {
+      id: delivery.id,
+      replyId: delivery.replyId,
+      status: delivery.status as DomainReplyDeliveryStatus,
+      attemptCount: delivery.attemptCount,
+      nextAttemptAt: delivery.nextAttemptAt,
+      leaseUntil: delivery.leaseUntil,
+      lastErrorCode: delivery.lastErrorCode,
+      createdAt: delivery.createdAt,
+      updatedAt: delivery.updatedAt,
+      attempts: delivery.attempts.map((attempt) => ({
+        id: attempt.id,
+        attemptNumber: attempt.attemptNumber,
+        status: attempt.status as DomainReplyDeliveryAttemptStatus,
+        errorCode: attempt.errorCode,
+        startedAt: attempt.startedAt,
+        finishedAt: attempt.finishedAt,
+      })),
     };
   }
 }
