@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   ReplyDeliveryAttemptStatus,
+  ReplyDeliveryManualActionType,
   ReplyDeliveryStatus,
 } from '../../domain/comment.types';
 
@@ -22,6 +23,29 @@ export class ReplyDeliveryAttemptResponseDto {
 
   @ApiPropertyOptional({ format: 'date-time', nullable: true })
   finishedAt!: string | null;
+}
+
+export class ReplyDeliveryManualActionResponseDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ enum: ReplyDeliveryManualActionType })
+  action!: ReplyDeliveryManualActionType;
+
+  @ApiProperty({ example: 'operations@example.com' })
+  actorId!: string;
+
+  @ApiProperty({ example: 'Provider incident resolved.' })
+  reason!: string;
+
+  @ApiProperty({ enum: ReplyDeliveryStatus })
+  previousStatus!: ReplyDeliveryStatus;
+
+  @ApiProperty({ enum: ReplyDeliveryStatus })
+  resultingStatus!: ReplyDeliveryStatus;
+
+  @ApiProperty({ format: 'date-time' })
+  createdAt!: string;
 }
 
 export class ReplyDeliveryResponseDto {
@@ -57,4 +81,10 @@ export class ReplyDeliveryResponseDto {
     description: 'The 20 most recent attempts, newest first.',
   })
   attempts!: ReplyDeliveryAttemptResponseDto[];
+
+  @ApiProperty({
+    type: [ReplyDeliveryManualActionResponseDto],
+    description: 'The 20 most recent manual actions, newest first.',
+  })
+  manualActions!: ReplyDeliveryManualActionResponseDto[];
 }

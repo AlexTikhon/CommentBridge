@@ -246,8 +246,14 @@ describe('comments API (e2e)', () => {
     );
 
     const retries = await Promise.all([
-      request(app.getHttpServer()).post(`${deliveryPath}/retry`),
-      request(app.getHttpServer()).post(`${deliveryPath}/retry`),
+      request(app.getHttpServer())
+        .post(`${deliveryPath}/retry`)
+        .set('X-Operator-Id', 'e2e-operator')
+        .send({ reason: 'Provider incident resolved.' }),
+      request(app.getHttpServer())
+        .post(`${deliveryPath}/retry`)
+        .set('X-Operator-Id', 'e2e-operator')
+        .send({ reason: 'Provider incident resolved.' }),
     ]);
     expect(retries.map((response) => response.status).sort()).toEqual([202, 409]);
     expect(retries.find((response) => response.status === 202)?.body).toMatchObject({
@@ -265,6 +271,15 @@ describe('comments API (e2e)', () => {
       status: 'SUCCEEDED',
       attemptCount: 2,
       lastErrorCode: null,
+      manualActions: [
+        expect.objectContaining({
+          action: 'RETRY',
+          actorId: 'e2e-operator',
+          reason: 'Provider incident resolved.',
+          previousStatus: 'FAILED',
+          resultingStatus: 'RETRY',
+        }),
+      ],
     });
     const attempts = (delivered.body as { attempts: Array<{ attemptNumber: number }> })
       .attempts;
@@ -301,11 +316,40 @@ describe('comments API (e2e)', () => {
 
     const response = await request(app.getHttpServer())
       .post(`/api/v1/replies/${unknown.id}/delivery/retry`)
+      .set('X-Operator-Id', 'e2e-operator')
+      .send({ reason: 'Retry ambiguous result.' })
       .expect(409);
     expect(response.body).toMatchObject({
       code: 'DELIVERY_RETRY_NOT_ALLOWED',
       detail: 'UNKNOWN deliveries must be resolved through provider reconciliation.',
     });
+
+    const deadLettered = await request(app.getHttpServer())
+      .post(`/api/v1/replies/${unknown.id}/delivery/dead-letter`)
+      .set('X-Operator-Id', 'e2e-operator')
+      .send({ reason: 'Provider cannot resolve this result.' })
+      .expect(200);
+    expect(deadLettered.body).toMatchObject({
+      status: 'DEAD_LETTERED',
+      lastErrorCode: 'MANUALLY_DEAD_LETTERED',
+      manualActions: [
+        expect.objectContaining({
+          action: 'DEAD_LETTER',
+          actorId: 'e2e-operator',
+          reason: 'Provider cannot resolve this result.',
+          previousStatus: 'UNKNOWN',
+          resultingStatus: 'DEAD_LETTERED',
+        }),
+      ],
+    });
+
+    const stored = await prisma.comment.findUniqueOrThrow({
+      where: { id: unknown.id },
+      include: { delivery: true },
+    });
+    expect(stored.deliveryStatus).toBe(DeliveryStatus.FAILED);
+    expect(stored.providerErrorCode).toBe('MANUALLY_DEAD_LETTERED');
+    expect(stored.delivery?.status).toBe(ReplyDeliveryStatus.DEAD_LETTERED);
   });
 
   it('returns 404 for a missing reply delivery', async () => {

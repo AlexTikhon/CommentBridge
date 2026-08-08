@@ -37,6 +37,7 @@ enum ReplyDeliveryStatus {
   SUCCEEDED
   FAILED
   UNKNOWN
+  DEAD_LETTERED
 }
 
 enum ReplyDeliveryAttemptStatus {
@@ -45,6 +46,11 @@ enum ReplyDeliveryAttemptStatus {
   RETRYABLE_FAILURE
   TERMINAL_FAILURE
   UNKNOWN
+}
+
+enum ReplyDeliveryManualActionType {
+  RETRY
+  DEAD_LETTER
 }
 
 model SocialAccount {
@@ -110,20 +116,35 @@ model Comment {
 }
 
 model ReplyDelivery {
-  id            String                 @id @default(uuid()) @db.Uuid
-  replyId       String                 @unique @db.Uuid
-  status        ReplyDeliveryStatus    @default(PENDING)
-  attemptCount  Int                    @default(0)
-  nextAttemptAt DateTime               @default(now()) @db.Timestamptz(3)
-  leaseUntil    DateTime?              @db.Timestamptz(3)
+  id            String                      @id @default(uuid()) @db.Uuid
+  replyId       String                      @unique @db.Uuid
+  status        ReplyDeliveryStatus         @default(PENDING)
+  attemptCount  Int                         @default(0)
+  nextAttemptAt DateTime                    @default(now()) @db.Timestamptz(3)
+  leaseUntil    DateTime?                   @db.Timestamptz(3)
   lastErrorCode String?
-  createdAt     DateTime               @default(now()) @db.Timestamptz(3)
-  updatedAt     DateTime               @updatedAt @db.Timestamptz(3)
-  reply         Comment                @relation(fields: [replyId], references: [id], onDelete: Cascade)
+  createdAt     DateTime                    @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime                    @updatedAt @db.Timestamptz(3)
+  reply         Comment                     @relation(fields: [replyId], references: [id], onDelete: Cascade)
   attempts      ReplyDeliveryAttempt[]
+  manualActions ReplyDeliveryManualAction[]
 
   @@index([status, nextAttemptAt, id])
   @@index([status, leaseUntil])
+}
+
+model ReplyDeliveryManualAction {
+  id              String                        @id @default(uuid()) @db.Uuid
+  deliveryId      String                        @db.Uuid
+  action          ReplyDeliveryManualActionType
+  actorId         String                        @db.VarChar(200)
+  reason          String                        @db.VarChar(1000)
+  previousStatus  ReplyDeliveryStatus
+  resultingStatus ReplyDeliveryStatus
+  createdAt       DateTime                      @default(now()) @db.Timestamptz(3)
+  delivery        ReplyDelivery                 @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  @@index([deliveryId, createdAt, id])
 }
 
 model ReplyDeliveryAttempt {

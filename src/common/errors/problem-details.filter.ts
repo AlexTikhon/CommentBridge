@@ -59,6 +59,11 @@ const ERROR_HTTP: Record<
     title: 'Reply delivery cannot be retried',
     slug: 'delivery-retry-not-allowed',
   },
+  DELIVERY_DEAD_LETTER_NOT_ALLOWED: {
+    status: HttpStatus.CONFLICT,
+    title: 'Reply delivery cannot be dead-lettered',
+    slug: 'delivery-dead-letter-not-allowed',
+  },
   UNSUPPORTED_PLATFORM: {
     status: HttpStatus.UNPROCESSABLE_ENTITY,
     title: 'Unsupported social platform',

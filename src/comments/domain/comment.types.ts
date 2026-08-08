@@ -28,6 +28,7 @@ export enum ReplyDeliveryStatus {
   SUCCEEDED = 'SUCCEEDED',
   FAILED = 'FAILED',
   UNKNOWN = 'UNKNOWN',
+  DEAD_LETTERED = 'DEAD_LETTERED',
 }
 
 export enum ReplyDeliveryAttemptStatus {
@@ -36,6 +37,11 @@ export enum ReplyDeliveryAttemptStatus {
   RETRYABLE_FAILURE = 'RETRYABLE_FAILURE',
   TERMINAL_FAILURE = 'TERMINAL_FAILURE',
   UNKNOWN = 'UNKNOWN',
+}
+
+export enum ReplyDeliveryManualActionType {
+  RETRY = 'RETRY',
+  DEAD_LETTER = 'DEAD_LETTER',
 }
 
 export interface CommentRecord {
@@ -126,9 +132,25 @@ export interface ReplyDeliveryView {
   createdAt: Date;
   updatedAt: Date;
   attempts: ReplyDeliveryAttemptView[];
+  manualActions: ReplyDeliveryManualActionView[];
 }
 
-export type RetryFailedDeliveryResult =
-  | { outcome: 'RETRIED'; delivery: ReplyDeliveryView }
+export interface ReplyDeliveryManualActionView {
+  id: string;
+  action: ReplyDeliveryManualActionType;
+  actorId: string;
+  reason: string;
+  previousStatus: ReplyDeliveryStatus;
+  resultingStatus: ReplyDeliveryStatus;
+  createdAt: Date;
+}
+
+export interface ManualDeliveryActionInput {
+  actorId: string;
+  reason: string;
+}
+
+export type ConditionalDeliveryActionResult =
+  | { outcome: 'COMPLETED'; delivery: ReplyDeliveryView }
   | { outcome: 'NOT_FOUND' }
   | { outcome: 'INVALID_STATE'; status: ReplyDeliveryStatus };

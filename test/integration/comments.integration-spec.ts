@@ -4,6 +4,7 @@ import {
   Prisma,
   PrismaClient,
   ReplyDeliveryAttemptStatus,
+  ReplyDeliveryManualActionType,
   ReplyDeliveryStatus,
 } from '@prisma/client';
 import { CommentsService } from '../../src/comments/application/comments.service';
@@ -315,18 +316,22 @@ describe('comments persistence integration', () => {
     });
 
     const retryAt = new Date(workerNow.getTime() + 5_000);
+    const manualAction = {
+      actorId: 'integration-operator',
+      reason: 'Provider incident resolved.',
+    };
     const results = await Promise.all([
-      deliveryRepository.retryFailed(accepted.reply.id, retryAt),
-      deliveryRepository.retryFailed(accepted.reply.id, retryAt),
+      deliveryRepository.retryFailed(accepted.reply.id, retryAt, manualAction),
+      deliveryRepository.retryFailed(accepted.reply.id, retryAt, manualAction),
     ]);
     expect(results.map((result) => result.outcome).sort()).toEqual([
+      'COMPLETED',
       'INVALID_STATE',
-      'RETRIED',
     ]);
 
     const queued = await prisma.comment.findUniqueOrThrow({
       where: { id: accepted.reply.id },
-      include: { delivery: true },
+      include: { delivery: { include: { manualActions: true } } },
     });
     expect(queued.deliveryStatus).toBe(DeliveryStatus.PENDING);
     expect(queued.providerErrorCode).toBeNull();
@@ -336,6 +341,15 @@ describe('comments persistence integration', () => {
       nextAttemptAt: retryAt,
       lastErrorCode: null,
     });
+    expect(queued.delivery?.manualActions).toEqual([
+      expect.objectContaining({
+        action: 'RETRY',
+        actorId: manualAction.actorId,
+        reason: manualAction.reason,
+        previousStatus: ReplyDeliveryStatus.FAILED,
+        resultingStatus: ReplyDeliveryStatus.RETRY,
+      }),
+    ]);
 
     await worker.processNext(retryAt);
     const delivered = await deliveries.getStatus(accepted.reply.id);
@@ -345,6 +359,73 @@ describe('comments persistence integration', () => {
     });
     expect(delivered.attempts.map((attempt) => attempt.attemptNumber)).toEqual([2, 1]);
     expect(instagramReplySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('dead-letters an eligible job once and records the manual action', async () => {
+    const accepted = await service.replyToComment(
+      SEED_IDS.instagramComment,
+      'Do not deliver this',
+      'integration-dead-letter',
+    );
+    const deadLetterAt = new Date(workerNow.getTime() + 10_000);
+    const action = {
+      actorId: 'integration-operator',
+      reason: 'Operator cancelled the queued response.',
+    };
+
+    const results = await Promise.all([
+      deliveryRepository.deadLetter(accepted.reply.id, deadLetterAt, action),
+      deliveryRepository.deadLetter(accepted.reply.id, deadLetterAt, action),
+    ]);
+    expect(results.map((result) => result.outcome).sort()).toEqual([
+      'COMPLETED',
+      'INVALID_STATE',
+    ]);
+
+    const stored = await prisma.comment.findUniqueOrThrow({
+      where: { id: accepted.reply.id },
+      include: { delivery: { include: { manualActions: true } } },
+    });
+    expect(stored.deliveryStatus).toBe(DeliveryStatus.FAILED);
+    expect(stored.providerErrorCode).toBe('MANUALLY_DEAD_LETTERED');
+    expect(stored.delivery).toMatchObject({
+      status: ReplyDeliveryStatus.DEAD_LETTERED,
+      lastErrorCode: 'MANUALLY_DEAD_LETTERED',
+    });
+    expect(stored.delivery?.manualActions).toHaveLength(1);
+    expect(stored.delivery?.manualActions[0]).toMatchObject({
+      action: 'DEAD_LETTER',
+      actorId: action.actorId,
+      reason: action.reason,
+      previousStatus: ReplyDeliveryStatus.PENDING,
+      resultingStatus: ReplyDeliveryStatus.DEAD_LETTERED,
+    });
+    await expect(worker.processNext(deadLetterAt)).resolves.toBe(false);
+    expect(instagramReplySpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects semantically invalid manual audit rows at the database boundary', async () => {
+    const accepted = await service.replyToComment(
+      SEED_IDS.instagramComment,
+      'Audit constraint',
+      'integration-audit-constraint',
+    );
+    const delivery = await prisma.replyDelivery.findUniqueOrThrow({
+      where: { replyId: accepted.reply.id },
+    });
+
+    await expect(
+      prisma.replyDeliveryManualAction.create({
+        data: {
+          deliveryId: delivery.id,
+          action: ReplyDeliveryManualActionType.RETRY,
+          actorId: 'invalid-writer',
+          reason: 'PENDING cannot be the source of RETRY.',
+          previousStatus: ReplyDeliveryStatus.PENDING,
+          resultingStatus: ReplyDeliveryStatus.RETRY,
+        },
+      }),
+    ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
   });
 
   it('reconciles an expired processing lease to UNKNOWN without retrying', async () => {

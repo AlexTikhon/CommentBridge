@@ -17,6 +17,7 @@ deterministic Instagram and LinkedIn mocks.
 - Durable `PENDING` delivery jobs, leased worker claims, attempt history, bounded
   retries, and `UNKNOWN` quarantine for ambiguous outcomes.
 - Operational delivery status and database-conditional retry for failed replies.
+- Explicit dead-letter state and transactional audit history for manual actions.
 - Platform adapter registry with deterministic Instagram and LinkedIn mocks and
   platform-specific message limits.
 - RFC 7807-style errors, safe NestJS HTTP exception handling, validation details,
@@ -107,7 +108,8 @@ curl -i -X POST \
 A new reply is durably queued and returns `202`. A replay remains `202` while
 delivery is pending and returns `200` after delivery reaches `SENT`.
 
-Inspect the delivery state and its 20 most recent attempts:
+Inspect the delivery state, its 20 most recent attempts, and its 20 most recent
+manual actions:
 
 ```bash
 curl "http://localhost:3000/api/v1/replies/<reply-id>/delivery"
@@ -117,12 +119,30 @@ Conditionally schedule a failed reply for another attempt:
 
 ```bash
 curl -i -X POST \
-  "http://localhost:3000/api/v1/replies/<reply-id>/delivery/retry"
+  "http://localhost:3000/api/v1/replies/<reply-id>/delivery/retry" \
+  -H "Content-Type: application/json" \
+  -H "X-Operator-Id: operations@example.com" \
+  -d '{"reason":"Provider incident resolved."}'
 ```
 
 Retry returns `202` only for `FAILED`. Concurrent or otherwise invalid transitions
 return `409`. In particular, `UNKNOWN` cannot be retried through this endpoint and
 must remain on the provider-reconciliation path.
+
+Move a queued, retrying, failed, or unknown delivery to the terminal dead-letter
+state:
+
+```bash
+curl -i -X POST \
+  "http://localhost:3000/api/v1/replies/<reply-id>/delivery/dead-letter" \
+  -H "Content-Type: application/json" \
+  -H "X-Operator-Id: operations@example.com" \
+  -d '{"reason":"Provider cannot resolve this delivery."}'
+```
+
+Manual retry and dead-letter transitions store the normalized operator ID, reason,
+previous state, resulting state, and timestamp atomically. Until authentication is
+introduced, `X-Operator-Id` is required but is not an authenticated identity.
 
 ## Database model
 
@@ -249,10 +269,10 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 ## Production evolution
 
 The durable delivery state machine, provider lookup reconciliation, delivery status,
-and conditional manual retry are implemented. Production evolution should add
-dead-letter/admin controls, an audit trail for manual actions, and optionally
-separate worker deployment. Inbound sync could add authenticated webhooks or
-polling. Tenant authorization, encrypted provider credentials, throttling,
+conditional manual retry, dead-letter controls, and manual-action audit trail are
+implemented. Production evolution should add authenticated operator identity and
+optionally separate worker deployment. Inbound sync could add authenticated webhooks
+or polling. Tenant authorization, encrypted provider credentials, throttling,
 observability, and retention policies should follow concrete operational
 requirements.
 

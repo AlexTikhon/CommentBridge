@@ -94,6 +94,14 @@ The attempt counter and history remain monotonic. Competing retry requests canno
 both succeed, and `UNKNOWN` is deliberately excluded so operators cannot bypass
 provider reconciliation.
 
+Dead-lettering has its own terminal `DEAD_LETTERED` job state rather than overloading
+provider failure. It is allowed from `PENDING`, `RETRY`, `FAILED`, and `UNKNOWN`, and
+is blocked while a worker owns `PROCESSING` or after `SUCCEEDED`. Every successful
+manual retry or dead-letter transition inserts an immutable action row containing
+operator ID, normalized reason, previous state, resulting state, and timestamp in
+the same database transaction. The operator header is audit attribution only until
+authentication supplies a verified principal.
+
 ## Error boundary and request IDs
 
 Custom application errors retain explicit RFC 7807-style mappings. General NestJS

@@ -3,6 +3,11 @@ import type { ReplyDeliveryRepository } from './ports/reply-delivery.repository'
 import { ReplyDeliveriesService } from './reply-deliveries.service';
 
 const now = new Date('2026-08-08T12:00:00.000Z');
+const action = { actorId: ' operator@example.com ', reason: ' Incident resolved. ' };
+const normalizedAction = {
+  actorId: 'operator@example.com',
+  reason: 'Incident resolved.',
+};
 
 function delivery(overrides: Partial<ReplyDeliveryView> = {}): ReplyDeliveryView {
   return {
@@ -16,6 +21,7 @@ function delivery(overrides: Partial<ReplyDeliveryView> = {}): ReplyDeliveryView
     createdAt: now,
     updatedAt: now,
     attempts: [],
+    manualActions: [],
     ...overrides,
   };
 }
@@ -24,6 +30,7 @@ function repositoryMock(): jest.Mocked<ReplyDeliveryRepository> {
   return {
     findByReplyId: jest.fn(),
     retryFailed: jest.fn(),
+    deadLetter: jest.fn(),
     claimNext: jest.fn(),
     claimUnknown: jest.fn(),
     markSucceeded: jest.fn(),
@@ -63,12 +70,16 @@ describe('ReplyDeliveriesService', () => {
       lastErrorCode: null,
     });
     repository.retryFailed.mockResolvedValue({
-      outcome: 'RETRIED',
+      outcome: 'COMPLETED',
       delivery: retried,
     });
 
-    await expect(service.retry(retried.replyId, now)).resolves.toEqual(retried);
-    expect(repository.retryFailed).toHaveBeenCalledWith(retried.replyId, now);
+    await expect(service.retry(retried.replyId, action, now)).resolves.toEqual(retried);
+    expect(repository.retryFailed).toHaveBeenCalledWith(
+      retried.replyId,
+      now,
+      normalizedAction,
+    );
   });
 
   it('does not allow UNKNOWN to bypass reconciliation', async () => {
@@ -77,7 +88,7 @@ describe('ReplyDeliveriesService', () => {
       status: ReplyDeliveryStatus.UNKNOWN,
     });
 
-    await expect(service.retry(delivery().replyId, now)).rejects.toMatchObject({
+    await expect(service.retry(delivery().replyId, action, now)).rejects.toMatchObject({
       code: 'DELIVERY_RETRY_NOT_ALLOWED',
       message: 'UNKNOWN deliveries must be resolved through provider reconciliation.',
     });
@@ -86,7 +97,7 @@ describe('ReplyDeliveriesService', () => {
   it('returns not found when retry has no delivery target', async () => {
     repository.retryFailed.mockResolvedValue({ outcome: 'NOT_FOUND' });
 
-    await expect(service.retry(delivery().replyId, now)).rejects.toMatchObject({
+    await expect(service.retry(delivery().replyId, action, now)).rejects.toMatchObject({
       code: 'DELIVERY_NOT_FOUND',
     });
   });
@@ -97,8 +108,45 @@ describe('ReplyDeliveriesService', () => {
       status: ReplyDeliveryStatus.SUCCEEDED,
     });
 
-    await expect(service.retry(delivery().replyId, now)).rejects.toMatchObject({
+    await expect(service.retry(delivery().replyId, action, now)).rejects.toMatchObject({
       code: 'DELIVERY_RETRY_NOT_ALLOWED',
+    });
+  });
+
+  it('returns the conditionally dead-lettered delivery', async () => {
+    const deadLettered = delivery({ status: ReplyDeliveryStatus.DEAD_LETTERED });
+    repository.deadLetter.mockResolvedValue({
+      outcome: 'COMPLETED',
+      delivery: deadLettered,
+    });
+
+    await expect(
+      service.deadLetter(deadLettered.replyId, action, now),
+    ).resolves.toEqual(deadLettered);
+    expect(repository.deadLetter).toHaveBeenCalledWith(
+      deadLettered.replyId,
+      now,
+      normalizedAction,
+    );
+  });
+
+  it('validates the operator identity before a manual action', async () => {
+    await expect(
+      service.retry(delivery().replyId, { actorId: ' ', reason: 'Valid' }, now),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(repository.retryFailed).not.toHaveBeenCalled();
+  });
+
+  it('rejects dead-lettering from an unsafe state', async () => {
+    repository.deadLetter.mockResolvedValue({
+      outcome: 'INVALID_STATE',
+      status: ReplyDeliveryStatus.PROCESSING,
+    });
+
+    await expect(
+      service.deadLetter(delivery().replyId, action, now),
+    ).rejects.toMatchObject({
+      code: 'DELIVERY_DEAD_LETTER_NOT_ALLOWED',
     });
   });
 });

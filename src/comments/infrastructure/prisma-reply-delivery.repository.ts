@@ -3,17 +3,20 @@ import {
   DeliveryStatus,
   Prisma,
   ReplyDeliveryAttemptStatus,
+  ReplyDeliveryManualActionType,
   ReplyDeliveryStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import type { ReplyDeliveryRepository } from '../application/ports/reply-delivery.repository';
 import {
   ReplyDeliveryAttemptStatus as DomainReplyDeliveryAttemptStatus,
+  ReplyDeliveryManualActionType as DomainReplyDeliveryManualActionType,
   ReplyDeliveryStatus as DomainReplyDeliveryStatus,
   SocialPlatform,
+  type ConditionalDeliveryActionResult,
+  type ManualDeliveryActionInput,
   type ReplyDeliveryView,
   type ReplyDeliveryWorkItem,
-  type RetryFailedDeliveryResult,
 } from '../domain/comment.types';
 import type { PlatformCommentResult } from '../../platforms/domain/platform.types';
 
@@ -23,8 +26,8 @@ interface ClaimedDeliveryRow {
   attemptCount: number;
 }
 
-type DeliveryWithAttempts = Prisma.ReplyDeliveryGetPayload<{
-  include: { attempts: true };
+type DeliveryWithHistory = Prisma.ReplyDeliveryGetPayload<{
+  include: { attempts: true; manualActions: true };
 }>;
 
 @Injectable()
@@ -39,12 +42,20 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
           orderBy: [{ attemptNumber: 'desc' }],
           take: 20,
         },
+        manualActions: {
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: 20,
+        },
       },
     });
     return delivery ? this.toView(delivery) : null;
   }
 
-  async retryFailed(replyId: string, now: Date): Promise<RetryFailedDeliveryResult> {
+  async retryFailed(
+    replyId: string,
+    now: Date,
+    action: ManualDeliveryActionInput,
+  ): Promise<ConditionalDeliveryActionResult> {
     return this.prisma.$transaction(async (transaction) => {
       const transitioned = await transaction.replyDelivery.updateMany({
         where: {
@@ -89,6 +100,22 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         );
       }
 
+      const transitionedDelivery = await transaction.replyDelivery.findUniqueOrThrow({
+        where: { replyId },
+        select: { id: true },
+      });
+      await transaction.replyDeliveryManualAction.create({
+        data: {
+          deliveryId: transitionedDelivery.id,
+          action: ReplyDeliveryManualActionType.RETRY,
+          actorId: action.actorId,
+          reason: action.reason,
+          previousStatus: ReplyDeliveryStatus.FAILED,
+          resultingStatus: ReplyDeliveryStatus.RETRY,
+          createdAt: now,
+        },
+      });
+
       const delivery = await transaction.replyDelivery.findUniqueOrThrow({
         where: { replyId },
         include: {
@@ -96,9 +123,103 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
             orderBy: [{ attemptNumber: 'desc' }],
             take: 20,
           },
+          manualActions: {
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: 20,
+          },
         },
       });
-      return { outcome: 'RETRIED', delivery: this.toView(delivery) };
+      return { outcome: 'COMPLETED', delivery: this.toView(delivery) };
+    });
+  }
+
+  async deadLetter(
+    replyId: string,
+    now: Date,
+    action: ManualDeliveryActionInput,
+  ): Promise<ConditionalDeliveryActionResult> {
+    return this.prisma.$transaction(async (transaction) => {
+      const existing = await transaction.replyDelivery.findUnique({
+        where: { replyId },
+        select: { id: true, status: true },
+      });
+      if (!existing) return { outcome: 'NOT_FOUND' };
+
+      const eligible = new Set<ReplyDeliveryStatus>([
+        ReplyDeliveryStatus.PENDING,
+        ReplyDeliveryStatus.RETRY,
+        ReplyDeliveryStatus.FAILED,
+        ReplyDeliveryStatus.UNKNOWN,
+      ]);
+      if (!eligible.has(existing.status)) {
+        return {
+          outcome: 'INVALID_STATE',
+          status: existing.status as DomainReplyDeliveryStatus,
+        };
+      }
+
+      const transitioned = await transaction.replyDelivery.updateMany({
+        where: { id: existing.id, status: existing.status },
+        data: {
+          status: ReplyDeliveryStatus.DEAD_LETTERED,
+          leaseUntil: null,
+          lastErrorCode: 'MANUALLY_DEAD_LETTERED',
+          updatedAt: now,
+        },
+      });
+      if (transitioned.count === 0) {
+        const current = await transaction.replyDelivery.findUniqueOrThrow({
+          where: { id: existing.id },
+          select: { status: true },
+        });
+        return {
+          outcome: 'INVALID_STATE',
+          status: current.status as DomainReplyDeliveryStatus,
+        };
+      }
+
+      const comment = await transaction.comment.updateMany({
+        where: {
+          id: replyId,
+          deliveryStatus: { in: [DeliveryStatus.PENDING, DeliveryStatus.FAILED] },
+        },
+        data: {
+          deliveryStatus: DeliveryStatus.FAILED,
+          providerErrorCode: 'MANUALLY_DEAD_LETTERED',
+        },
+      });
+      if (comment.count !== 1) {
+        throw new Error(
+          `Reply ${replyId} is inconsistent with its dead-letter-eligible state.`,
+        );
+      }
+
+      await transaction.replyDeliveryManualAction.create({
+        data: {
+          deliveryId: existing.id,
+          action: ReplyDeliveryManualActionType.DEAD_LETTER,
+          actorId: action.actorId,
+          reason: action.reason,
+          previousStatus: existing.status,
+          resultingStatus: ReplyDeliveryStatus.DEAD_LETTERED,
+          createdAt: now,
+        },
+      });
+
+      const delivery = await transaction.replyDelivery.findUniqueOrThrow({
+        where: { id: existing.id },
+        include: {
+          attempts: {
+            orderBy: [{ attemptNumber: 'desc' }],
+            take: 20,
+          },
+          manualActions: {
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: 20,
+          },
+        },
+      });
+      return { outcome: 'COMPLETED', delivery: this.toView(delivery) };
     });
   }
 
@@ -390,7 +511,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
     };
   }
 
-  private toView(delivery: DeliveryWithAttempts): ReplyDeliveryView {
+  private toView(delivery: DeliveryWithHistory): ReplyDeliveryView {
     return {
       id: delivery.id,
       replyId: delivery.replyId,
@@ -408,6 +529,15 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         errorCode: attempt.errorCode,
         startedAt: attempt.startedAt,
         finishedAt: attempt.finishedAt,
+      })),
+      manualActions: delivery.manualActions.map((action) => ({
+        id: action.id,
+        action: action.action as DomainReplyDeliveryManualActionType,
+        actorId: action.actorId,
+        reason: action.reason,
+        previousStatus: action.previousStatus as DomainReplyDeliveryStatus,
+        resultingStatus: action.resultingStatus as DomainReplyDeliveryStatus,
+        createdAt: action.createdAt,
       })),
     };
   }
