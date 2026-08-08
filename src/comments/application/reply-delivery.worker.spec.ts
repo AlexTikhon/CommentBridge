@@ -27,6 +27,7 @@ function workItem(
 function repositoryMock(): jest.Mocked<ReplyDeliveryRepository> {
   return {
     claimNext: jest.fn(),
+    claimUnknown: jest.fn().mockResolvedValue(null),
     markSucceeded: jest.fn(),
     markRetryableFailure: jest.fn(),
     markTerminalFailure: jest.fn(),
@@ -72,6 +73,73 @@ describe('ReplyDeliveryWorker', () => {
     );
   });
 
+  it('resolves an unknown delivery when provider lookup finds the reply', async () => {
+    const item = workItem();
+    const result = {
+      externalCommentId: 'provider-reply',
+      remoteCreatedAt: new Date('2026-08-07T09:59:59.000Z'),
+    };
+    repository.claimUnknown.mockResolvedValue(item);
+    jest.spyOn(instagram, 'lookupReply').mockResolvedValue(result);
+
+    await expect(worker.processNext(now)).resolves.toBe(true);
+
+    expect(repository.claimUnknown).toHaveBeenCalledWith(
+      now,
+      new Date('2026-08-07T10:00:30.000Z'),
+    );
+    expect(repository.markSucceeded).toHaveBeenCalledWith(item, result);
+    expect(repository.claimNext).not.toHaveBeenCalled();
+  });
+
+  it('retries only after provider lookup confirms the reply is absent', async () => {
+    const item = workItem();
+    repository.claimUnknown.mockResolvedValue(item);
+    jest.spyOn(instagram, 'lookupReply').mockResolvedValue(null);
+
+    await worker.processNext(now);
+
+    expect(repository.markRetryableFailure).toHaveBeenCalledWith(
+      item,
+      'PROVIDER_CONFIRMED_NOT_FOUND',
+      new Date('2026-08-07T10:00:01.000Z'),
+      5,
+    );
+  });
+
+  it('keeps an unknown delivery quarantined when lookup is inconclusive', async () => {
+    const item = workItem();
+    repository.claimUnknown.mockResolvedValue(item);
+    jest
+      .spyOn(instagram, 'lookupReply')
+      .mockRejectedValue(new ProviderAdapterError('PLATFORM_UNAVAILABLE', true));
+
+    await worker.processNext(now);
+
+    expect(repository.markUnknown).toHaveBeenCalledWith(
+      item,
+      'RECONCILIATION_PLATFORM_UNAVAILABLE',
+      new Date('2026-08-07T10:00:01.000Z'),
+    );
+    expect(repository.markRetryableFailure).not.toHaveBeenCalled();
+  });
+
+  it('does not reinterpret a reconciliation persistence failure', async () => {
+    const item = workItem();
+    const persistenceError = new Error('database write failed');
+    repository.claimUnknown.mockResolvedValue(item);
+    jest.spyOn(instagram, 'lookupReply').mockResolvedValue({
+      externalCommentId: 'provider-reply',
+      remoteCreatedAt: now,
+    });
+    repository.markSucceeded.mockRejectedValue(persistenceError);
+
+    await expect(worker.processNext(now)).rejects.toBe(persistenceError);
+
+    expect(repository.markUnknown).not.toHaveBeenCalled();
+    expect(repository.markRetryableFailure).not.toHaveBeenCalled();
+  });
+
   it('schedules an explicitly retryable provider failure with backoff', async () => {
     repository.claimNext.mockResolvedValue(workItem());
     jest
@@ -113,6 +181,7 @@ describe('ReplyDeliveryWorker', () => {
     expect(repository.markUnknown).toHaveBeenCalledWith(
       workItem(),
       'AMBIGUOUS_PROVIDER_RESULT',
+      new Date('2026-08-07T10:00:01.000Z'),
     );
     expect(repository.markRetryableFailure).not.toHaveBeenCalled();
   });

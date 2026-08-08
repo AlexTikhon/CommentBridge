@@ -13,6 +13,8 @@ export interface ReplyToPlatformCommentInput {
   signal?: AbortSignal;
 }
 
+export type LookupPlatformReplyInput = Omit<ReplyToPlatformCommentInput, 'message'>;
+
 export interface PlatformCommentResult {
   externalCommentId: string;
   remoteCreatedAt: Date;
@@ -26,4 +28,6 @@ export interface SocialPlatformAdapter {
   readonly platform: SocialPlatform;
   getCapabilities(): PlatformCapabilities;
   replyToComment(input: ReplyToPlatformCommentInput): Promise<PlatformCommentResult>;
+  /** Returns null only when the provider authoritatively confirms absence. */
+  lookupReply(input: LookupPlatformReplyInput): Promise<PlatformCommentResult | null>;
 }

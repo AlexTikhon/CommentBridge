@@ -53,28 +53,37 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         },
       });
 
-      const reply = await transaction.comment.findUnique({
-        where: { id: delivery.replyId },
-        include: {
-          parent: true,
-          postPublication: { include: { socialAccount: true } },
-        },
-      });
-      if (!reply) {
-        throw new Error(`Delivery ${delivery.id} references a missing reply.`);
-      }
+      return this.loadWorkItem(transaction, delivery);
+    });
+  }
 
-      return {
-        deliveryId: delivery.id,
-        replyId: reply.id,
-        attemptNumber: delivery.attemptCount,
-        platform: reply.postPublication.socialAccount.platform as SocialPlatform,
-        publicationExternalId: reply.postPublication.externalPostId,
-        parentExternalCommentId: reply.parent?.externalCommentId ?? null,
-        accountExternalId: reply.postPublication.socialAccount.externalAccountId,
-        message: reply.body,
-        idempotencyKey: reply.idempotencyKey,
-      };
+  async claimUnknown(
+    now: Date,
+    leaseUntil: Date,
+  ): Promise<ReplyDeliveryWorkItem | null> {
+    return this.prisma.$transaction(async (transaction) => {
+      const claimed = await transaction.$queryRaw<ClaimedDeliveryRow[]>(Prisma.sql`
+        WITH candidate AS (
+          SELECT d."id"
+          FROM "ReplyDelivery" d
+          WHERE d."status" = 'UNKNOWN'
+            AND d."nextAttemptAt" <= ${now}
+          ORDER BY d."nextAttemptAt" ASC, d."id" ASC
+          FOR UPDATE SKIP LOCKED
+          LIMIT 1
+        )
+        UPDATE "ReplyDelivery" d
+        SET
+          "status" = 'PROCESSING',
+          "leaseUntil" = ${leaseUntil},
+          "updatedAt" = ${now}
+        FROM candidate
+        WHERE d."id" = candidate."id"
+        RETURNING d."id", d."replyId", d."attemptCount"
+      `);
+      const delivery = claimed[0];
+      if (!delivery) return null;
+      return this.loadWorkItem(transaction, delivery);
     });
   }
 
@@ -187,12 +196,17 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
     });
   }
 
-  async markUnknown(item: ReplyDeliveryWorkItem, errorCode: string): Promise<void> {
+  async markUnknown(
+    item: ReplyDeliveryWorkItem,
+    errorCode: string,
+    nextAttemptAt: Date,
+  ): Promise<void> {
     await this.prisma.$transaction(async (transaction) => {
       await this.transitionProcessingJob(transaction, item, {
         status: ReplyDeliveryStatus.UNKNOWN,
         leaseUntil: null,
         lastErrorCode: errorCode,
+        nextAttemptAt,
       });
       await transaction.replyDeliveryAttempt.update({
         where: {
@@ -264,5 +278,33 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
     if (updated.count !== 1) {
       throw new Error(`Delivery ${item.deliveryId} is no longer owned by this worker.`);
     }
+  }
+
+  private async loadWorkItem(
+    transaction: Prisma.TransactionClient,
+    delivery: ClaimedDeliveryRow,
+  ): Promise<ReplyDeliveryWorkItem> {
+    const reply = await transaction.comment.findUnique({
+      where: { id: delivery.replyId },
+      include: {
+        parent: true,
+        postPublication: { include: { socialAccount: true } },
+      },
+    });
+    if (!reply) {
+      throw new Error(`Delivery ${delivery.id} references a missing reply.`);
+    }
+
+    return {
+      deliveryId: delivery.id,
+      replyId: reply.id,
+      attemptNumber: delivery.attemptCount,
+      platform: reply.postPublication.socialAccount.platform as SocialPlatform,
+      publicationExternalId: reply.postPublication.externalPostId,
+      parentExternalCommentId: reply.parent?.externalCommentId ?? null,
+      accountExternalId: reply.postPublication.socialAccount.externalAccountId,
+      message: reply.body,
+      idempotencyKey: reply.idempotencyKey,
+    };
   }
 }

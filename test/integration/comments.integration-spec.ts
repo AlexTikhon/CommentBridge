@@ -29,6 +29,7 @@ describe('comments persistence integration', () => {
   const repository = new PrismaCommentRepository(prismaService);
   const deliveryRepository = new PrismaReplyDeliveryRepository(prismaService);
   let instagram: MockInstagramAdapter;
+  let deliverWithInstagram: MockInstagramAdapter['replyToComment'];
   let instagramReplySpy: jest.SpiedFunction<MockInstagramAdapter['replyToComment']>;
   let service: CommentsService;
   let worker: ReplyDeliveryWorker;
@@ -37,6 +38,7 @@ describe('comments persistence integration', () => {
   beforeEach(async () => {
     await resetAndSeed(prisma);
     instagram = new MockInstagramAdapter();
+    deliverWithInstagram = instagram.replyToComment.bind(instagram);
     instagramReplySpy = jest.spyOn(instagram, 'replyToComment');
     const adapters = new PlatformAdapterRegistry([
       instagram,
@@ -188,7 +190,7 @@ describe('comments persistence integration', () => {
     expect(instagramReplySpy).toHaveBeenCalledTimes(5);
   });
 
-  it('quarantines an ambiguous provider result as UNKNOWN', async () => {
+  it('retries an UNKNOWN delivery only after lookup confirms absence', async () => {
     instagramReplySpy.mockRejectedValue(new Error('raw provider body with a secret'));
     const accepted = await service.replyToComment(
       SEED_IDS.instagramComment,
@@ -209,8 +211,60 @@ describe('comments persistence integration', () => {
     });
     expect(JSON.stringify(stored.delivery)).not.toContain('secret');
     await expect(
-      worker.processNext(new Date('2200-01-01T00:00:00.000Z')),
-    ).resolves.toBe(false);
+      worker.processNext(new Date(workerNow.getTime() + 2_000)),
+    ).resolves.toBe(true);
+
+    const reconciled = await prisma.comment.findUniqueOrThrow({
+      where: { id: accepted.reply.id },
+      include: { delivery: { include: { attempts: true } } },
+    });
+    expect(reconciled.deliveryStatus).toBe(DeliveryStatus.PENDING);
+    expect(reconciled.delivery).toMatchObject({
+      status: ReplyDeliveryStatus.RETRY,
+      attemptCount: 1,
+      lastErrorCode: 'PROVIDER_CONFIRMED_NOT_FOUND',
+    });
+    expect(reconciled.delivery?.attempts).toEqual([
+      expect.objectContaining({
+        status: ReplyDeliveryAttemptStatus.RETRYABLE_FAILURE,
+        errorCode: 'PROVIDER_CONFIRMED_NOT_FOUND',
+      }),
+    ]);
+    expect(instagramReplySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves an ambiguous success through lookup without redelivery', async () => {
+    instagramReplySpy.mockImplementation(async (input) => {
+      await deliverWithInstagram(input);
+      throw new Error('provider response was lost after acceptance');
+    });
+    const accepted = await service.replyToComment(
+      SEED_IDS.instagramComment,
+      'Accepted but ambiguous',
+      'integration-reconciled-success',
+    );
+
+    await worker.processNext(workerNow);
+    await worker.processNext(new Date(workerNow.getTime() + 2_000));
+
+    const reconciled = await prisma.comment.findUniqueOrThrow({
+      where: { id: accepted.reply.id },
+      include: { delivery: { include: { attempts: true } } },
+    });
+    expect(reconciled.deliveryStatus).toBe(DeliveryStatus.SENT);
+    expect(reconciled.externalCommentId).toMatch(/^mock-instagram-/);
+    expect(reconciled.delivery).toMatchObject({
+      status: ReplyDeliveryStatus.SUCCEEDED,
+      attemptCount: 1,
+      lastErrorCode: null,
+    });
+    expect(reconciled.delivery?.attempts).toEqual([
+      expect.objectContaining({
+        attemptNumber: 1,
+        status: ReplyDeliveryAttemptStatus.SUCCEEDED,
+      }),
+    ]);
+    expect(instagramReplySpy).toHaveBeenCalledTimes(1);
   });
 
   it('reconciles an expired processing lease to UNKNOWN without retrying', async () => {

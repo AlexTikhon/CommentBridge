@@ -154,8 +154,10 @@ The worker claims due jobs with `FOR UPDATE SKIP LOCKED` and a lease. Explicitly
 retryable provider failures use bounded exponential backoff and reuse the same
 provider idempotency key. Unknown exceptions, timeouts, expired leases, and a crash
 after provider acceptance are quarantined as delivery `UNKNOWN`; the public reply
-remains `PENDING` until reconciliation. They are never retried blindly. Exactly-once
-delivery still depends on provider-side idempotency and reconciliation support.
+remains `PENDING` until provider lookup resolves it. A found reply completes the
+original attempt, an authoritative absence permits bounded retry, and an
+inconclusive lookup remains quarantined with backoff. Exactly-once delivery still
+depends on provider-side idempotency and authoritative reconciliation support.
 
 ## Pagination
 
@@ -228,9 +230,9 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 
 ## Production evolution
 
-The durable delivery state machine is implemented. Production evolution should add
-provider-specific reconciliation for `UNKNOWN`, operational retry/dead-letter
-controls, and optionally separate worker deployment. Inbound sync could add
+The durable delivery state machine and provider lookup reconciliation are
+implemented. Production evolution should add operational status, manual
+retry/dead-letter controls, and optionally separate worker deployment. Inbound sync could add
 authenticated webhooks or polling. Tenant authorization, encrypted provider
 credentials, throttling, observability, and retention policies should follow
 concrete operational requirements.

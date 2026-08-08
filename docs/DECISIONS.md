@@ -81,8 +81,11 @@ ambiguous.
 Provider calls and success persistence remain separate error boundaries. If the
 provider succeeds but the success transaction fails, the job stays `PROCESSING`.
 After its lease expires, reconciliation moves the job and open attempt to `UNKNOWN`
-instead of retrying blindly; the public comment remains `PENDING`. Provider-specific
-reconciliation can later resolve that quarantine to `SENT` or a safe retry.
+instead of retrying blindly; the public comment remains `PENDING`. The worker leases
+UNKNOWN jobs without creating another delivery attempt and performs provider lookup
+using the original idempotency context. A found reply completes the original attempt;
+only authoritative absence schedules a bounded retry. Lookup errors remain UNKNOWN
+with backoff, so an inconclusive reconciliation never causes duplicate delivery.
 
 ## Error boundary and request IDs
 

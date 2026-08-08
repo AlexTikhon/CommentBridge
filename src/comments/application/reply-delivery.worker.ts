@@ -7,7 +7,9 @@ import {
 } from '@nestjs/common';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import type {
+  LookupPlatformReplyInput,
   PlatformCommentResult,
+  ReplyToPlatformCommentInput,
   SocialPlatformAdapter,
 } from '../../platforms/domain/platform.types';
 import { ProviderAdapterError } from '../domain/comment.errors';
@@ -58,6 +60,15 @@ export class ReplyDeliveryWorker
       this.logger.warn(`Marked ${reconciled} expired reply deliveries as UNKNOWN.`);
     }
 
+    const unknown = await this.repository.claimUnknown(
+      now,
+      new Date(now.getTime() + LEASE_DURATION_MS),
+    );
+    if (unknown) {
+      await this.reconcileUnknown(unknown, now);
+      return true;
+    }
+
     const item = await this.repository.claimNext(
       now,
       new Date(now.getTime() + LEASE_DURATION_MS),
@@ -98,6 +109,7 @@ export class ReplyDeliveryWorker
           error instanceof ProviderCallTimedOutError
             ? 'PROVIDER_TIMEOUT_UNKNOWN'
             : 'AMBIGUOUS_PROVIDER_RESULT',
+          this.nextAttemptAt(now, item.attemptNumber),
         );
       }
       return true;
@@ -131,6 +143,88 @@ export class ReplyDeliveryWorker
     adapter: SocialPlatformAdapter,
     item: ReplyDeliveryWorkItem,
   ): Promise<PlatformCommentResult> {
+    return this.withProviderTimeout((signal) =>
+      adapter.replyToComment(this.providerInput(item, signal)),
+    );
+  }
+
+  private async reconcileUnknown(
+    item: ReplyDeliveryWorkItem,
+    now: Date,
+  ): Promise<void> {
+    if (!item.parentExternalCommentId || !item.idempotencyKey) {
+      await this.repository.markTerminalFailure(item, 'INVALID_DELIVERY_CONTEXT');
+      return;
+    }
+
+    let adapter: SocialPlatformAdapter;
+    try {
+      adapter = this.adapters.resolve(item.platform);
+    } catch {
+      await this.repository.markTerminalFailure(item, 'UNSUPPORTED_PLATFORM');
+      return;
+    }
+
+    let result: PlatformCommentResult | null;
+    try {
+      result = await this.withProviderTimeout((signal) =>
+        adapter.lookupReply(this.lookupInput(item, signal)),
+      );
+    } catch (error: unknown) {
+      await this.repository.markUnknown(
+        item,
+        error instanceof ProviderAdapterError
+          ? `RECONCILIATION_${error.safeCode}`
+          : error instanceof ProviderCallTimedOutError
+            ? 'RECONCILIATION_TIMEOUT'
+            : 'RECONCILIATION_LOOKUP_UNKNOWN',
+        this.nextAttemptAt(now, item.attemptNumber),
+      );
+      return;
+    }
+
+    // Keep persistence outside the provider error boundary. If this transition
+    // fails, the reconciliation lease expires back to UNKNOWN and is safe to
+    // repeat without issuing another reply.
+    if (result) {
+      await this.repository.markSucceeded(item, result);
+      return;
+    }
+
+    await this.repository.markRetryableFailure(
+      item,
+      'PROVIDER_CONFIRMED_NOT_FOUND',
+      this.nextAttemptAt(now, item.attemptNumber),
+      MAX_ATTEMPTS,
+    );
+  }
+
+  private providerInput(
+    item: ReplyDeliveryWorkItem,
+    signal: AbortSignal,
+  ): ReplyToPlatformCommentInput {
+    return {
+      ...this.lookupInput(item, signal),
+      message: item.message,
+    };
+  }
+
+  private lookupInput(
+    item: ReplyDeliveryWorkItem,
+    signal: AbortSignal,
+  ): LookupPlatformReplyInput {
+    return {
+      publicationExternalId: item.publicationExternalId,
+      parentExternalCommentId: item.parentExternalCommentId!,
+      accountExternalId: item.accountExternalId,
+      idempotencyKey: item.idempotencyKey!,
+      signal,
+    };
+  }
+
+  private async withProviderTimeout<T>(
+    call: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
     let timeout: NodeJS.Timeout | undefined;
     const deadline = new Promise<never>((_, reject) => {
@@ -141,17 +235,7 @@ export class ReplyDeliveryWorker
     });
 
     try {
-      return await Promise.race([
-        adapter.replyToComment({
-          publicationExternalId: item.publicationExternalId,
-          parentExternalCommentId: item.parentExternalCommentId!,
-          accountExternalId: item.accountExternalId,
-          message: item.message,
-          idempotencyKey: item.idempotencyKey!,
-          signal: controller.signal,
-        }),
-        deadline,
-      ]);
+      return await Promise.race([call(controller.signal), deadline]);
     } finally {
       if (timeout) clearTimeout(timeout);
     }
