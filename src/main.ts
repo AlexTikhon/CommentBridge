@@ -26,6 +26,7 @@ export async function bootstrap(): Promise<void> {
       'Normalized comment retrieval and idempotent social-platform replies.',
     )
     .setVersion('1.0')
+    .addBearerAuth()
     .build();
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('api/docs', app, document, {

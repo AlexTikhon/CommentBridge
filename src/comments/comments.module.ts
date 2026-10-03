@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AuthModule } from '../auth/auth.module';
 import { PlatformsModule } from '../platforms/platforms.module';
 import { CommentsService } from './application/comments.service';
 import { DeliveryStatsService } from './application/delivery-stats.service';
@@ -18,7 +19,7 @@ import { DeliveryStatsController } from './presentation/delivery-stats.controlle
 import { ReplyDeliveriesController } from './presentation/reply-deliveries.controller';
 
 @Module({
-  imports: [PlatformsModule],
+  imports: [PlatformsModule, AuthModule],
   controllers: [CommentsController, ReplyDeliveriesController, DeliveryStatsController],
   providers: [
     CommentsService,

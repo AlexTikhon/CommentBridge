@@ -108,11 +108,17 @@ curl -i -X POST \
 A new reply is durably queued and returns `202`. A replay remains `202` while
 delivery is pending and returns `200` after delivery reaches `SENT`.
 
+The delivery operations endpoints (status, retry, dead-letter, and stats) require an
+operator API key, `Authorization: Bearer <key>`; see
+[Operator authentication](#operator-authentication). The examples below assume
+`OPERATOR_KEY` holds a configured key.
+
 Inspect the delivery state, its 20 most recent attempts, and its 20 most recent
 manual actions:
 
 ```bash
-curl "http://localhost:3000/api/v1/replies/<reply-id>/delivery"
+curl "http://localhost:3000/api/v1/replies/<reply-id>/delivery" \
+  -H "Authorization: Bearer $OPERATOR_KEY"
 ```
 
 Conditionally schedule a failed reply for another attempt:
@@ -121,7 +127,7 @@ Conditionally schedule a failed reply for another attempt:
 curl -i -X POST \
   "http://localhost:3000/api/v1/replies/<reply-id>/delivery/retry" \
   -H "Content-Type: application/json" \
-  -H "X-Operator-Id: operations@example.com" \
+  -H "Authorization: Bearer $OPERATOR_KEY" \
   -d '{"reason":"Provider incident resolved."}'
 ```
 
@@ -136,13 +142,30 @@ state:
 curl -i -X POST \
   "http://localhost:3000/api/v1/replies/<reply-id>/delivery/dead-letter" \
   -H "Content-Type: application/json" \
-  -H "X-Operator-Id: operations@example.com" \
+  -H "Authorization: Bearer $OPERATOR_KEY" \
   -d '{"reason":"Provider cannot resolve this delivery."}'
 ```
 
-Manual retry and dead-letter transitions store the normalized operator ID, reason,
-previous state, resulting state, and timestamp atomically. Until authentication is
-introduced, `X-Operator-Id` is required but is not an authenticated identity.
+Manual retry and dead-letter transitions store the authenticated operator ID, the
+normalized reason, previous state, resulting state, and timestamp atomically.
+
+### Operator authentication
+
+Operators authenticate with static API keys configured as
+`OPERATOR_API_KEYS=operatorId=key[,operatorId=key]`. Each key must be at least 32
+characters (`openssl rand -hex 32`), and keys and operator IDs must be unique. A
+request is attributed to the operator that owns the matching key; a client-supplied
+`X-Operator-Id` header is ignored. Keys are held only as SHA-256 digests, compared in
+constant time, and never logged or echoed in errors. Missing, malformed, or unknown
+credentials all return the same `401` problem response with
+`WWW-Authenticate: Bearer`.
+
+The endpoints fail closed: with `OPERATOR_API_KEYS` empty, every operations request is
+rejected (a startup warning says so), and malformed settings stop startup. Comment
+and reply endpoints and `/health` stay open. This is deliberately not user
+authentication or tenant authorization: there are no roles, per-endpoint scopes, or
+key rotation workflow. Rotate by adding the new key, deploying, then removing the
+old one.
 
 ## Database model
 
@@ -268,8 +291,8 @@ Invalid values stop startup with an error naming the variable (never its value).
 
 A drain that did any work also writes one JSON log line
 (`{"event":"delivery.drain","durationMs":…,"expiredLeases":…,"reconciled":…,"delivered":…}`);
-idle drains are silent. Messages and provider payloads are never logged. Like the
-other operations endpoints, this one is unauthenticated until authentication is added.
+idle drains are silent. Messages and provider payloads are never logged. It requires
+an operator API key like the other operations endpoints.
 
 ## Pagination
 
@@ -344,11 +367,12 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 
 The durable delivery state machine, provider lookup reconciliation, delivery status,
 conditional manual retry, dead-letter controls, and manual-action audit trail are
-implemented. Production evolution should add authenticated operator identity and
-optionally separate worker deployment. Inbound sync could add authenticated webhooks
-or polling. Tenant authorization, encrypted provider credentials, throttling,
-observability, and retention policies should follow concrete operational
-requirements.
+implemented. Operator API-key authentication and in-process worker observability are
+implemented. Production evolution should add a separate worker deployment, a
+retention policy for finished deliveries and attempt history, and an external
+identity provider in place of static keys. Inbound sync could add authenticated
+webhooks or polling. Tenant authorization, encrypted provider credentials,
+throttling, and metrics export should follow concrete operational requirements.
 
 ## AI-assisted development
 

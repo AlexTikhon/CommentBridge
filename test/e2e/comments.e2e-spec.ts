@@ -12,6 +12,8 @@ import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-in
 import { SEED_IDS } from '../../prisma/seed';
 import { resetAndSeed } from '../database-test-utils';
 
+const operatorAuth = `Bearer ${process.env.OPERATOR_API_KEYS?.split('=')[1] ?? ''}`;
+
 describe('comments API (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaClient;
@@ -229,7 +231,10 @@ describe('comments API (e2e)', () => {
     });
     const deliveryPath = `/api/v1/replies/${failed.id}/delivery`;
 
-    const status = await request(app.getHttpServer()).get(deliveryPath).expect(200);
+    const status = await request(app.getHttpServer())
+      .get(deliveryPath)
+      .set('Authorization', operatorAuth)
+      .expect(200);
     expect(status.body).toEqual(
       expect.objectContaining({
         replyId: failed.id,
@@ -248,11 +253,12 @@ describe('comments API (e2e)', () => {
     const retries = await Promise.all([
       request(app.getHttpServer())
         .post(`${deliveryPath}/retry`)
-        .set('X-Operator-Id', 'e2e-operator')
+        .set('Authorization', operatorAuth)
+        .set('X-Operator-Id', 'mallory')
         .send({ reason: 'Provider incident resolved.' }),
       request(app.getHttpServer())
         .post(`${deliveryPath}/retry`)
-        .set('X-Operator-Id', 'e2e-operator')
+        .set('Authorization', operatorAuth)
         .send({ reason: 'Provider incident resolved.' }),
     ]);
     expect(retries.map((response) => response.status).sort()).toEqual([202, 409]);
@@ -266,7 +272,10 @@ describe('comments API (e2e)', () => {
     });
 
     await worker.processNext(new Date('2100-01-01T00:00:00.000Z'));
-    const delivered = await request(app.getHttpServer()).get(deliveryPath).expect(200);
+    const delivered = await request(app.getHttpServer())
+      .get(deliveryPath)
+      .set('Authorization', operatorAuth)
+      .expect(200);
     expect(delivered.body).toMatchObject({
       status: 'SUCCEEDED',
       attemptCount: 2,
@@ -316,7 +325,7 @@ describe('comments API (e2e)', () => {
 
     const response = await request(app.getHttpServer())
       .post(`/api/v1/replies/${unknown.id}/delivery/retry`)
-      .set('X-Operator-Id', 'e2e-operator')
+      .set('Authorization', operatorAuth)
       .send({ reason: 'Retry ambiguous result.' })
       .expect(409);
     expect(response.body).toMatchObject({
@@ -326,7 +335,7 @@ describe('comments API (e2e)', () => {
 
     const deadLettered = await request(app.getHttpServer())
       .post(`/api/v1/replies/${unknown.id}/delivery/dead-letter`)
-      .set('X-Operator-Id', 'e2e-operator')
+      .set('Authorization', operatorAuth)
       .send({ reason: 'Provider cannot resolve this result.' })
       .expect(200);
     expect(deadLettered.body).toMatchObject({
@@ -355,6 +364,7 @@ describe('comments API (e2e)', () => {
   it('returns 404 for a missing reply delivery', async () => {
     const response = await request(app.getHttpServer())
       .get('/api/v1/replies/99999999-9999-4999-8999-999999999999/delivery')
+      .set('Authorization', operatorAuth)
       .expect(404);
     expect(response.body.code).toBe('DELIVERY_NOT_FOUND');
   });
@@ -416,6 +426,7 @@ describe('comments API (e2e)', () => {
 
     const queued = await request(app.getHttpServer())
       .get('/api/v1/deliveries/stats')
+      .set('Authorization', operatorAuth)
       .expect(200);
     expect(queued.body.queue.countsByStatus).toMatchObject({
       PENDING: 1,
@@ -429,6 +440,7 @@ describe('comments API (e2e)', () => {
 
     const delivered = await request(app.getHttpServer())
       .get('/api/v1/deliveries/stats')
+      .set('Authorization', operatorAuth)
       .expect(200);
     expect(delivered.body.queue.countsByStatus).toMatchObject({
       PENDING: 0,
@@ -440,5 +452,48 @@ describe('comments API (e2e)', () => {
       jobs: { DELIVERY: { SUCCEEDED: expect.any(Number) } },
     });
     expect(delivered.body.worker.jobs.DELIVERY.SUCCEEDED).toBeGreaterThanOrEqual(1);
+  });
+
+  describe('operator authentication', () => {
+    const replyId = '99999999-9999-4999-8999-999999999999';
+    const operations: [string, string][] = [
+      ['get', `/api/v1/replies/${replyId}/delivery`],
+      ['post', `/api/v1/replies/${replyId}/delivery/retry`],
+      ['post', `/api/v1/replies/${replyId}/delivery/dead-letter`],
+      ['get', '/api/v1/deliveries/stats'],
+    ];
+    const open = (method: string, path: string) =>
+      method === 'get'
+        ? request(app.getHttpServer()).get(path)
+        : request(app.getHttpServer()).post(path).send({ reason: 'Not allowed.' });
+
+    it.each(operations)('rejects unauthenticated %s %s', async (method, path) => {
+      const missing = await open(method, path).expect(401);
+      expect(missing.headers['www-authenticate']).toBe('Bearer');
+      expect(missing.headers['content-type']).toContain('application/problem+json');
+      expect(missing.body).toMatchObject({
+        status: 401,
+        requestId: expect.any(String),
+      });
+
+      await open(method, path)
+        .set('Authorization', 'Bearer not-a-configured-operator-key-000000000')
+        .expect(401);
+    });
+
+    it('does not accept the old X-Operator-Id header as credentials', async () => {
+      await request(app.getHttpServer())
+        .post(`/api/v1/replies/${replyId}/delivery/retry`)
+        .set('X-Operator-Id', 'e2e-operator')
+        .send({ reason: 'Spoofed identity.' })
+        .expect(401);
+    });
+
+    it('leaves the comment and health endpoints open', async () => {
+      await request(app.getHttpServer())
+        .get(`/api/v1/posts/${SEED_IDS.post}/comments?limit=1`)
+        .expect(200);
+      await request(app.getHttpServer()).get('/health').expect(200);
+    });
   });
 });

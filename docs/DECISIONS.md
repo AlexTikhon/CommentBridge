@@ -99,8 +99,8 @@ provider failure. It is allowed from `PENDING`, `RETRY`, `FAILED`, and `UNKNOWN`
 is blocked while a worker owns `PROCESSING` or after `SUCCEEDED`. Every successful
 manual retry or dead-letter transition inserts an immutable action row containing
 operator ID, normalized reason, previous state, resulting state, and timestamp in
-the same database transaction. The operator header is audit attribution only until
-authentication supplies a verified principal.
+the same database transaction. The operator is the authenticated principal
+described under Operator authentication below.
 
 ## Lease ownership tokens
 
@@ -135,6 +135,19 @@ metrics dependency until a concrete scraper exists. The same snapshot and counte
 objects can be adapted to Prometheus or OpenTelemetry later without touching the
 worker. Each job reports a closed set of outcomes, including `LEASE_LOST`, so a
 stale write is visible instead of only logged.
+
+## Operator authentication
+
+The operations endpoints can change delivery state and expose queue internals, so
+they require a bearer API key. A static, environment-configured key list is the
+smallest mechanism that gives a verified identity for the audit trail without
+choosing an identity provider or a user model. The operator ID is derived from the
+matched key, never from a request header, so a caller cannot attribute an action to
+someone else. Keys are stored as SHA-256 digests and checked against every
+credential with a constant-time comparison; all failures return one indistinguishable 401. The guard fails closed when no keys are configured. Keys are long random
+secrets rather than passwords, so a fast digest (not a password hash) is
+appropriate. Roles, scopes, per-key expiry, and rotation tooling are intentionally
+out of scope and would come with an external identity provider.
 
 ## Error boundary and request IDs
 

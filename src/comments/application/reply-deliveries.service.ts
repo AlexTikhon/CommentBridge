@@ -85,7 +85,7 @@ export class ReplyDeliveriesService {
     if (actorId.length === 0 || actorId.length > 200) {
       throw new ApplicationError(
         'VALIDATION_ERROR',
-        'X-Operator-Id must contain between 1 and 200 characters.',
+        'Operator ID must contain between 1 and 200 characters.',
       );
     }
     if (reason.length === 0 || reason.length > 1_000) {

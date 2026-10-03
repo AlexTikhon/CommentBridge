@@ -2,23 +2,25 @@ import {
   Body,
   Controller,
   Get,
-  Headers,
   HttpCode,
   HttpStatus,
   Param,
   ParseUUIDPipe,
   Post,
+  UseGuards,
 } from '@nestjs/common';
 import {
   ApiAcceptedResponse,
   ApiBadRequestResponse,
+  ApiBearerAuth,
   ApiConflictResponse,
-  ApiHeader,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
+  ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
+import { CurrentOperator, OperatorAuthGuard } from '../../auth/operator-auth.guard';
 import { ReplyDeliveriesService } from '../application/reply-deliveries.service';
 import type { ReplyDeliveryView } from '../domain/comment.types';
 import { ProblemDetailsDto } from './dto/comment.response';
@@ -26,6 +28,9 @@ import { ManualDeliveryActionDto } from './dto/manual-delivery-action.dto';
 import { ReplyDeliveryResponseDto } from './dto/reply-delivery.response';
 
 @ApiTags('reply deliveries')
+@ApiBearerAuth()
+@ApiUnauthorizedResponse({ type: ProblemDetailsDto })
+@UseGuards(OperatorAuthGuard)
 @Controller('api/v1/replies')
 export class ReplyDeliveriesController {
   constructor(private readonly deliveries: ReplyDeliveriesService) {}
@@ -44,18 +49,17 @@ export class ReplyDeliveriesController {
   @HttpCode(HttpStatus.ACCEPTED)
   @ApiOperation({ summary: 'Conditionally retry a failed reply delivery' })
   @ApiAcceptedResponse({ type: ReplyDeliveryResponseDto })
-  @ApiHeader({ name: 'X-Operator-Id', required: true })
   @ApiBadRequestResponse({ type: ProblemDetailsDto })
   @ApiNotFoundResponse({ type: ProblemDetailsDto })
   @ApiConflictResponse({ type: ProblemDetailsDto })
   async retry(
     @Param('replyId', new ParseUUIDPipe()) replyId: string,
-    @Headers('x-operator-id') actorId: string | undefined,
+    @CurrentOperator() actorId: string,
     @Body() body: ManualDeliveryActionDto,
   ): Promise<ReplyDeliveryResponseDto> {
     return this.toResponse(
       await this.deliveries.retry(replyId, {
-        actorId: actorId ?? '',
+        actorId,
         reason: body.reason,
       }),
     );
@@ -65,18 +69,17 @@ export class ReplyDeliveriesController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Move an eligible reply delivery to dead letter' })
   @ApiOkResponse({ type: ReplyDeliveryResponseDto })
-  @ApiHeader({ name: 'X-Operator-Id', required: true })
   @ApiBadRequestResponse({ type: ProblemDetailsDto })
   @ApiNotFoundResponse({ type: ProblemDetailsDto })
   @ApiConflictResponse({ type: ProblemDetailsDto })
   async deadLetter(
     @Param('replyId', new ParseUUIDPipe()) replyId: string,
-    @Headers('x-operator-id') actorId: string | undefined,
+    @CurrentOperator() actorId: string,
     @Body() body: ManualDeliveryActionDto,
   ): Promise<ReplyDeliveryResponseDto> {
     return this.toResponse(
       await this.deliveries.deadLetter(replyId, {
-        actorId: actorId ?? '',
+        actorId,
         reason: body.reason,
       }),
     );
