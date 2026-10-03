@@ -4,6 +4,7 @@ import { AppModule } from './app.module';
 import { OperatorAuthGuard } from './auth/operator-auth.guard';
 import { CommentsService } from './comments/application/comments.service';
 import { InvalidDeliveryWorkerConfigError } from './comments/application/delivery-worker.config';
+import { DeliveryRetentionService } from './comments/application/delivery-retention.service';
 import { DeliveryWorkerMetrics } from './comments/application/delivery-worker.metrics';
 import { DeliveryWorkerRuntime } from './comments/application/delivery-worker.runtime';
 import { DELIVERY_WORKER_INSTANCE_ID } from './comments/application/delivery-worker.state';
@@ -25,7 +26,23 @@ describe('WorkerModule', () => {
     expect(moduleRef.get(DeliveryWorkerRuntime)).toBeInstanceOf(DeliveryWorkerRuntime);
     expect(moduleRef.get(DeliveryWorkerMetrics)).toBeInstanceOf(DeliveryWorkerMetrics);
     expect(moduleRef.get(PlatformAdapterRegistry, { strict: false })).toBeDefined();
+    expect(moduleRef.get(DeliveryRetentionService)).toBeInstanceOf(
+      DeliveryRetentionService,
+    );
     await moduleRef.close();
+  });
+
+  it('fails fast on an invalid retention configuration', async () => {
+    const previous = process.env.DELIVERY_RETENTION_BATCH_SIZE;
+    process.env.DELIVERY_RETENTION_BATCH_SIZE = '0';
+    try {
+      await expect(compile(WorkerModule)).rejects.toThrow(
+        InvalidDeliveryWorkerConfigError,
+      );
+    } finally {
+      if (previous === undefined) delete process.env.DELIVERY_RETENTION_BATCH_SIZE;
+      else process.env.DELIVERY_RETENTION_BATCH_SIZE = previous;
+    }
   });
 
   it('loads no HTTP surface: no controllers, operator auth, or comment workflow', async () => {
@@ -83,6 +100,7 @@ describe('AppModule', () => {
       ReplyDeliveryWorker,
       DeliveryWorkerRuntime,
       DeliveryWorkerMetrics,
+      DeliveryRetentionService,
     ]) {
       expect(() => moduleRef.get(worker, { strict: false })).toThrow();
     }

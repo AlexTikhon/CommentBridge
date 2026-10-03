@@ -17,6 +17,15 @@ describe('loadDeliveryWorkerConfig', () => {
       maxReconciliationsPerTick: 3,
       heartbeatIntervalMs: 10_000,
       staleAfterMs: 30_000,
+      retention: {
+        enabled: true,
+        attemptRetentionDays: 90,
+        manualActionRetentionDays: 365,
+        intervalMs: 3_600_000,
+        batchSize: 500,
+        minAttemptsPerDelivery: 3,
+        maxBatchesPerRun: 100,
+      },
     });
   });
 
@@ -45,6 +54,7 @@ describe('loadDeliveryWorkerConfig', () => {
       maxReconciliationsPerTick: 3,
       heartbeatIntervalMs: 2_000,
       staleAfterMs: 7_000,
+      retention: expect.objectContaining({ enabled: true, batchSize: 500 }),
     });
   });
 
@@ -151,5 +161,83 @@ describe('removedWorkerSettingWarnings', () => {
     expect(rest).toEqual([]);
     expect(warning).toContain('DELIVERY_WORKER_ENABLED is no longer used');
     expect(warning).toContain('start:worker');
+  });
+});
+
+describe('delivery retention settings', () => {
+  const retention = (env: NodeJS.ProcessEnv) => loadDeliveryWorkerConfig(env).retention;
+
+  it('reads overrides from the same loader as the worker settings', () => {
+    expect(
+      retention({
+        DELIVERY_RETENTION_ENABLED: 'false',
+        DELIVERY_ATTEMPT_RETENTION_DAYS: '30',
+        DELIVERY_MANUAL_ACTION_RETENTION_DAYS: '30',
+        DELIVERY_RETENTION_INTERVAL_MS: '60000',
+        DELIVERY_RETENTION_BATCH_SIZE: '50',
+        DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY: '1',
+      }),
+    ).toMatchObject({
+      enabled: false,
+      attemptRetentionDays: 30,
+      manualActionRetentionDays: 30,
+      intervalMs: 60_000,
+      batchSize: 50,
+      minAttemptsPerDelivery: 1,
+    });
+  });
+
+  it.each([
+    ['DELIVERY_RETENTION_ENABLED', 'maybe'],
+    ['DELIVERY_RETENTION_ENABLED', '1'],
+    ['DELIVERY_ATTEMPT_RETENTION_DAYS', '0'],
+    ['DELIVERY_ATTEMPT_RETENTION_DAYS', '-1'],
+    ['DELIVERY_ATTEMPT_RETENTION_DAYS', '1.5'],
+    ['DELIVERY_ATTEMPT_RETENTION_DAYS', '999999'],
+    ['DELIVERY_MANUAL_ACTION_RETENTION_DAYS', '0'],
+    ['DELIVERY_RETENTION_BATCH_SIZE', '0'],
+    ['DELIVERY_RETENTION_BATCH_SIZE', '100000'],
+    ['DELIVERY_RETENTION_INTERVAL_MS', '0'],
+    ['DELIVERY_RETENTION_INTERVAL_MS', 'hourly'],
+    ['DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY', '0'],
+  ])('rejects invalid %s=%s', (name, value) => {
+    expect(() => loadDeliveryWorkerConfig({ [name]: value })).toThrow(
+      InvalidDeliveryWorkerConfigError,
+    );
+  });
+
+  it('refuses to keep audit history for less time than attempt history', () => {
+    expect(() =>
+      retention({
+        DELIVERY_ATTEMPT_RETENTION_DAYS: '90',
+        DELIVERY_MANUAL_ACTION_RETENTION_DAYS: '89',
+      }),
+    ).toThrow(/DELIVERY_MANUAL_ACTION_RETENTION_DAYS must not be less than/);
+  });
+
+  it('accepts equal attempt and audit retention', () => {
+    expect(
+      retention({
+        DELIVERY_ATTEMPT_RETENTION_DAYS: '90',
+        DELIVERY_MANUAL_ACTION_RETENTION_DAYS: '90',
+      }),
+    ).toMatchObject({ attemptRetentionDays: 90, manualActionRetentionDays: 90 });
+  });
+
+  it('checks an attempt override against the audit default', () => {
+    expect(() => retention({ DELIVERY_ATTEMPT_RETENTION_DAYS: '400' })).toThrow(
+      /DELIVERY_MANUAL_ACTION_RETENTION_DAYS must not be less than/,
+    );
+  });
+
+  it('does not echo rejected values', () => {
+    let message = '';
+    try {
+      retention({ DELIVERY_RETENTION_BATCH_SIZE: 'hunter2' });
+    } catch (error: unknown) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('DELIVERY_RETENTION_BATCH_SIZE');
+    expect(message).not.toContain('hunter2');
   });
 });

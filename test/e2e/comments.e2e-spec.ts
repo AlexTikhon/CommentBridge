@@ -6,6 +6,7 @@ import { CommentDirection, DeliveryStatus, type PrismaClient } from '@prisma/cli
 import { ReplyDeliveryAttemptStatus, ReplyDeliveryStatus } from '@prisma/client';
 import * as request from 'supertest';
 import { AppModule } from '../../src/app.module';
+import { DeliveryRetentionService } from '../../src/comments/application/delivery-retention.service';
 import { DeliveryWorkerMetrics } from '../../src/comments/application/delivery-worker.metrics';
 import { DeliveryWorkerRuntime } from '../../src/comments/application/delivery-worker.runtime';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
@@ -374,6 +375,75 @@ describe('comments API (e2e)', () => {
     expect(stored.deliveryStatus).toBe(DeliveryStatus.FAILED);
     expect(stored.providerErrorCode).toBe('MANUALLY_DEAD_LETTERED');
     expect(stored.delivery?.status).toBe(ReplyDeliveryStatus.DEAD_LETTERED);
+  });
+
+  describe('after delivery history retention', () => {
+    const base = Date.parse('2100-01-01T00:00:00.000Z');
+    const day = 86_400_000;
+
+    it('keeps status, retry, dead-letter and stats working on pruned history', async () => {
+      const accepted = await request(app.getHttpServer())
+        .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
+        .set('Idempotency-Key', 'e2e-retention')
+        .send({ message: '[test:provider-unavailable]' })
+        .expect(202);
+      const deliveryPath = `/api/v1/replies/${accepted.body.reply.id}/delivery`;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await worker.processNext(new Date(base + attempt * day));
+      }
+
+      // The worker's own retention service, evaluated a year after the attempts.
+      const pruned = await workerModule
+        .get(DeliveryRetentionService)
+        .run(new Date(base + 400 * day));
+      expect(pruned).toMatchObject({ deletedAttempts: 2, failed: false });
+
+      const status = await request(app.getHttpServer())
+        .get(deliveryPath)
+        .set('Authorization', operatorAuth)
+        .expect(200);
+      expect(status.body).toMatchObject({ status: 'FAILED', attemptCount: 5 });
+      expect(
+        (status.body as { attempts: Array<{ attemptNumber: number }> }).attempts.map(
+          (attempt) => attempt.attemptNumber,
+        ),
+      ).toEqual([5, 4, 3]);
+
+      await request(app.getHttpServer())
+        .post(`${deliveryPath}/retry`)
+        .set('Authorization', operatorAuth)
+        .send({ reason: 'Provider incident resolved.' })
+        .expect(202);
+      await worker.processNext(new Date(base + 401 * day));
+
+      const retried = await request(app.getHttpServer())
+        .get(deliveryPath)
+        .set('Authorization', operatorAuth)
+        .expect(200);
+      expect(retried.body).toMatchObject({ status: 'FAILED', attemptCount: 6 });
+      expect(
+        (retried.body as { attempts: Array<{ attemptNumber: number }> }).attempts.map(
+          (attempt) => attempt.attemptNumber,
+        ),
+      ).toEqual([6, 5, 4, 3]);
+
+      await request(app.getHttpServer())
+        .post(`${deliveryPath}/dead-letter`)
+        .set('Authorization', operatorAuth)
+        .send({ reason: 'Giving up on this reply.' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`${deliveryPath}/dead-letter`)
+        .set('Authorization', operatorAuth)
+        .send({ reason: 'Again.' })
+        .expect(409);
+
+      const stats = await request(app.getHttpServer())
+        .get('/api/v1/deliveries/stats')
+        .set('Authorization', operatorAuth)
+        .expect(200);
+      expect(stats.body.queue.countsByStatus).toMatchObject({ DEAD_LETTERED: 1 });
+    });
   });
 
   it('returns 404 for a missing reply delivery', async () => {

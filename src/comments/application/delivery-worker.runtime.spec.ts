@@ -7,6 +7,10 @@ import {
   type DeliveryWorkerConfig,
 } from './delivery-worker.config';
 import { DeliveryWorkerMetrics } from './delivery-worker.metrics';
+import type {
+  DeliveryRetentionResult,
+  DeliveryRetentionService,
+} from './delivery-retention.service';
 import { DeliveryWorkerRuntime } from './delivery-worker.runtime';
 import type { DeliveryWorkerStateRepository } from './ports/delivery-worker-state.repository';
 import type { ReplyDeliveryRepository } from './ports/reply-delivery.repository';
@@ -37,6 +41,19 @@ function stateMock(): jest.Mocked<DeliveryWorkerStateRepository> {
   };
 }
 
+function retentionResult(): DeliveryRetentionResult {
+  return {
+    deletedAttempts: 0,
+    deletedManualActions: 0,
+    batchCount: 2,
+    durationMs: 1,
+    attemptCutoff: startTime,
+    manualActionCutoff: startTime,
+    capped: false,
+    failed: false,
+  };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {
@@ -50,24 +67,31 @@ describe('DeliveryWorkerRuntime', () => {
   let drain: jest.Mock<Promise<DrainResult>, []>;
   let stop: jest.Mock;
   let metrics: DeliveryWorkerMetrics;
+  let retentionRun: jest.Mock<
+    Promise<DeliveryRetentionResult>,
+    [Date?, (() => boolean)?]
+  >;
   let log: jest.SpyInstance;
   let warn: jest.SpyInstance;
 
-  function createRuntime(overrides: Partial<DeliveryWorkerConfig> = {}) {
+  function createRuntime(
+    overrides: Partial<DeliveryWorkerConfig> = {},
+    retention: Partial<DeliveryWorkerConfig['retention']> = {},
+  ) {
     const worker = { drain, stop } as unknown as ReplyDeliveryWorker;
+    const config = loadDeliveryWorkerConfig({
+      DELIVERY_POLL_INTERVAL_MS: '1000',
+      DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS: '10000',
+      DELIVERY_WORKER_STALE_AFTER_MS: '30000',
+      DELIVERY_RETENTION_INTERVAL_MS: '60000',
+    });
     return new DeliveryWorkerRuntime(
       worker,
       metrics,
       state,
-      {
-        ...loadDeliveryWorkerConfig({
-          DELIVERY_POLL_INTERVAL_MS: '1000',
-          DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS: '10000',
-          DELIVERY_WORKER_STALE_AFTER_MS: '30000',
-        }),
-        ...overrides,
-      },
+      { ...config, ...overrides, retention: { ...config.retention, ...retention } },
       INSTANCE_ID,
+      { run: retentionRun } as unknown as DeliveryRetentionService,
     );
   }
 
@@ -79,6 +103,7 @@ describe('DeliveryWorkerRuntime', () => {
     state = stateMock();
     drain = jest.fn().mockResolvedValue(drainResult());
     stop = jest.fn();
+    retentionRun = jest.fn().mockResolvedValue(retentionResult());
     metrics = new DeliveryWorkerMetrics();
     log = jest.spyOn(Logger.prototype, 'log').mockImplementation();
     warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
@@ -458,6 +483,154 @@ describe('DeliveryWorkerRuntime', () => {
     });
   });
 
+  describe('retention maintenance', () => {
+    it('runs once at startup and then on its own interval', async () => {
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(retentionRun).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(60_000 * 3);
+      expect(retentionRun).toHaveBeenCalledTimes(4);
+      await runtime.onModuleDestroy();
+    });
+
+    it('is not tied to polling: a busy queue does not cause more runs', async () => {
+      drain.mockResolvedValue(drainResult({ delivered: 5 }));
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(59_000);
+
+      expect(drain.mock.calls.length).toBeGreaterThan(50);
+      expect(retentionRun).toHaveBeenCalledTimes(1);
+      await runtime.onModuleDestroy();
+    });
+
+    it('still runs while the queue is idle', async () => {
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(120_000);
+
+      expect(state.recordDrain).not.toHaveBeenCalled();
+      expect(retentionRun.mock.calls.length).toBeGreaterThanOrEqual(3);
+      await runtime.onModuleDestroy();
+    });
+
+    it('hands the service the current time and a stop signal', async () => {
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      const [at, shouldStop] = retentionRun.mock.calls[0] ?? [];
+      expect(at).toEqual(startTime);
+      expect(shouldStop?.()).toBe(false);
+      await runtime.onModuleDestroy();
+      expect(shouldStop?.()).toBe(true);
+    });
+
+    it('never runs when disabled and schedules no timer for it', async () => {
+      const runtime = createRuntime({}, { enabled: false });
+
+      await runtime.start();
+      const timers = jest.getTimerCount();
+      await jest.advanceTimersByTimeAsync(300_000);
+
+      expect(retentionRun).not.toHaveBeenCalled();
+      expect(timers).toBe(2);
+      await runtime.onModuleDestroy();
+    });
+
+    it('never overlaps two runs', async () => {
+      const slow = deferred<DeliveryRetentionResult>();
+      retentionRun.mockReturnValueOnce(slow.promise);
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(300_000);
+      expect(retentionRun).toHaveBeenCalledTimes(1);
+
+      slow.resolve(retentionResult());
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(retentionRun).toHaveBeenCalledTimes(2);
+      await runtime.onModuleDestroy();
+    });
+
+    it('survives an unexpected rejection and tries again next interval', async () => {
+      retentionRun.mockRejectedValueOnce(new Error('postgresql://u:secret@db/app'));
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(60_000);
+
+      expect(retentionRun).toHaveBeenCalledTimes(2);
+      expect(String(warn.mock.calls.at(-1)?.[0])).not.toContain('secret');
+      await runtime.onModuleDestroy();
+    });
+
+    it('does not disturb polling or heartbeats', async () => {
+      retentionRun.mockRejectedValue(new Error('boom'));
+      const runtime = createRuntime();
+
+      await runtime.start();
+      state.heartbeat.mockClear();
+      await jest.advanceTimersByTimeAsync(25_000);
+
+      expect(state.heartbeat).toHaveBeenCalledTimes(2);
+      expect(metrics.snapshot().drainFailures).toBe(0);
+      await runtime.onModuleDestroy();
+    });
+
+    it('starts no run after shutdown begins and leaves no timer behind', async () => {
+      const runtime = createRuntime();
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      await runtime.onModuleDestroy();
+      await jest.advanceTimersByTimeAsync(600_000);
+
+      expect(retentionRun).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('waits for a run already in flight before shutdown completes', async () => {
+      const slow = deferred<DeliveryRetentionResult>();
+      retentionRun.mockReturnValueOnce(slow.promise);
+      const runtime = createRuntime();
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      let destroyed = false;
+      const destroying = runtime.onModuleDestroy().then(() => {
+        destroyed = true;
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(destroyed).toBe(false);
+
+      slow.resolve(retentionResult());
+      await destroying;
+      expect(destroyed).toBe(true);
+    });
+
+    it('starts no run when shutdown begins during registration', async () => {
+      const registering = deferred<void>();
+      state.register.mockReturnValue(registering.promise);
+      const runtime = createRuntime();
+
+      const starting = runtime.start();
+      const destroying = runtime.onModuleDestroy();
+      registering.resolve();
+      await starting;
+      await destroying;
+      await jest.advanceTimersByTimeAsync(600_000);
+
+      expect(retentionRun).not.toHaveBeenCalled();
+    });
+  });
+
   describe('with the real worker', () => {
     function workItem(): ReplyDeliveryWorkItem {
       return {
@@ -498,7 +671,9 @@ describe('DeliveryWorkerRuntime', () => {
         config,
         metrics,
       );
-      return new DeliveryWorkerRuntime(worker, metrics, state, config, INSTANCE_ID);
+      return new DeliveryWorkerRuntime(worker, metrics, state, config, INSTANCE_ID, {
+        run: retentionRun,
+      } as unknown as DeliveryRetentionService);
     }
 
     it('persists the summary of a drain that delivered work', async () => {

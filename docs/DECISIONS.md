@@ -166,9 +166,56 @@ than one per poll. The worker instance ID identifies a process and is unrelated 
 delivery's lease token, which guards ownership of one delivery. Cleanup is a single
 prune of rows past a 24-hour window when a worker starts: the table grows only with
 restarts, so a retention job would be disproportionate until delivery history gets
-one. Timestamps use each process clock, so host clock skew must stay well below the
+one. (Delivery history has since gained one, below; this prune stays separate
+because it is a single statement at startup and the two tables have unrelated policies.)
+Timestamps use each process clock, so host clock skew must stay well below the
 stale threshold; using the database clock for staleness is the upgrade if that
 becomes a problem.
+
+## Delivery history retention
+
+The three delivery tables answer different questions, so they get different lifetimes.
+`ReplyDelivery` is **current domain state**: one row per reply, holding status, the
+authoritative attempt counter and the last error. `GET /api/v1/replies/:id/delivery`
+returns 404 without it, retry and dead-letter are decided from it, and it carries no
+history that outlives the reply, so it is retained for as long as the reply exists.
+Nothing in this system deletes replies, so retention never deletes deliveries and does
+not invent a parent-deletion mechanism. `ReplyDeliveryAttempt` is **operational
+execution history**: useful for diagnosing recent behavior, worthless after a few months,
+and growing with every retry, so it is pruned (90 days). `ReplyDeliveryManualAction` is
+**operator audit history**: written once, small, and what answers "who changed this and
+why", so it is kept longer (365 days) and startup refuses a configuration that expires
+it before the attempts.
+
+Eligibility is decided inside the deleting SQL statement, never by selecting ids and
+deleting them later. A delivery must be settled (`SUCCEEDED`, `FAILED`, `DEAD_LETTERED`);
+`UNKNOWN` is not settled, because reconciliation rewrites the attempt numbered
+`attemptCount` and would fail if it were gone. `FAILED` is settled for workers but an
+operator may retry it, so the newest N attempts (default 3) always remain; a retry only
+appends attempt `attemptCount + 1`. The attempt counter lives on the delivery and is
+incremented at claim time, so deleting rows cannot cause an attempt number to be reused.
+Batches select with `FOR UPDATE … SKIP LOCKED` on the attempt and `FOR SHARE … SKIP LOCKED`
+on its delivery: concurrent runners split the work instead of waiting, the delivery's
+state is re-checked under the lock, and a delivery an operator or worker is changing is
+skipped. Each statement deletes at most one batch (500) and a pass is capped at 100
+batches per table. The cap also bounds shutdown latency, since a stop request is checked
+between batches.
+
+Retention runs from the worker process on its own timer, not per poll, and is safe with
+several workers because duplicate passes only find fewer rows. Visibility is structured
+logs rather than new columns on `DeliveryWorkerInstance`: that table describes a process
+and its drains, an hourly pass is not worth another migration, and logs already carry the
+counts. Dry-run was left out: a mode that deletes nothing cannot drain a backlog the way
+a real pass does, so it would need separate counting SQL that could drift from the
+deleting SQL.
+
+Measured, not assumed: against 500,000 deliveries and 700,000 attempts, one statement
+took roughly one second whether or not the table had an index on `finishedAt` (950 ms
+versus 1,357 ms with work available, 1,095 ms versus 1,202 ms with none), because cost
+is dominated by re-checking old attempts that are kept by design. An index was therefore
+not added. The steady-state cost grows with the number of settled deliveries, which is
+acceptable for an hourly job until tens of millions of deliveries; the next step then is
+a high-water mark or time partitioning, not an index.
 
 ## Operator authentication
 

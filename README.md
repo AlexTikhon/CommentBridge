@@ -324,9 +324,9 @@ The worker process starts with `NestFactory.createApplicationContext` (no HTTP
 listener), registers itself, then polls and heartbeats until it receives a signal.
 A fatal startup error (invalid configuration, database unreachable) exits non-zero.
 
-On `SIGTERM` or `SIGINT` the runtime stops the poll and heartbeat timers, starts no
-further jobs, and waits for the job already in flight (bounded by the provider
-timeout) before the database connection closes and the process exits. A second signal
+On `SIGTERM` or `SIGINT` the runtime stops the poll, heartbeat, and retention
+timers, starts no further jobs or cleanup batches, and waits for the job (bounded by
+the provider timeout) and any single cleanup batch already in flight before the database connection closes and the process exits. A second signal
 exits immediately. A hard kill is still safe: the unfinished lease expires into
 `UNKNOWN` and is resolved by provider lookup. Shutdown writes nothing to shared
 state; the worker simply goes `STALE` when its heartbeat ages out.
@@ -433,6 +433,68 @@ idle drains are silent. The worker logs `delivery-worker.starting`,
 `delivery-worker.shutdown-complete` with its `workerInstanceId`; heartbeats are not
 logged. Messages, provider payloads, and credentials are never logged.
 
+## Data retention
+
+Delivery data falls into four classes with different lifetimes:
+
+| Data                                                    | Class               | Retention                                               |
+| ------------------------------------------------------- | ------------------- | ------------------------------------------------------- |
+| `Comment` (inbound comments and replies)                | Domain state        | Kept                                                    |
+| `ReplyDelivery`                                         | Domain state        | **Kept for the lifetime of its reply; never pruned**    |
+| `ReplyDeliveryAttempt`                                  | Operational history | Pruned after 90 days; newest 3 per delivery always kept |
+| `ReplyDeliveryManualAction` (retry / dead-letter audit) | Audit history       | Pruned after 365 days                                   |
+| `DeliveryWorkerInstance`                                | Ephemeral runtime   | Pruned by the worker at startup (24 h), unchanged       |
+
+`ReplyDelivery` is kept because the API depends on it: `GET /api/v1/replies/:id/delivery`
+returns 404 without the row, and the row holds the current status, attempt counter and
+last error. Only its child history is pruned, so every delivery endpoint behaves the
+same after pruning; the attempt and manual-action lists in the delivery response are
+simply shorter. The attempt list is therefore recent history, not a permanent log, and
+`attemptCount` (a counter on the delivery, not a row count) still reports the true total.
+
+**Attempts** are deleted only when all of these hold in the deleting statement:
+
+- the attempt finished (`finishedAt` set; an open attempt is never touched) before the cutoff;
+- its delivery is `SUCCEEDED`, `FAILED`, or `DEAD_LETTERED`. `PENDING`, `RETRY`,
+  `PROCESSING` and `UNKNOWN` deliveries keep everything, because `UNKNOWN` reconciliation
+  rewrites the attempt numbered `attemptCount`;
+- at least `DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY` newer attempts of the same
+  delivery exist, so the latest outcomes survive however old they are. `FAILED` can still
+  be retried by an operator; a retry only creates attempt `attemptCount + 1` and reads
+  nothing older.
+
+**Manual actions** are deleted once older than their own, longer, cutoff and only for
+settled deliveries. No state transition reads them. They are written once and never
+updated by the application; only retention removes them.
+
+Pruning cannot reuse an attempt number: the next number comes from
+`ReplyDelivery.attemptCount`, which is incremented when a delivery is claimed.
+
+Retention runs inside the **worker** process, on its own timer (once at startup, then
+every `DELIVERY_RETENTION_INTERVAL_MS`), independent of polling: a busy queue does not
+prune more often and an idle one still prunes. Any number of workers may run it. Each pass
+deletes at most `DELIVERY_RETENTION_BATCH_SIZE` rows per statement, at most 100
+statements per table per run, and rows another transaction holds are skipped rather than
+waited for, so concurrent passes simply find less to do. A pass logs
+`{"event":"delivery-retention.completed","deletedAttempts":…,"deletedManualActions":…,"batchCount":…,"durationMs":…,"attemptCutoff":…,"manualActionCutoff":…,"capped":…}`
+when it deleted something (`debug` level when it found nothing) and
+`delivery-retention.failed` with the error name on failure. Row contents are never
+logged. There is no dry-run mode and no HTTP endpoint; to pause pruning set
+`DELIVERY_RETENTION_ENABLED=false`.
+
+| Variable                                       | Default   | Meaning                                                  |
+| ---------------------------------------------- | --------- | -------------------------------------------------------- |
+| `DELIVERY_RETENTION_ENABLED`                   | `true`    | `false` disables pruning entirely                        |
+| `DELIVERY_ATTEMPT_RETENTION_DAYS`              | `90`      | Age after which finished attempts may be pruned          |
+| `DELIVERY_MANUAL_ACTION_RETENTION_DAYS`        | `365`     | Age after which audit rows may be pruned; at least above |
+| `DELIVERY_RETENTION_INTERVAL_MS`               | `3600000` | Time between passes of one worker                        |
+| `DELIVERY_RETENTION_BATCH_SIZE`                | `500`     | Maximum rows deleted per statement                       |
+| `DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY` | `3`       | Newest attempts always kept per delivery (at least 1)    |
+
+Values are validated at startup like the other delivery settings (the API shares the loader, so
+an invalid value stops it too, but only the worker ever prunes); the audit retention may not be
+shorter than the attempt retention.
+
 ## Pagination
 
 Pages use descending keyset pagination over effective creation time and UUID. An
@@ -506,10 +568,8 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 The durable delivery state machine, provider lookup reconciliation, delivery status,
 conditional manual retry, dead-letter controls, and manual-action audit trail are
 implemented. Operator API-key authentication, the standalone worker process, and
-PostgreSQL-backed worker heartbeats are implemented. Production evolution should
-add a
-retention policy for finished deliveries and attempt history, and an external
-identity provider in place of static keys. Inbound sync could add authenticated
+PostgreSQL-backed worker heartbeats and delivery history retention are implemented.
+Production evolution should add an external identity provider in place of static keys. Inbound sync could add authenticated
 webhooks or polling. Tenant authorization, encrypted provider credentials,
 throttling, and metrics export should follow concrete operational requirements.
 

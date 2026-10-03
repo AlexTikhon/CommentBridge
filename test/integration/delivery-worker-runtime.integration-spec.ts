@@ -1,8 +1,12 @@
 import { Logger } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { CommentsService } from '../../src/comments/application/comments.service';
+import { DeliveryRetentionService } from '../../src/comments/application/delivery-retention.service';
 import { DeliveryStatsService } from '../../src/comments/application/delivery-stats.service';
-import { loadDeliveryWorkerConfig } from '../../src/comments/application/delivery-worker.config';
+import {
+  loadDeliveryWorkerConfig,
+  type DeliveryWorkerConfig,
+} from '../../src/comments/application/delivery-worker.config';
 import { DeliveryWorkerMetrics } from '../../src/comments/application/delivery-worker.metrics';
 import { DeliveryWorkerRuntime } from '../../src/comments/application/delivery-worker.runtime';
 import {
@@ -12,6 +16,7 @@ import {
 import type { DeliveryDrainRecord } from '../../src/comments/application/ports/delivery-worker-state.repository';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
 import { PrismaCommentRepository } from '../../src/comments/infrastructure/prisma-comment.repository';
+import { PrismaDeliveryRetentionRepository } from '../../src/comments/infrastructure/prisma-delivery-retention.repository';
 import { PrismaDeliveryWorkerStateRepository } from '../../src/comments/infrastructure/prisma-delivery-worker-state.repository';
 import { PrismaReplyDeliveryRepository } from '../../src/comments/infrastructure/prisma-reply-delivery.repository';
 import type { PrismaService } from '../../src/database/prisma.service';
@@ -316,7 +321,10 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
     });
     const runtimes: DeliveryWorkerRuntime[] = [];
 
-    function startableRuntime(instanceId: string) {
+    function startableRuntime(
+      instanceId: string,
+      runtimeConfig: DeliveryWorkerConfig = config,
+    ) {
       const adapters = new PlatformAdapterRegistry([
         new MockInstagramAdapter(),
         new MockLinkedInAdapter(),
@@ -326,13 +334,17 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
         new ReplyDeliveryWorker(
           new PrismaReplyDeliveryRepository(workerPrisma as PrismaService),
           adapters,
-          config,
+          runtimeConfig,
           metrics,
         ),
         metrics,
         workerState,
-        config,
+        runtimeConfig,
         instanceId,
+        new DeliveryRetentionService(
+          new PrismaDeliveryRetentionRepository(workerPrisma as PrismaService),
+          runtimeConfig,
+        ),
       );
       runtimes.push(runtime);
       return runtime;
@@ -436,6 +448,60 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
         'runtime-a',
         'runtime-b',
       ]);
+    });
+
+    it('prunes eligible history on its own schedule and touches nothing else', async () => {
+      const comments = new CommentsService(
+        new PrismaCommentRepository(workerPrisma as PrismaService),
+        new PlatformAdapterRegistry([new MockInstagramAdapter()]),
+      );
+      const queue = async (key: string) =>
+        (await comments.replyToComment(SEED_IDS.instagramComment, key, key)).reply.id;
+      const settledReply = await queue('runtime-retention-settled');
+      const activeReply = await queue('runtime-retention-active');
+      const longAgo = new Date(Date.now() - 200 * 86_400_000);
+      for (const [replyId, status] of [
+        [settledReply, 'SUCCEEDED'],
+        [activeReply, 'UNKNOWN'],
+      ] as const) {
+        const delivery = await workerPrisma.replyDelivery.update({
+          where: { replyId },
+          data: { status, attemptCount: 4, nextAttemptAt: new Date('2100-01-01') },
+        });
+        await workerPrisma.replyDeliveryAttempt.createMany({
+          data: [1, 2, 3, 4].map((attemptNumber) => ({
+            deliveryId: delivery.id,
+            attemptNumber,
+            status: 'RETRYABLE_FAILURE' as const,
+            startedAt: longAgo,
+            finishedAt: longAgo,
+          })),
+        });
+      }
+      const retentionConfig = loadDeliveryWorkerConfig({
+        DELIVERY_POLL_INTERVAL_MS: '100',
+        DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS: '200',
+        DELIVERY_RETENTION_INTERVAL_MS: '200',
+        DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY: '1',
+      });
+
+      await startableRuntime('runtime-retention', retentionConfig).start();
+
+      await eventually(async () =>
+        (await workerPrisma.replyDeliveryAttempt.count({
+          where: { delivery: { replyId: settledReply } },
+        })) === 1
+          ? true
+          : null,
+      );
+      await expect(
+        workerPrisma.replyDeliveryAttempt.count({
+          where: { delivery: { replyId: activeReply } },
+        }),
+      ).resolves.toBe(4);
+      await expect(
+        workerPrisma.replyDelivery.count({ where: { replyId: settledReply } }),
+      ).resolves.toBe(1);
     });
 
     it('stops heartbeating at shutdown and then ages out to STALE', async () => {
