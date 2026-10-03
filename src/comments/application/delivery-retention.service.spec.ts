@@ -126,7 +126,11 @@ describe('DeliveryRetentionService', () => {
 
     expect(repository.pruneAttempts).toHaveBeenCalledTimes(1);
     expect(repository.pruneManualActions).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ deletedAttempts: 2, failed: false });
+    expect(result).toMatchObject({
+      deletedAttempts: 2,
+      failed: false,
+      errorCode: null,
+    });
   });
 
   it('starts nothing when already stopping', async () => {
@@ -164,7 +168,12 @@ describe('DeliveryRetentionService', () => {
 
     const result = await createService().run(now);
 
-    expect(result).toMatchObject({ failed: true, deletedAttempts: 2 });
+    expect(result).toMatchObject({
+      failed: true,
+      deletedAttempts: 2,
+      errorCode: 'Error',
+    });
+    expect(JSON.stringify(result)).not.toContain('secret');
     expect(repository.pruneManualActions).not.toHaveBeenCalled();
     const [failure] = logged(error);
     expect(failure).toMatchObject({
@@ -173,5 +182,20 @@ describe('DeliveryRetentionService', () => {
       errorName: 'Error',
     });
     expect(JSON.stringify(failure)).not.toContain('secret');
+  });
+
+  it.each([
+    ['a non-Error throw', 'postgresql://u:secret@db', 'UnknownError'],
+    [
+      'an error whose name carries unsafe text',
+      Object.assign(new Error('x'), { name: 'Bad Name: secret=1' }),
+      'UnknownError',
+    ],
+  ])('reduces %s to a safe code', async (_label, thrown, expected) => {
+    repository.pruneAttempts.mockRejectedValueOnce(thrown);
+
+    const result = await createService().run(now);
+
+    expect(result.errorCode).toBe(expected);
   });
 });

@@ -1,6 +1,7 @@
 import type { PlatformCommentResult } from '../../../platforms/domain/platform.types';
 import type {
   ConditionalDeliveryActionResult,
+  DeliveryQueueHealthSnapshot,
   DeliveryQueueSnapshot,
   ManualDeliveryActionInput,
   ReplyDeliveryView,
@@ -54,6 +55,11 @@ export interface ReplyDeliveryRepository {
   ): Promise<void>;
   /** Read-only queue depth and lag as of `now`, from one consistent statement. */
   getQueueSnapshot(now: Date): Promise<DeliveryQueueSnapshot>;
+  /**
+   * Cheap, index-backed facts for health evaluation: the oldest due delivery and
+   * the unresolved UNKNOWN set. Safe to poll; it never scans settled history.
+   */
+  getHealthSnapshot(now: Date): Promise<DeliveryQueueHealthSnapshot>;
   /** Moves genuinely expired PROCESSING deliveries to UNKNOWN; returns how many. */
   reconcileExpiredLeases(now: Date): Promise<number>;
 }

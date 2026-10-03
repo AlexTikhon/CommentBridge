@@ -14,6 +14,30 @@ export interface DeliveryWorkerConfig {
   /** A worker whose last heartbeat is older than this is reported STALE. */
   staleAfterMs: number;
   retention: DeliveryRetentionConfig;
+  health: DeliveryHealthConfig;
+}
+
+/**
+ * Thresholds for GET /api/v1/deliveries/health. Only the API process evaluates
+ * them, but they share the loader (and so the fail-fast validation) with the rest
+ * of the delivery settings. Every threshold is inclusive: a value equal to the
+ * threshold already counts as that severity.
+ */
+export interface DeliveryHealthConfig {
+  /** When false, having no active worker is not an issue (for example in local dev). */
+  workerRequired: boolean;
+  /** How long the system may be without an active worker before that is CRITICAL. */
+  noWorkerGraceMs: number;
+  /** Oldest due PENDING/RETRY delivery age that is DEGRADED. */
+  queueLagWarnMs: number;
+  /** Oldest due PENDING/RETRY delivery age that is CRITICAL. */
+  queueLagCriticalMs: number;
+  /** Age of the oldest unresolved UNKNOWN outcome that is DEGRADED. */
+  unknownAgeWarnMs: number;
+  /** Age of the oldest unresolved UNKNOWN outcome that is CRITICAL. */
+  unknownAgeCriticalMs: number;
+  /** Retention is overdue after this many intervals without a successful run. */
+  retentionOverdueMultiplier: number;
 }
 
 /**
@@ -75,6 +99,36 @@ export function loadDeliveryWorkerConfig(
     return value;
   };
 
+  // Like `integer`, but zero is meaningful (a grace period of "none").
+  const nonNegativeInteger = (name: string, fallback: number): number => {
+    const raw = env[name]?.trim();
+    if (!raw) return fallback;
+    const value = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value > MAX_TIMER_MS) {
+      problems.push(
+        `${name} must be a non-negative integer no greater than ${MAX_TIMER_MS}`,
+      );
+      return fallback;
+    }
+    return value;
+  };
+
+  const positiveNumber = (name: string, fallback: number, max: number): number => {
+    const raw = env[name]?.trim();
+    if (!raw) return fallback;
+    const value = Number(raw);
+    if (
+      !/^\d+(\.\d+)?$/.test(raw) ||
+      !Number.isFinite(value) ||
+      value <= 0 ||
+      value > max
+    ) {
+      problems.push(`${name} must be a positive number no greater than ${max}`);
+      return fallback;
+    }
+    return value;
+  };
+
   const flag = (name: string, fallback: boolean): boolean => {
     const raw = env[name]?.trim().toLowerCase();
     if (!raw) return fallback;
@@ -120,6 +174,22 @@ export function loadDeliveryWorkerConfig(
       ),
       maxBatchesPerRun: 100,
     },
+    health: {
+      workerRequired: flag('DELIVERY_HEALTH_WORKER_REQUIRED', true),
+      noWorkerGraceMs: nonNegativeInteger('DELIVERY_HEALTH_NO_WORKER_GRACE_MS', 60_000),
+      queueLagWarnMs: integer('DELIVERY_HEALTH_QUEUE_LAG_WARN_MS', 60_000),
+      queueLagCriticalMs: integer('DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS', 300_000),
+      unknownAgeWarnMs: integer('DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS', 300_000),
+      unknownAgeCriticalMs: integer(
+        'DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS',
+        1_800_000,
+      ),
+      retentionOverdueMultiplier: positiveNumber(
+        'DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER',
+        3,
+        1_000,
+      ),
+    },
   };
 
   // Cross-field rules are only meaningful once each field parsed.
@@ -150,6 +220,22 @@ export function loadDeliveryWorkerConfig(
     ) {
       problems.push(
         'DELIVERY_MANUAL_ACTION_RETENTION_DAYS must not be less than DELIVERY_ATTEMPT_RETENTION_DAYS',
+      );
+    }
+    const { health } = config;
+    if (health.queueLagCriticalMs <= health.queueLagWarnMs) {
+      problems.push(
+        'DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS must be greater than DELIVERY_HEALTH_QUEUE_LAG_WARN_MS',
+      );
+    }
+    if (health.unknownAgeCriticalMs <= health.unknownAgeWarnMs) {
+      problems.push(
+        'DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS must be greater than DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS',
+      );
+    }
+    if (health.retentionOverdueMultiplier <= 1) {
+      problems.push(
+        'DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER must be greater than 1',
       );
     }
   }

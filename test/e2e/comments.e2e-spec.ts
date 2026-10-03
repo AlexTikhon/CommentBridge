@@ -631,6 +631,7 @@ describe('comments API (e2e)', () => {
       ['post', `/api/v1/replies/${replyId}/delivery/retry`],
       ['post', `/api/v1/replies/${replyId}/delivery/dead-letter`],
       ['get', '/api/v1/deliveries/stats'],
+      ['get', '/api/v1/deliveries/health'],
     ];
     const open = (method: string, path: string) =>
       method === 'get'
@@ -664,6 +665,8 @@ describe('comments API (e2e)', () => {
         .get(`/api/v1/posts/${SEED_IDS.post}/comments?limit=1`)
         .expect(200);
       await request(app.getHttpServer()).get('/health').expect(200);
+      await request(app.getHttpServer()).get('/health/live').expect(200);
+      await request(app.getHttpServer()).get('/health/ready').expect(200);
     });
   });
 });

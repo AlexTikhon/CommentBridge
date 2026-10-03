@@ -37,7 +37,9 @@ function stateMock(): jest.Mocked<DeliveryWorkerStateRepository> {
     register: jest.fn().mockResolvedValue(undefined),
     heartbeat: jest.fn().mockResolvedValue(undefined),
     recordDrain: jest.fn().mockResolvedValue(undefined),
+    recordRetention: jest.fn().mockResolvedValue(undefined),
     getSnapshot: jest.fn(),
+    getHealthSnapshot: jest.fn(),
   };
 }
 
@@ -51,6 +53,7 @@ function retentionResult(): DeliveryRetentionResult {
     manualActionCutoff: startTime,
     capped: false,
     failed: false,
+    errorCode: null,
   };
 }
 
@@ -483,6 +486,112 @@ describe('DeliveryWorkerRuntime', () => {
     });
   });
 
+  describe('retention outcome persistence', () => {
+    it('records a successful run with its counts, duration and completion time', async () => {
+      retentionRun.mockResolvedValue({
+        ...retentionResult(),
+        deletedAttempts: 7,
+        deletedManualActions: 2,
+        durationMs: 41,
+      });
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(state.recordRetention).toHaveBeenCalledTimes(1);
+      expect(state.recordRetention).toHaveBeenCalledWith(
+        { instanceId: INSTANCE_ID, startedAt: startTime },
+        {
+          outcome: 'SUCCEEDED',
+          finishedAt: startTime,
+          durationMs: 41,
+          deletedAttempts: 7,
+          deletedManualActions: 2,
+          errorCode: null,
+        },
+      );
+      await runtime.onModuleDestroy();
+    });
+
+    it('records a failed run with only a safe error code and the partial counts', async () => {
+      retentionRun.mockResolvedValue({
+        ...retentionResult(),
+        failed: true,
+        deletedAttempts: 3,
+        errorCode: 'PrismaClientKnownRequestError',
+      });
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(state.recordRetention).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          outcome: 'FAILED',
+          deletedAttempts: 3,
+          errorCode: 'PrismaClientKnownRequestError',
+        }),
+      );
+      await runtime.onModuleDestroy();
+    });
+
+    it('records an unexpected rejection as a failure without its message', async () => {
+      retentionRun.mockRejectedValueOnce(new TypeError('postgresql://u:secret@db/app'));
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      const [, record] = state.recordRetention.mock.calls[0] ?? [];
+      expect(record).toMatchObject({ outcome: 'FAILED', errorCode: 'TypeError' });
+      expect(JSON.stringify(record)).not.toContain('secret');
+      await runtime.onModuleDestroy();
+    });
+
+    it('survives a failure to persist the outcome and keeps scheduling', async () => {
+      state.recordRetention.mockRejectedValue(
+        new Error('postgresql://u:secret@db/app'),
+      );
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(60_000);
+
+      expect(retentionRun).toHaveBeenCalledTimes(2);
+      expect(state.recordRetention).toHaveBeenCalledTimes(2);
+      expect(warn.mock.calls.map(([line]) => String(line)).join(' ')).not.toContain(
+        'secret',
+      );
+      await runtime.onModuleDestroy();
+    });
+
+    it('does not record success for a run cut short by shutdown', async () => {
+      const slow = deferred<DeliveryRetentionResult>();
+      retentionRun.mockReturnValueOnce(slow.promise);
+      const runtime = createRuntime();
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      const destroying = runtime.onModuleDestroy();
+      slow.resolve(retentionResult());
+      await destroying;
+
+      expect(state.recordRetention).not.toHaveBeenCalled();
+    });
+
+    it('records nothing when retention is disabled', async () => {
+      const runtime = createRuntime({}, { enabled: false });
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(300_000);
+
+      expect(state.recordRetention).not.toHaveBeenCalled();
+      await runtime.onModuleDestroy();
+    });
+  });
+
   describe('retention maintenance', () => {
     it('runs once at startup and then on its own interval', async () => {
       const runtime = createRuntime();
@@ -660,6 +769,7 @@ describe('DeliveryWorkerRuntime', () => {
         markUnknown: jest.fn(),
         reconcileExpiredLeases: jest.fn().mockResolvedValue(0),
         getQueueSnapshot: jest.fn(),
+        getHealthSnapshot: jest.fn(),
       };
     }
 

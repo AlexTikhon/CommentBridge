@@ -163,22 +163,30 @@ model ReplyDeliveryAttempt {
 }
 
 // One row per delivery-worker process lifetime. Liveness is the heartbeat age;
-// the lastDrain* columns describe the most recent drain that did work.
+// the lastDrain* columns describe the most recent drain that did work, and the
+// lastRetention* columns the most recent retention pass of this process. The
+// success and failure timestamps are independent so health can tell which is newer.
 model DeliveryWorkerInstance {
-  instanceId              String    @id @db.VarChar(200)
-  startedAt               DateTime  @db.Timestamptz(3)
-  lastHeartbeatAt         DateTime  @db.Timestamptz(3)
-  lastDrainCompletedAt    DateTime? @db.Timestamptz(3)
-  lastDrainDurationMs     Int       @default(0)
-  lastDrainProcessedCount Int       @default(0)
-  lastDrainSucceededCount Int       @default(0)
-  lastDrainRetryCount     Int       @default(0)
-  lastDrainFailedCount    Int       @default(0)
-  lastDrainUnknownCount   Int       @default(0)
-  lastDrainLeaseLostCount Int       @default(0)
-  lastDrainExpiredLeases  Int       @default(0)
-  createdAt               DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt               DateTime  @updatedAt @db.Timestamptz(3)
+  instanceId                        String    @id @db.VarChar(200)
+  startedAt                         DateTime  @db.Timestamptz(3)
+  lastHeartbeatAt                   DateTime  @db.Timestamptz(3)
+  lastDrainCompletedAt              DateTime? @db.Timestamptz(3)
+  lastDrainDurationMs               Int       @default(0)
+  lastDrainProcessedCount           Int       @default(0)
+  lastDrainSucceededCount           Int       @default(0)
+  lastDrainRetryCount               Int       @default(0)
+  lastDrainFailedCount              Int       @default(0)
+  lastDrainUnknownCount             Int       @default(0)
+  lastDrainLeaseLostCount           Int       @default(0)
+  lastDrainExpiredLeases            Int       @default(0)
+  lastRetentionSucceededAt          DateTime? @db.Timestamptz(3)
+  lastRetentionFailedAt             DateTime? @db.Timestamptz(3)
+  lastRetentionDurationMs           Int       @default(0)
+  lastRetentionDeletedAttempts      Int       @default(0)
+  lastRetentionDeletedManualActions Int       @default(0)
+  lastRetentionFailureCode          String?   @db.VarChar(100)
+  createdAt                         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt                         DateTime  @updatedAt @db.Timestamptz(3)
 
   @@index([lastHeartbeatAt])
 }

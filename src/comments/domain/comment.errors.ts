@@ -10,6 +10,7 @@ export type ApplicationErrorCode =
   | 'IDEMPOTENCY_CONFLICT'
   | 'PLATFORM_RATE_LIMITED'
   | 'PLATFORM_UNAVAILABLE'
+  | 'DELIVERY_HEALTH_UNAVAILABLE'
   | 'INTERNAL_ERROR';
 
 export class ApplicationError extends Error {

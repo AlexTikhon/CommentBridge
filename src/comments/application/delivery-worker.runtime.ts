@@ -9,12 +9,17 @@ import {
   DELIVERY_WORKER_CONFIG,
   type DeliveryWorkerConfig,
 } from './delivery-worker.config';
-import { DeliveryRetentionService } from './delivery-retention.service';
+import {
+  DeliveryRetentionService,
+  safeErrorCode,
+  type DeliveryRetentionResult,
+} from './delivery-retention.service';
 import { DeliveryWorkerMetrics } from './delivery-worker.metrics';
 import { DELIVERY_WORKER_INSTANCE_ID, retainedSince } from './delivery-worker.state';
 import {
   DELIVERY_WORKER_STATE_REPOSITORY,
   type DeliveryDrainRecord,
+  type DeliveryRetentionRecord,
   type DeliveryWorkerIdentity,
   type DeliveryWorkerStateRepository,
 } from './ports/delivery-worker-state.repository';
@@ -184,17 +189,36 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
   }
 
   /**
-   * One retention pass. The service reports its own outcome; this only keeps an
-   * unexpected rejection from escaping the timer and asks it to stop between
-   * batches once shutdown begins.
+   * One retention pass. The service reports its own outcome; this persists it for
+   * health reporting, keeps an unexpected rejection from escaping the timer, and
+   * asks the service to stop between batches once shutdown begins.
    */
   private async maintain(): Promise<void> {
     if (this.stopping) return;
+    let record: DeliveryRetentionRecord;
     try {
-      await this.retention.run(new Date(), () => this.stopping);
+      const result = await this.retention.run(new Date(), () => this.stopping);
+      // A pass cut short by shutdown is neither a success nor a failure.
+      if (this.stopping && !result.failed) return;
+      record = toRetentionRecord(result, new Date());
     } catch (error: unknown) {
       this.logger.warn(
         `Delivery retention run failed for worker ${this.identity.instanceId}: ${errorName(error)}`,
+      );
+      record = {
+        outcome: 'FAILED',
+        finishedAt: new Date(),
+        durationMs: 0,
+        deletedAttempts: 0,
+        deletedManualActions: 0,
+        errorCode: safeErrorCode(error),
+      };
+    }
+    try {
+      await this.state.recordRetention(this.identity, record);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Could not record retention outcome for worker ${this.identity.instanceId}: ${errorName(error)}`,
       );
     }
   }
@@ -239,6 +263,20 @@ function toDrainRecord(result: DrainResult): DeliveryDrainRecord {
     unknown: outcomes.UNKNOWN,
     leaseLost: outcomes.LEASE_LOST,
     expiredLeases: result.expiredLeases,
+  };
+}
+
+function toRetentionRecord(
+  result: DeliveryRetentionResult,
+  finishedAt: Date,
+): DeliveryRetentionRecord {
+  return {
+    outcome: result.failed ? 'FAILED' : 'SUCCEEDED',
+    finishedAt,
+    durationMs: result.durationMs,
+    deletedAttempts: result.deletedAttempts,
+    deletedManualActions: result.deletedManualActions,
+    errorCode: result.errorCode,
   };
 }
 

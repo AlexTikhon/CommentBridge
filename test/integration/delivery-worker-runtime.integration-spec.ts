@@ -504,6 +504,58 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       ).resolves.toBe(1);
     });
 
+    it('persists each retention outcome so the API can report it', async () => {
+      const retentionConfig = loadDeliveryWorkerConfig({
+        DELIVERY_POLL_INTERVAL_MS: '100',
+        DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS: '200',
+        DELIVERY_RETENTION_INTERVAL_MS: '200',
+      });
+      await startableRuntime('runtime-retention-health', retentionConfig).start();
+
+      const row = await eventually(async () => {
+        const current = await workerPrisma.deliveryWorkerInstance.findUnique({
+          where: { instanceId: 'runtime-retention-health' },
+        });
+        return current?.lastRetentionSucceededAt ? current : null;
+      });
+
+      expect(row).toMatchObject({
+        lastRetentionFailedAt: null,
+        lastRetentionFailureCode: null,
+      });
+      const snapshot = await apiState.getHealthSnapshot({
+        activeSince: activeSince(new Date(), STALE_AFTER_MS),
+        retainedSince: retainedSince(new Date(), STALE_AFTER_MS),
+      });
+      expect(snapshot.active).toBe(1);
+      expect(snapshot.retention.lastSucceededAt).toEqual(row.lastRetentionSucceededAt);
+    });
+
+    it('persists a failed retention run with a safe error code only', async () => {
+      jest.spyOn(Logger.prototype, 'error').mockImplementation();
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      jest
+        .spyOn(PrismaDeliveryRetentionRepository.prototype, 'pruneAttempts')
+        .mockRejectedValue(new Error('postgresql://user:secret@db/app unreachable'));
+      const retentionConfig = loadDeliveryWorkerConfig({
+        DELIVERY_POLL_INTERVAL_MS: '100',
+        DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS: '200',
+        DELIVERY_RETENTION_INTERVAL_MS: '200',
+      });
+      await startableRuntime('runtime-retention-failing', retentionConfig).start();
+
+      const row = await eventually(async () => {
+        const current = await workerPrisma.deliveryWorkerInstance.findUnique({
+          where: { instanceId: 'runtime-retention-failing' },
+        });
+        return current?.lastRetentionFailedAt ? current : null;
+      });
+
+      expect(row.lastRetentionFailureCode).toBe('Error');
+      expect(row.lastRetentionSucceededAt).toBeNull();
+      expect(JSON.stringify(row)).not.toContain('secret');
+    });
+
     it('stops heartbeating at shutdown and then ages out to STALE', async () => {
       const runtime = startableRuntime('runtime-a');
       await runtime.start();

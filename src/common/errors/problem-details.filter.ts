@@ -89,6 +89,11 @@ const ERROR_HTTP: Record<
     title: 'Social platform is unavailable',
     slug: 'platform-unavailable',
   },
+  DELIVERY_HEALTH_UNAVAILABLE: {
+    status: HttpStatus.SERVICE_UNAVAILABLE,
+    title: 'Delivery health cannot be evaluated',
+    slug: 'delivery-health-unavailable',
+  },
   INTERNAL_ERROR: {
     status: HttpStatus.INTERNAL_SERVER_ERROR,
     title: 'Internal server error',

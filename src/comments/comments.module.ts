@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { PlatformsModule } from '../platforms/platforms.module';
 import { CommentsService } from './application/comments.service';
+import { DeliveryHealthService } from './application/delivery-health.service';
 import { DeliveryStatsService } from './application/delivery-stats.service';
 import { ReplyDeliveriesService } from './application/reply-deliveries.service';
 import { COMMENT_REPOSITORY } from './application/ports/comment.repository';
@@ -22,6 +23,7 @@ import { ReplyDeliveriesController } from './presentation/reply-deliveries.contr
     CommentsService,
     ReplyDeliveriesService,
     DeliveryStatsService,
+    DeliveryHealthService,
     { provide: COMMENT_REPOSITORY, useClass: PrismaCommentRepository },
   ],
 })

@@ -100,9 +100,11 @@ docker compose --profile app up -d --build api delivery-worker   # runs migrate 
 docker compose --profile app up -d --scale delivery-worker=3 api delivery-worker
 ```
 
-`api` publishes a port and has an HTTP healthcheck. `delivery-worker` publishes no
-port and has no container healthcheck: its liveness is the heartbeat reported by
-`GET /api/v1/deliveries/stats`, and the restart policy covers crashes. Its
+`api` publishes a port and its healthcheck calls `GET /health/ready` (readiness, never
+delivery backlog; see _Health endpoints_). `delivery-worker` publishes no port and has no
+container healthcheck: its liveness is the heartbeat reported by
+`GET /api/v1/deliveries/stats` and judged by `GET /api/v1/deliveries/health`, and the
+restart policy covers crashes. Its
 `stop_grace_period` (30s) exceeds the provider timeout so the job in flight can
 finish on `SIGTERM`. Both services receive `DATABASE_URL` and the `DELIVERY_*`
 settings; only the API needs `OPERATOR_API_KEYS` and `PORT`. A `migrate` job applies
@@ -433,6 +435,182 @@ idle drains are silent. The worker logs `delivery-worker.starting`,
 `delivery-worker.shutdown-complete` with its `workerInstanceId`; heartbeats are not
 logged. Messages, provider payloads, and credentials are never logged.
 
+## Health endpoints
+
+Three different questions get three different answers. Mixing them is how an outage
+turns into a restart loop, so they are separate on purpose.
+
+| Endpoint                        | Question                               | Auth         | Depends on                   | Result                                  |
+| ------------------------------- | -------------------------------------- | ------------ | ---------------------------- | --------------------------------------- |
+| `GET /health/live`              | Is this process alive?                 | none         | nothing                      | always `200 {"status":"UP"}`            |
+| `GET /health/ready`             | Can this API instance serve traffic?   | none         | PostgreSQL (`SELECT 1`, 2 s) | `200 READY` / `503 NOT_READY`           |
+| `GET /health`                   | Legacy readiness check (compatibility) | none         | PostgreSQL (`SELECT 1`, 2 s) | unchanged body: `ready` / `not_ready`   |
+| `GET /api/v1/deliveries/health` | Is asynchronous delivery keeping up?   | operator key | PostgreSQL (two small reads) | `200` + state in JSON / `503` if unread |
+
+```json
+{ "status": "READY", "checks": { "database": "UP" } }
+```
+
+**Compatibility.** `GET /health` has always run `SELECT 1` and answered `503` when the
+database was down, so it already behaved like readiness and Docker health checks rely
+on it. It is kept exactly as it was (same body, same status codes); only the query now
+has the same 2-second bound as `/health/ready`. New probes should use `/health/live`
+(restart decisions) and `/health/ready` (traffic decisions). None of the three public
+endpoints knows anything about the delivery queue, and none returns secrets, connection
+strings or stack traces.
+
+The Compose `api` healthcheck calls `/health/ready`. The worker has no HTTP listener and
+no container healthcheck by design: its health is its heartbeat, judged by the
+operational endpoint below.
+
+### Operational health
+
+`GET /api/v1/deliveries/health` answers "is delivery actually working?", which can be
+false while the API is perfectly ready. It needs an operator API key (it is not public)
+and reports a deterministic `HEALTHY` / `DEGRADED` / `CRITICAL` status: the worst of
+four signals, with no scores or weights. Every non-healthy state lists the issues that
+caused it.
+
+```json
+{
+  "status": "CRITICAL",
+  "evaluatedAt": "2026-10-03T13:00:00.000Z",
+  "signals": {
+    "workers": {
+      "status": "CRITICAL",
+      "required": true,
+      "active": 0,
+      "stale": 1,
+      "lastHeartbeatAt": "2026-10-03T12:41:10.000Z"
+    },
+    "queue": {
+      "status": "DEGRADED",
+      "oldestDueAgeMs": 95000,
+      "warnAfterMs": 60000,
+      "criticalAfterMs": 300000
+    },
+    "unknown": {
+      "status": "HEALTHY",
+      "count": 0,
+      "oldestAgeMs": null,
+      "warnAfterMs": 300000,
+      "criticalAfterMs": 1800000
+    },
+    "retention": {
+      "status": "HEALTHY",
+      "enabled": true,
+      "lastSuccessAt": "2026-10-03T12:30:02.000Z",
+      "lastFailureAt": null,
+      "lastFailureCode": null,
+      "overdueAfterMs": 10800000
+    }
+  },
+  "issues": [
+    {
+      "code": "NO_ACTIVE_WORKER",
+      "severity": "CRITICAL",
+      "signal": "workers",
+      "message": "No active delivery workers"
+    },
+    {
+      "code": "QUEUE_LAG",
+      "severity": "DEGRADED",
+      "signal": "queue",
+      "message": "Oldest due delivery has waited past the lag warning threshold"
+    }
+  ]
+}
+```
+
+**HTTP status.** `200` whenever the state could be evaluated, including `CRITICAL`; the
+state is in the body. A backlog is not a reason for a load balancer or orchestrator to
+restart anything, and a polling tool must be able to read the detail. A non-2xx response
+(`503`, `application/problem+json`, code `DELIVERY_HEALTH_UNAVAILABLE`) means the state
+could not be evaluated because PostgreSQL could not be read. A failed read is never
+turned into an empty, healthy-looking result.
+
+**Stable issue codes.** Match on `code`; `message` is for humans. Severity is a separate
+field, so there is one code per condition.
+
+| Code                       | Signal      | Raised when                                                                              | Severity                                     |
+| -------------------------- | ----------- | ---------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `NO_ACTIVE_WORKER`         | `workers`   | No worker heartbeat within `DELIVERY_WORKER_STALE_AFTER_MS` (and workers are required)   | `DEGRADED` inside the grace, then `CRITICAL` |
+| `QUEUE_LAG`                | `queue`     | Oldest _due_ `PENDING`/`RETRY` delivery waited ≥ warn / ≥ critical                       | `DEGRADED` / `CRITICAL`                      |
+| `UNKNOWN_AGE`              | `unknown`   | Oldest unresolved `UNKNOWN` outcome is ≥ warn / ≥ critical old                           | `DEGRADED` / `CRITICAL`                      |
+| `RETENTION_OVERDUE`        | `retention` | No successful retention run for ≥ interval × multiplier                                  | `DEGRADED`                                   |
+| `RETENTION_RECENT_FAILURE` | `retention` | The latest retention outcome (across workers) is a failure newer than the latest success | `DEGRADED`                                   |
+
+Every threshold is inclusive: a value equal to the threshold already has that severity.
+
+- **Worker availability.** Idle and busy workers both heartbeat, so `active > 0` means a
+  worker is running and `0` means none is; "never seen a worker" and "all workers stale"
+  are told apart by `stale` and `lastHeartbeatAt`. With no active worker the signal is
+  `DEGRADED` until `DELIVERY_HEALTH_NO_WORKER_GRACE_MS` has elapsed since the last worker
+  went stale, or since this API process started if none was ever recorded, then
+  `CRITICAL`. The API's own start time is part of the clock so that bringing the whole
+  stack up (or restarting the API) does not page anyone before a worker can register.
+  **Stale rows alone never change the status while another worker is active:** a clean
+  shutdown and a crash are indistinguishable, and every deploy leaves a stale row for up
+  to 24 hours, so counting them would make routine deploys look like incidents. They are
+  reported in `workers.stale` for humans. A deployment that intentionally runs no worker
+  can set `DELIVERY_HEALTH_WORKER_REQUIRED=false`.
+- **Queue lag.** `now − min(nextAttemptAt)` over `PENDING`/`RETRY` rows whose
+  `nextAttemptAt <= now`. A retry scheduled for the future is backoff working as
+  designed, not lateness, so it is never counted. The lookup is an index probe on
+  `(status, nextAttemptAt)`, constant cost however large the backlog.
+- **UNKNOWN.** `UNKNOWN` means a provider call may or may not have happened, so what
+  matters is how long that has gone unresolved, not how many there are (the count is
+  reported as context). The age is measured from `startedAt` of the attempt that produced
+  the ambiguity (the delivery's latest attempt), not from `updatedAt`: every reconciliation
+  try refreshes `updatedAt` and `nextAttemptAt`, which would make a delivery that has been
+  stuck for hours look new. A delivery leaves the set when reconciliation resolves it.
+- **Retention.** Each worker records its latest retention outcome on its own
+  `DeliveryWorkerInstance` row (timestamps, duration, deleted counts, and for failures a
+  short error class name; never messages, stacks, or row contents). Health takes the newest
+  success and newest failure across all retained worker rows. A failure newer than the
+  newest success is `RETENTION_RECENT_FAILURE` and is cleared by any later success, from any
+  worker. With no success at all, a worker that has been up for the whole overdue window
+  counts as overdue; a younger one does not, because retention runs immediately at worker
+  start. Nothing is reported when retention is disabled.
+
+**Lease-loss rate is deliberately not a signal.** `LEASE_LOST` outcomes exist only in
+per-process counters and in each worker's single most recent drain; neither can answer
+"how many in the last N minutes, cluster-wide" without a new event table. That is more
+infrastructure than this task warrants, so lease loss stays a logged metric.
+
+| Variable                                       | Default   | Meaning                                                         |
+| ---------------------------------------------- | --------- | --------------------------------------------------------------- |
+| `DELIVERY_HEALTH_WORKER_REQUIRED`              | `true`    | `false` stops "no worker" being an issue                        |
+| `DELIVERY_HEALTH_NO_WORKER_GRACE_MS`           | `60000`   | Time with no worker before `DEGRADED` becomes `CRITICAL` (0 ok) |
+| `DELIVERY_HEALTH_QUEUE_LAG_WARN_MS`            | `60000`   | Oldest due delivery age that is `DEGRADED`                      |
+| `DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS`        | `300000`  | Oldest due delivery age that is `CRITICAL` (above warn)         |
+| `DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS`          | `300000`  | Oldest unresolved `UNKNOWN` age that is `DEGRADED`              |
+| `DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS`      | `1800000` | Oldest unresolved `UNKNOWN` age that is `CRITICAL` (above warn) |
+| `DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER` | `3`       | Overdue after this many retention intervals (greater than 1)    |
+
+Everything else is intentionally fixed: the readiness query timeout (2 s) and the 24-hour
+worker-row window the stale/retained logic already used. Invalid or inconsistent values
+stop startup, like the other delivery settings. The API and worker read the same
+variables, so set them identically on both (as Compose does).
+
+**Alert integration.** CommentBridge exposes state; it does not send notifications and
+contains no Slack, email, or paging integration. An external monitor polls the endpoint
+with an operator key and alerts on the body:
+
+```bash
+curl -fsS -H "Authorization: Bearer $OPERATOR_API_KEY" \
+  http://localhost:3000/api/v1/deliveries/health | jq '{status, issues}'
+```
+
+Alert on `status != "HEALTHY"` or on specific `issues[].code`, and treat a non-2xx or
+a timeout as its own alert ("health cannot be read"). Keep the key in the monitor's
+secret store; do not put it in a public dashboard or a URL. The endpoint is cheap
+(two small reads, no table scans), so a 10–30 second poll is fine. The API logs
+`delivery-health.degraded`, `delivery-health.critical`, and `delivery-health.recovered`
+(status and issue codes only) when the status it observes changes. That state is
+process-local and only advances when someone polls, so it is a log aid, not alert
+deduplication.
+
 ## Data retention
 
 Delivery data falls into four classes with different lifetimes:
@@ -479,7 +657,11 @@ waited for, so concurrent passes simply find less to do. A pass logs
 `{"event":"delivery-retention.completed","deletedAttempts":…,"deletedManualActions":…,"batchCount":…,"durationMs":…,"attemptCutoff":…,"manualActionCutoff":…,"capped":…}`
 when it deleted something (`debug` level when it found nothing) and
 `delivery-retention.failed` with the error name on failure. Row contents are never
-logged. There is no dry-run mode and no HTTP endpoint; to pause pruning set
+logged. Each pass's outcome (time, duration, counts, and on failure the error class name)
+is also stored on the worker's own `DeliveryWorkerInstance` row so that
+`GET /api/v1/deliveries/health` can report when retention last succeeded or failed and
+whether it is overdue (_Health endpoints_). It is the latest outcome per worker, not a
+history table. There is no dry-run mode and no HTTP endpoint; to pause pruning set
 `DELIVERY_RETENTION_ENABLED=false`.
 
 | Variable                                       | Default   | Meaning                                                  |
@@ -569,7 +751,9 @@ The durable delivery state machine, provider lookup reconciliation, delivery sta
 conditional manual retry, dead-letter controls, and manual-action audit trail are
 implemented. Operator API-key authentication, the standalone worker process, and
 PostgreSQL-backed worker heartbeats and delivery history retention are implemented.
-Production evolution should add an external identity provider in place of static keys. Inbound sync could add authenticated
+Application-level liveness, readiness and operational delivery health with stable alert
+codes are implemented; exporting them to a metrics or alerting system is left to the
+consumer of those endpoints. Production evolution should add an external identity provider in place of static keys. Inbound sync could add authenticated
 webhooks or polling. Tenant authorization, encrypted provider credentials,
 throttling, and metrics export should follow concrete operational requirements.
 

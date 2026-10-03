@@ -131,6 +131,21 @@ export interface DeliveryQueueSnapshot {
   expiredLeases: number;
 }
 
+/**
+ * The few facts health needs from the delivery table. Unlike DeliveryQueueSnapshot
+ * it counts nothing but UNKNOWN rows, so it stays cheap as settled history grows.
+ */
+export interface DeliveryQueueHealthSnapshot {
+  /** Earliest scheduled time among due PENDING/RETRY deliveries; null when none is due. */
+  oldestDueAt: Date | null;
+  unknownCount: number;
+  /**
+   * Start of the provider call whose outcome is still unresolved, for the oldest
+   * UNKNOWN delivery; null when there is none.
+   */
+  oldestUnknownSince: Date | null;
+}
+
 export interface ReplyDeliveryAttemptView {
   id: string;
   attemptNumber: number;

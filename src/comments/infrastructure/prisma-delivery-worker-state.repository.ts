@@ -3,6 +3,9 @@ import type { DeliveryWorkerInstance } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import type {
   DeliveryDrainRecord,
+  DeliveryRetentionRecord,
+  DeliveryWorkerHealthQuery,
+  DeliveryWorkerHealthSnapshot,
   DeliveryWorkerIdentity,
   DeliveryWorkerInstanceRecord,
   DeliveryWorkerSnapshot,
@@ -95,6 +98,80 @@ export class PrismaDeliveryWorkerStateRepository implements DeliveryWorkerStateR
       },
       update: { lastHeartbeatAt: now, ...drainColumns(drain) },
     });
+  }
+
+  async recordRetention(
+    worker: DeliveryWorkerIdentity,
+    retention: DeliveryRetentionRecord,
+  ): Promise<void> {
+    const succeeded = retention.outcome === 'SUCCEEDED';
+    // The first branch's timestamp and the failure code are only ever set by their
+    // own outcome, so a later opposite outcome leaves them standing.
+    const outcomeColumns = succeeded
+      ? { lastRetentionSucceededAt: retention.finishedAt }
+      : {
+          lastRetentionFailedAt: retention.finishedAt,
+          lastRetentionFailureCode: retention.errorCode,
+        };
+    const columns = {
+      ...outcomeColumns,
+      lastRetentionDurationMs: retention.durationMs,
+      lastRetentionDeletedAttempts: retention.deletedAttempts,
+      lastRetentionDeletedManualActions: retention.deletedManualActions,
+    };
+    await this.prisma.deliveryWorkerInstance.upsert({
+      where: { instanceId: worker.instanceId },
+      create: {
+        instanceId: worker.instanceId,
+        startedAt: worker.startedAt,
+        lastHeartbeatAt: retention.finishedAt,
+        ...columns,
+      },
+      update: columns,
+    });
+  }
+
+  async getHealthSnapshot(
+    query: DeliveryWorkerHealthQuery,
+  ): Promise<DeliveryWorkerHealthSnapshot> {
+    const retained = { gte: query.retainedSince };
+    const [active, stale, overall, activeStarts, lastFailure] =
+      await this.prisma.$transaction([
+        this.prisma.deliveryWorkerInstance.count({
+          where: { lastHeartbeatAt: { gte: query.activeSince } },
+        }),
+        this.prisma.deliveryWorkerInstance.count({
+          where: { lastHeartbeatAt: { ...retained, lt: query.activeSince } },
+        }),
+        this.prisma.deliveryWorkerInstance.aggregate({
+          where: { lastHeartbeatAt: retained },
+          _max: {
+            lastHeartbeatAt: true,
+            lastRetentionSucceededAt: true,
+            lastRetentionFailedAt: true,
+          },
+        }),
+        this.prisma.deliveryWorkerInstance.aggregate({
+          where: { lastHeartbeatAt: { gte: query.activeSince } },
+          _min: { startedAt: true },
+        }),
+        this.prisma.deliveryWorkerInstance.findFirst({
+          where: { lastHeartbeatAt: retained, lastRetentionFailedAt: { not: null } },
+          orderBy: { lastRetentionFailedAt: 'desc' },
+          select: { lastRetentionFailureCode: true },
+        }),
+      ]);
+    return {
+      active,
+      stale,
+      latestHeartbeatAt: overall._max.lastHeartbeatAt,
+      earliestActiveStartedAt: activeStarts._min.startedAt,
+      retention: {
+        lastSucceededAt: overall._max.lastRetentionSucceededAt,
+        lastFailedAt: overall._max.lastRetentionFailedAt,
+        lastFailureCode: lastFailure?.lastRetentionFailureCode ?? null,
+      },
+    };
   }
 
   async getSnapshot(

@@ -21,6 +21,19 @@ export interface DeliveryDrainRecord {
   expiredLeases: number;
 }
 
+/**
+ * The outcome of one retention pass by one worker. `errorCode` is a short,
+ * sanitized identifier (an error class name), never a message or stack trace.
+ */
+export interface DeliveryRetentionRecord {
+  outcome: 'SUCCEEDED' | 'FAILED';
+  finishedAt: Date;
+  durationMs: number;
+  deletedAttempts: number;
+  deletedManualActions: number;
+  errorCode: string | null;
+}
+
 export interface DeliveryWorkerInstanceRecord extends DeliveryWorkerIdentity {
   lastHeartbeatAt: Date;
   /** Null until this instance has completed a drain that did work. */
@@ -34,6 +47,30 @@ export interface DeliveryWorkerSnapshotQuery {
   activeSince: Date;
   /** Maximum number of instances returned (most recent heartbeat first). */
   limit: number;
+}
+
+export interface DeliveryWorkerHealthQuery {
+  /** Instances whose last heartbeat is older than this are not considered at all. */
+  retainedSince: Date;
+  /** Instances with a heartbeat at or after this are ACTIVE; older ones are STALE. */
+  activeSince: Date;
+}
+
+/**
+ * Aggregates over the retained worker rows, computed in the database so the API
+ * never loads instance lists to answer a health question.
+ */
+export interface DeliveryWorkerHealthSnapshot {
+  active: number;
+  stale: number;
+  latestHeartbeatAt: Date | null;
+  earliestActiveStartedAt: Date | null;
+  /** The most recent retention outcomes of any retained worker. */
+  retention: {
+    lastSucceededAt: Date | null;
+    lastFailedAt: Date | null;
+    lastFailureCode: string | null;
+  };
 }
 
 export interface DeliveryWorkerSnapshot {
@@ -62,6 +99,19 @@ export interface DeliveryWorkerStateRepository {
     drain: DeliveryDrainRecord,
     now: Date,
   ): Promise<void>;
+  /**
+   * Stores the outcome of this worker's latest retention pass. A failure never
+   * erases the last success (or the reverse), so "which is newer" stays answerable.
+   * Liveness is not touched: the heartbeat timer owns it.
+   */
+  recordRetention(
+    worker: DeliveryWorkerIdentity,
+    retention: DeliveryRetentionRecord,
+  ): Promise<void>;
+  /** Worker and retention aggregates as of one transaction. */
+  getHealthSnapshot(
+    query: DeliveryWorkerHealthQuery,
+  ): Promise<DeliveryWorkerHealthSnapshot>;
   /** Worker instances as of one transaction. */
   getSnapshot(query: DeliveryWorkerSnapshotQuery): Promise<DeliveryWorkerSnapshot>;
 }

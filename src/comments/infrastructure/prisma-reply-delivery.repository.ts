@@ -15,6 +15,7 @@ import {
   ReplyDeliveryStatus as DomainReplyDeliveryStatus,
   SocialPlatform,
   type ConditionalDeliveryActionResult,
+  type DeliveryQueueHealthSnapshot,
   type DeliveryQueueSnapshot,
   type ManualDeliveryActionInput,
   type ReplyDeliveryView,
@@ -524,6 +525,46 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         rows.map((row) => row.oldestDueReconciliationAt),
       ),
       expiredLeases: rows.reduce((total, row) => total + row.expiredLeases, 0),
+    };
+  }
+
+  async getHealthSnapshot(now: Date): Promise<DeliveryQueueHealthSnapshot> {
+    // Each branch leads with the (status, nextAttemptAt) index, so the oldest due
+    // time is a single index probe however large the backlog. UNKNOWN is the only
+    // status counted, and it is normally a handful of rows. The attempt that
+    // produced the unknown outcome is joined by its unique key; its startedAt is
+    // when the ambiguous provider call began and, unlike updatedAt, nothing
+    // reconciliation does ever moves it.
+    const [row] = await this.prisma.$queryRaw<
+      {
+        oldestDueAt: Date | null;
+        unknownCount: number;
+        oldestUnknownSince: Date | null;
+      }[]
+    >(Prisma.sql`
+      SELECT
+        LEAST(
+          (SELECT min("nextAttemptAt") FROM "ReplyDelivery"
+            WHERE "status" = 'PENDING' AND "nextAttemptAt" <= ${now}),
+          (SELECT min("nextAttemptAt") FROM "ReplyDelivery"
+            WHERE "status" = 'RETRY' AND "nextAttemptAt" <= ${now})
+        ) AS "oldestDueAt",
+        unknown."count" AS "unknownCount",
+        unknown."oldestSince" AS "oldestUnknownSince"
+      FROM (
+        SELECT
+          count(*)::int AS "count",
+          min(COALESCE(a."startedAt", d."updatedAt")) AS "oldestSince"
+        FROM "ReplyDelivery" d
+        LEFT JOIN "ReplyDeliveryAttempt" a
+          ON a."deliveryId" = d."id" AND a."attemptNumber" = d."attemptCount"
+        WHERE d."status" = 'UNKNOWN'
+      ) unknown
+    `);
+    return {
+      oldestDueAt: row?.oldestDueAt ?? null,
+      unknownCount: row?.unknownCount ?? 0,
+      oldestUnknownSince: row?.oldestUnknownSince ?? null,
     };
   }
 

@@ -26,6 +26,15 @@ describe('loadDeliveryWorkerConfig', () => {
         minAttemptsPerDelivery: 3,
         maxBatchesPerRun: 100,
       },
+      health: {
+        workerRequired: true,
+        noWorkerGraceMs: 60_000,
+        queueLagWarnMs: 60_000,
+        queueLagCriticalMs: 300_000,
+        unknownAgeWarnMs: 300_000,
+        unknownAgeCriticalMs: 1_800_000,
+        retentionOverdueMultiplier: 3,
+      },
     });
   });
 
@@ -55,6 +64,7 @@ describe('loadDeliveryWorkerConfig', () => {
       heartbeatIntervalMs: 2_000,
       staleAfterMs: 7_000,
       retention: expect.objectContaining({ enabled: true, batchSize: 500 }),
+      health: expect.objectContaining({ workerRequired: true }),
     });
   });
 
@@ -239,5 +249,84 @@ describe('delivery retention settings', () => {
     }
     expect(message).toContain('DELIVERY_RETENTION_BATCH_SIZE');
     expect(message).not.toContain('hunter2');
+  });
+});
+
+describe('loadDeliveryWorkerConfig health settings', () => {
+  it('reads every health override, including a zero grace period and a fractional multiplier', () => {
+    expect(
+      loadDeliveryWorkerConfig({
+        DELIVERY_HEALTH_WORKER_REQUIRED: 'false',
+        DELIVERY_HEALTH_NO_WORKER_GRACE_MS: '0',
+        DELIVERY_HEALTH_QUEUE_LAG_WARN_MS: '1000',
+        DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS: '2000',
+        DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS: '3000',
+        DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS: '4000',
+        DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER: '1.5',
+      }).health,
+    ).toEqual({
+      workerRequired: false,
+      noWorkerGraceMs: 0,
+      queueLagWarnMs: 1_000,
+      queueLagCriticalMs: 2_000,
+      unknownAgeWarnMs: 3_000,
+      unknownAgeCriticalMs: 4_000,
+      retentionOverdueMultiplier: 1.5,
+    });
+  });
+
+  it.each([
+    ['DELIVERY_HEALTH_QUEUE_LAG_WARN_MS', '0'],
+    ['DELIVERY_HEALTH_QUEUE_LAG_WARN_MS', '-5'],
+    ['DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS', 'soon'],
+    ['DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS', '1.5'],
+    ['DELIVERY_HEALTH_NO_WORKER_GRACE_MS', '-1'],
+    ['DELIVERY_HEALTH_NO_WORKER_GRACE_MS', 'abc'],
+    ['DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER', 'many'],
+    ['DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER', '0'],
+    ['DELIVERY_HEALTH_WORKER_REQUIRED', 'yes'],
+  ])('rejects %s=%s without echoing the value', (name, value) => {
+    let message = '';
+    try {
+      loadDeliveryWorkerConfig({ [name]: value });
+    } catch (error) {
+      expect(error).toBeInstanceOf(InvalidDeliveryWorkerConfigError);
+      message = (error as Error).message;
+    }
+    expect(message).toContain(name);
+    expect(message).not.toContain(`=${value}`);
+  });
+
+  it('requires the critical queue lag to exceed the warning threshold', () => {
+    const env = {
+      DELIVERY_HEALTH_QUEUE_LAG_WARN_MS: '5000',
+      DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS: '5000',
+    };
+    expect(() => loadDeliveryWorkerConfig(env)).toThrow(
+      /DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS must be greater than DELIVERY_HEALTH_QUEUE_LAG_WARN_MS/,
+    );
+    expect(
+      loadDeliveryWorkerConfig({
+        ...env,
+        DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS: '5001',
+      }).health.queueLagCriticalMs,
+    ).toBe(5_001);
+  });
+
+  it('requires the critical UNKNOWN age to exceed the warning threshold', () => {
+    expect(() =>
+      loadDeliveryWorkerConfig({
+        DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS: '9000',
+        DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS: '8000',
+      }),
+    ).toThrow(
+      /DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS must be greater than DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS/,
+    );
+  });
+
+  it('requires an overdue multiplier above 1 so a single interval is never overdue', () => {
+    expect(() =>
+      loadDeliveryWorkerConfig({ DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER: '1' }),
+    ).toThrow(/DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER must be greater than 1/);
   });
 });

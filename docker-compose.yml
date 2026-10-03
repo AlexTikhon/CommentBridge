@@ -17,6 +17,13 @@ x-delivery-settings: &delivery-settings
   DELIVERY_RETENTION_INTERVAL_MS:
   DELIVERY_RETENTION_BATCH_SIZE:
   DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY:
+  DELIVERY_HEALTH_WORKER_REQUIRED:
+  DELIVERY_HEALTH_NO_WORKER_GRACE_MS:
+  DELIVERY_HEALTH_QUEUE_LAG_WARN_MS:
+  DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS:
+  DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS:
+  DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS:
+  DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER:
 
 services:
   postgres:
@@ -90,12 +97,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    # Readiness (PostgreSQL reachable), not operational health: a delivery backlog
+    # or a stopped worker must never make Docker report the API as unhealthy.
     healthcheck:
       test:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+        - "fetch('http://127.0.0.1:3000/health/ready').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
       interval: 10s
       timeout: 3s
       retries: 5
@@ -103,8 +112,9 @@ services:
     restart: unless-stopped
 
   # Same image as the API, different command, and no HTTP listener or published
-  # port. Its liveness is the heartbeat shown by GET /api/v1/deliveries/stats, so it
-  # has no container healthcheck; restart-on-exit covers crashes.
+  # port. Its liveness is the heartbeat shown by GET /api/v1/deliveries/stats and
+  # judged by GET /api/v1/deliveries/health, so it has no container healthcheck;
+  # restart-on-exit covers crashes.
   delivery-worker:
     profiles: [app]
     image: commentbridge:local

@@ -202,10 +202,11 @@ batches per table. The cap also bounds shutdown latency, since a stop request is
 between batches.
 
 Retention runs from the worker process on its own timer, not per poll, and is safe with
-several workers because duplicate passes only find fewer rows. Visibility is structured
-logs rather than new columns on `DeliveryWorkerInstance`: that table describes a process
-and its drains, an hourly pass is not worth another migration, and logs already carry the
-counts. Dry-run was left out: a mode that deletes nothing cannot drain a backlog the way
+several workers because duplicate passes only find fewer rows. Visibility was first
+structured logs only; once health had to answer "when did retention last succeed, and is
+it overdue" that was no longer enough, and the latest outcome per worker now also lives on
+the worker's own `DeliveryWorkerInstance` row (see _Health_ below). It is the latest
+outcome, not a history table. Dry-run was left out: a mode that deletes nothing cannot drain a backlog the way
 a real pass does, so it would need separate counting SQL that could drift from the
 deleting SQL.
 
@@ -215,7 +216,76 @@ versus 1,357 ms with work available, 1,095 ms versus 1,202 ms with none), becaus
 is dominated by re-checking old attempts that are kept by design. An index was therefore
 not added. The steady-state cost grows with the number of settled deliveries, which is
 acceptable for an hourly job until tens of millions of deliveries; the next step then is
-a high-water mark or time partitioning, not an index.
+a high-water mark or time partitioning, not an index. That cost is retention's alone: the
+health queries below were written not to repeat it (they never touch settled history), so
+the table-growth risk is not multiplied by a monitor polling every few seconds.
+
+## Liveness vs readiness vs operational health
+
+These are three questions with three consumers, and answering them with one endpoint is
+how an infrastructure blip becomes an outage.
+
+- **Liveness** (`/health/live`) asks whether restarting this process would help. It checks
+  nothing outside the process. If it failed on a database outage, the orchestrator would
+  restart every healthy API instance during exactly the moment restarts can't help, and
+  the pool reconnects would then land on a database that is trying to recover.
+- **Readiness** (`/health/ready`) asks whether this instance should receive traffic. The
+  API cannot serve without PostgreSQL, so it runs `SELECT 1`, bounded to 2 seconds so a
+  hung pool reads as "not ready" instead of a probe timeout. It deliberately runs no queue
+  statistics: probes fire every few seconds on every instance. The pre-existing `/health`
+  was already this check (same query, `503` on failure, used by the Compose healthcheck),
+  so it keeps its body and status codes untouched instead of being redefined.
+- **Operational health** (`/api/v1/deliveries/health`) asks whether asynchronous delivery
+  is working. A queue backlog or a stopped worker must never control process liveness or
+  readiness: restarting the API does nothing for a backlog, and removing a ready API from
+  rotation because workers are down would turn a delivery incident into a read-API
+  outage. It is therefore a separate, authenticated operator endpoint that answers `200`
+  with the state in the body (including `CRITICAL`), and uses non-2xx only when health
+  could not be evaluated; a failed database read is reported as such and never as an
+  empty (healthy-looking) result.
+
+Choices inside operational health:
+
+- Worst-signal aggregation with explicit thresholds, no score, so every state can be
+  explained by listing the conditions that produced it. Severity is a field beside a
+  single stable code per condition (`QUEUE_LAG` with `DEGRADED` or `CRITICAL`) rather than
+  a code per severity, so an alert rule matches the condition and routes on severity.
+- No-worker is `DEGRADED` during a grace period and `CRITICAL` after it, measured from
+  when the last worker went stale or from the API's own start, whichever is later. Stale
+  worker rows by themselves are informational: crash and clean shutdown look the same and
+  each deploy leaves one for 24 hours, so counting them would make every deploy an
+  incident, while real capacity loss with no worker is already `CRITICAL`.
+- UNKNOWN age is measured from the start of the attempt that produced the ambiguity, not
+  `updatedAt`, because reconciliation rewrites `updatedAt` on every try and would make a
+  permanently stuck delivery look recent. Counts are context only; age is the signal.
+- Queue lag counts only due `PENDING`/`RETRY` work, so scheduled backoff is not "late".
+- The queries are `min(nextAttemptAt)` on the existing `(status, nextAttemptAt, id)`
+  index and a count over the (normally tiny) `UNKNOWN` set, plus aggregates over the small
+  worker table. They do not reuse the stats statement, which groups the whole delivery
+  table, and they add no index.
+- Retention outcomes are stored per worker on its own row, so nothing is shared or
+  contended, and combined at read time (newest success, newest failure). The only schema
+  change is nullable/defaulted columns on `DeliveryWorkerInstance`. Error codes are error
+  class names only.
+- Lease-loss rate is not a signal: the data exists only as per-process counters and each
+  worker's last drain, and a real rate needs an event store. It stays a logged metric.
+- Evaluation takes an explicit `now` and is a pure function over plain facts, so every
+  boundary is unit-tested with a fixed clock. Thresholds are inclusive.
+- Status-transition logging is process-local and only advances on polls; it is a log aid,
+  not durable alert deduplication.
+
+## Vendor-neutral alert signals
+
+CommentBridge exposes machine-readable state and stable issue codes; it does not send
+Slack messages, emails, or pages. Notification destinations, escalation policies,
+deduplication, maintenance windows, and on-call routing change independently of the
+application and differ per team, and embedding any one vendor would put its client, its
+secrets, and its outage modes inside the delivery path. An application that can be polled
+is monitored by whatever the operator already runs (Prometheus blackbox/JSON exporters,
+a cloud monitor, a cron plus `curl`) without a code change, and a later metrics or
+OpenTelemetry integration can be built on the same evaluator. The endpoint requires an
+operator key because queue ages and worker state are operational detail, so a monitor
+holds that key as a secret rather than exposing the endpoint publicly.
 
 ## Operator authentication
 

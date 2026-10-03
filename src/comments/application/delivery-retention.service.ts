@@ -21,6 +21,21 @@ export interface DeliveryRetentionResult {
   /** The per-run batch cap was hit, so more eligible rows may remain. */
   capped: boolean;
   failed: boolean;
+  /** Error class name of a failed pass (never a message); null otherwise. */
+  errorCode: string | null;
+}
+
+const SAFE_ERROR_CODE = /^[A-Za-z0-9_.-]{1,100}$/;
+
+/**
+ * A short identifier safe to persist and expose. Driver messages can carry
+ * connection strings, so only the error class name is kept, and only when it
+ * looks like an identifier.
+ */
+export function safeErrorCode(error: unknown): string {
+  return error instanceof Error && SAFE_ERROR_CODE.test(error.name)
+    ? error.name
+    : 'UnknownError';
 }
 
 /**
@@ -60,6 +75,7 @@ export class DeliveryRetentionService {
       ),
       capped: false,
       failed: false,
+      errorCode: null,
     };
 
     try {
@@ -78,13 +94,14 @@ export class DeliveryRetentionService {
       );
     } catch (error: unknown) {
       result.failed = true;
+      result.errorCode = safeErrorCode(error);
       result.durationMs = Date.now() - startedAt;
       // Error name only: driver messages can carry connection details.
       this.logger.error(
         JSON.stringify({
           event: 'delivery-retention.failed',
           ...this.summary(result),
-          errorName: error instanceof Error ? error.name : 'unknown',
+          errorName: result.errorCode,
         }),
       );
       return result;

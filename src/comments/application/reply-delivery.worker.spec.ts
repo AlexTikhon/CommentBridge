@@ -44,6 +44,7 @@ function repositoryMock(): jest.Mocked<ReplyDeliveryRepository> {
     markUnknown: jest.fn(),
     reconcileExpiredLeases: jest.fn().mockResolvedValue(0),
     getQueueSnapshot: jest.fn(),
+    getHealthSnapshot: jest.fn(),
   };
 }
 
