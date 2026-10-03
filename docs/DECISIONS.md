@@ -102,6 +102,29 @@ operator ID, normalized reason, previous state, resulting state, and timestamp i
 the same database transaction. The operator header is audit attribution only until
 authentication supplies a verified principal.
 
+## Lease ownership tokens
+
+A lease timestamp cannot prove who owns a delivery. A worker that stalls past its
+lease is reconciled to `UNKNOWN`, and the lookup claim that follows reuses the
+same attempt number, so a guard of `status = PROCESSING` plus attempt number would
+accept the stalled worker's late write against the new owner's lease. Each claim
+therefore receives a unique `leaseToken` generated in PostgreSQL, and every
+worker-owned transition is a conditional update on that exact token. A mismatch
+changes nothing and raises an internal `DeliveryLeaseLostError`; the winner (or
+provider lookup) decides the outcome. A database check ties `leaseUntil` and
+`leaseToken` to `PROCESSING`.
+
+Expired-lease reconciliation is a single statement rather than a read followed by
+a write, so a delivery that completes or is re-leased in between is never
+misclassified and the returned count is exact. The migration assigns tokens to any
+in-flight `PROCESSING` rows without touching their status or expiry; they can only
+end by expiring into `UNKNOWN`.
+
+Scheduling reserves a bounded share of each drain for `UNKNOWN` reconciliation
+rather than strict priority, trading a little reconciliation latency for the
+guarantee that fresh replies are never starved. Completion timestamps come from the
+worker's clock, not from hidden `new Date()` calls in the repository.
+
 ## Error boundary and request IDs
 
 Custom application errors retain explicit RFC 7807-style mappings. General NestJS

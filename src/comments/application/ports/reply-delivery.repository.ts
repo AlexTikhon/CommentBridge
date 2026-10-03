@@ -8,6 +8,12 @@ import type {
 
 export const REPLY_DELIVERY_REPOSITORY = Symbol('REPLY_DELIVERY_REPOSITORY');
 
+/**
+ * Worker-owned transitions (`mark*`) are conditional on the delivery still being
+ * PROCESSING under the exact lease token returned by the claim. When that no
+ * longer holds they reject with `DeliveryLeaseLostError` and change nothing.
+ * `completedAt` is the worker's logical completion time for audit timestamps.
+ */
 export interface ReplyDeliveryRepository {
   findByReplyId(replyId: string): Promise<ReplyDeliveryView | null>;
   retryFailed(
@@ -25,18 +31,26 @@ export interface ReplyDeliveryRepository {
   markSucceeded(
     item: ReplyDeliveryWorkItem,
     result: PlatformCommentResult,
+    completedAt: Date,
   ): Promise<void>;
   markRetryableFailure(
     item: ReplyDeliveryWorkItem,
     errorCode: string,
     nextAttemptAt: Date,
     maxAttempts: number,
+    completedAt: Date,
   ): Promise<'RETRY' | 'FAILED'>;
-  markTerminalFailure(item: ReplyDeliveryWorkItem, errorCode: string): Promise<void>;
+  markTerminalFailure(
+    item: ReplyDeliveryWorkItem,
+    errorCode: string,
+    completedAt: Date,
+  ): Promise<void>;
   markUnknown(
     item: ReplyDeliveryWorkItem,
     errorCode: string,
     nextAttemptAt: Date,
+    completedAt: Date,
   ): Promise<void>;
+  /** Moves genuinely expired PROCESSING deliveries to UNKNOWN; returns how many. */
   reconcileExpiredLeases(now: Date): Promise<number>;
 }

@@ -197,6 +197,58 @@ original attempt, an authoritative absence permits bounded retry, and an
 inconclusive lookup remains quarantined with backoff. Exactly-once delivery still
 depends on provider-side idempotency and authoritative reconciliation support.
 
+## Worker lease ownership
+
+Every claim (normal delivery or `UNKNOWN` reconciliation) stamps the delivery with a
+fresh random `leaseToken` next to `leaseUntil`, and returns it in the work item.
+Every completion (`SUCCEEDED`, `RETRY`, `FAILED`, `UNKNOWN`) is a single
+conditional update on `id`, `status = PROCESSING`, the attempt number, **and the
+exact token**, and clears the lease and token when it leaves `PROCESSING`.
+
+The token matters because a lease can expire, be reconciled to `UNKNOWN`, and be
+re-claimed for lookup under the _same attempt number_. Status and attempt number
+alone would then match the new owner, letting a stalled worker overwrite its
+result. A stale worker now fails with an internal `DeliveryLeaseLostError`
+before any delivery, comment, or attempt row changes; the worker logs it and
+discards the result. The new owner's provider lookup finds a reply the stale
+worker really sent, so it is still delivered once. The token is never exposed by
+the API. PostgreSQL enforces that `PROCESSING` rows have both `leaseUntil` and
+`leaseToken`, and all other states have neither.
+
+`reconcileExpiredLeases` is one SQL statement that moves only rows that are still
+`PROCESSING` and expired, closes their open attempt, and returns the number
+actually transitioned. A provider lookup during reconciliation is not a new
+outbound attempt, so `attemptCount` is unchanged.
+
+## Worker scheduling and lifecycle
+
+Each poll runs one bounded drain: expired-lease maintenance once, then up to
+`DELIVERY_MAX_JOBS_PER_TICK` jobs. `UNKNOWN` reconciliation gets up to
+`DELIVERY_MAX_RECONCILIATIONS_PER_TICK` slots first and normal `PENDING`/`RETRY`
+deliveries get the remainder, so a large `UNKNOWN` backlog cannot starve fresh
+replies. A slot one queue does not use goes to the other. Every job takes a fresh
+clock reading, so a lease never starts in the past. (Keep the reconciliation quota
+below the job budget to guarantee normal deliveries a slot every tick.)
+
+On shutdown the worker stops its timer, starts no further jobs, and waits for the
+job already in flight (bounded by the provider timeout) before the database
+connection closes. A hard kill is still safe: the unfinished lease expires into
+`UNKNOWN` and is resolved by provider lookup.
+
+| Variable                                | Default | Meaning                                      |
+| --------------------------------------- | ------- | -------------------------------------------- |
+| `DELIVERY_WORKER_ENABLED`               | `true`  | `false` on API-only instances                |
+| `DELIVERY_POLL_INTERVAL_MS`             | `1000`  | Delay between drains                         |
+| `DELIVERY_LEASE_DURATION_MS`            | `30000` | Must exceed the provider timeout             |
+| `DELIVERY_PROVIDER_TIMEOUT_MS`          | `10000` | Per provider call or lookup                  |
+| `DELIVERY_MAX_ATTEMPTS`                 | `5`     | Attempts before `FAILED`                     |
+| `DELIVERY_BASE_RETRY_DELAY_MS`          | `1000`  | First backoff; doubles per attempt           |
+| `DELIVERY_MAX_RETRY_DELAY_MS`           | `60000` | Backoff cap; at least the base delay         |
+| `DELIVERY_MAX_JOBS_PER_TICK`            | `10`    | Jobs per drain                               |
+| `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` | `3`     | Reconciliation slots; at most the job budget |
+
+Invalid values stop startup with an error naming the variable (never its value).
+
 ## Pagination
 
 Pages use descending keyset pagination over effective creation time and UUID. An
@@ -260,7 +312,7 @@ git diff --check
 - Mock adapters are deterministic and make no external requests.
 - Outbound jobs are polled by an in-process worker. Production deployments can run
   the same worker separately; set `DELIVERY_WORKER_ENABLED=false` on API-only
-  instances.
+  instances. Operational limits are environment variables (see above).
 - Parent/publication consistency and delivery-field invariants are enforced by
   PostgreSQL as well as the application workflow.
 

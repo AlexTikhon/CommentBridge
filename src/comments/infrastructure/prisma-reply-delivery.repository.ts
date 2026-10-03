@@ -7,6 +7,7 @@ import {
   ReplyDeliveryStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
+import { DeliveryLeaseLostError } from '../domain/comment.errors';
 import type { ReplyDeliveryRepository } from '../application/ports/reply-delivery.repository';
 import {
   ReplyDeliveryAttemptStatus as DomainReplyDeliveryAttemptStatus,
@@ -24,6 +25,7 @@ interface ClaimedDeliveryRow {
   id: string;
   replyId: string;
   attemptCount: number;
+  leaseToken: string;
 }
 
 type DeliveryWithHistory = Prisma.ReplyDeliveryGetPayload<{
@@ -66,6 +68,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
           status: ReplyDeliveryStatus.RETRY,
           nextAttemptAt: now,
           leaseUntil: null,
+          leaseToken: null,
           lastErrorCode: null,
           updatedAt: now,
         },
@@ -163,6 +166,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         data: {
           status: ReplyDeliveryStatus.DEAD_LETTERED,
           leaseUntil: null,
+          leaseToken: null,
           lastErrorCode: 'MANUALLY_DEAD_LETTERED',
           updatedAt: now,
         },
@@ -240,10 +244,11 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
           "status" = 'PROCESSING',
           "attemptCount" = d."attemptCount" + 1,
           "leaseUntil" = ${leaseUntil},
+          "leaseToken" = gen_random_uuid(),
           "updatedAt" = ${now}
         FROM candidate
         WHERE d."id" = candidate."id"
-        RETURNING d."id", d."replyId", d."attemptCount"
+        RETURNING d."id", d."replyId", d."attemptCount", d."leaseToken"
       `);
       const delivery = claimed[0];
       if (!delivery) return null;
@@ -279,10 +284,11 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         SET
           "status" = 'PROCESSING',
           "leaseUntil" = ${leaseUntil},
+          "leaseToken" = gen_random_uuid(),
           "updatedAt" = ${now}
         FROM candidate
         WHERE d."id" = candidate."id"
-        RETURNING d."id", d."replyId", d."attemptCount"
+        RETURNING d."id", d."replyId", d."attemptCount", d."leaseToken"
       `);
       const delivery = claimed[0];
       if (!delivery) return null;
@@ -293,12 +299,15 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
   async markSucceeded(
     item: ReplyDeliveryWorkItem,
     result: PlatformCommentResult,
+    completedAt: Date,
   ): Promise<void> {
     await this.prisma.$transaction(async (transaction) => {
       await this.transitionProcessingJob(transaction, item, {
         status: ReplyDeliveryStatus.SUCCEEDED,
         leaseUntil: null,
+        leaseToken: null,
         lastErrorCode: null,
+        updatedAt: completedAt,
       });
       await transaction.comment.update({
         where: { id: item.replyId },
@@ -318,7 +327,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         },
         data: {
           status: ReplyDeliveryAttemptStatus.SUCCEEDED,
-          finishedAt: new Date(),
+          finishedAt: completedAt,
         },
       });
     });
@@ -329,13 +338,16 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
     errorCode: string,
     nextAttemptAt: Date,
     maxAttempts: number,
+    completedAt: Date,
   ): Promise<'RETRY' | 'FAILED'> {
     const exhausted = item.attemptNumber >= maxAttempts;
     await this.prisma.$transaction(async (transaction) => {
       await this.transitionProcessingJob(transaction, item, {
         status: exhausted ? ReplyDeliveryStatus.FAILED : ReplyDeliveryStatus.RETRY,
         leaseUntil: null,
+        leaseToken: null,
         lastErrorCode: errorCode,
+        updatedAt: completedAt,
         ...(exhausted ? {} : { nextAttemptAt }),
       });
       if (exhausted) {
@@ -359,7 +371,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
             ? ReplyDeliveryAttemptStatus.TERMINAL_FAILURE
             : ReplyDeliveryAttemptStatus.RETRYABLE_FAILURE,
           errorCode,
-          finishedAt: new Date(),
+          finishedAt: completedAt,
         },
       });
     });
@@ -369,12 +381,15 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
   async markTerminalFailure(
     item: ReplyDeliveryWorkItem,
     errorCode: string,
+    completedAt: Date,
   ): Promise<void> {
     await this.prisma.$transaction(async (transaction) => {
       await this.transitionProcessingJob(transaction, item, {
         status: ReplyDeliveryStatus.FAILED,
         leaseUntil: null,
+        leaseToken: null,
         lastErrorCode: errorCode,
+        updatedAt: completedAt,
       });
       await transaction.comment.update({
         where: { id: item.replyId },
@@ -393,7 +408,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         data: {
           status: ReplyDeliveryAttemptStatus.TERMINAL_FAILURE,
           errorCode,
-          finishedAt: new Date(),
+          finishedAt: completedAt,
         },
       });
     });
@@ -403,13 +418,16 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
     item: ReplyDeliveryWorkItem,
     errorCode: string,
     nextAttemptAt: Date,
+    completedAt: Date,
   ): Promise<void> {
     await this.prisma.$transaction(async (transaction) => {
       await this.transitionProcessingJob(transaction, item, {
         status: ReplyDeliveryStatus.UNKNOWN,
         leaseUntil: null,
+        leaseToken: null,
         lastErrorCode: errorCode,
         nextAttemptAt,
+        updatedAt: completedAt,
       });
       await transaction.replyDeliveryAttempt.update({
         where: {
@@ -421,48 +439,49 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         data: {
           status: ReplyDeliveryAttemptStatus.UNKNOWN,
           errorCode,
-          finishedAt: new Date(),
+          finishedAt: completedAt,
         },
       });
     });
   }
 
+  /**
+   * One statement, so the check and the write cannot be separated by a
+   * concurrent completion or re-claim. The UPDATE re-evaluates its predicate
+   * after waiting on a row lock, so a delivery that finished (or was re-leased)
+   * meanwhile is no longer PROCESSING-and-expired and is left alone. The open
+   * attempt is closed from the rows actually transitioned, and the returned
+   * count is the number of deliveries moved, not the number first observed.
+   */
   async reconcileExpiredLeases(now: Date): Promise<number> {
-    return this.prisma.$transaction(async (transaction) => {
-      const expired = await transaction.replyDelivery.findMany({
-        where: {
-          status: ReplyDeliveryStatus.PROCESSING,
-          leaseUntil: { lt: now },
-        },
-        select: { id: true },
-      });
-      if (expired.length === 0) return 0;
-      const deliveryIds = expired.map(({ id }) => id);
-
-      await transaction.replyDeliveryAttempt.updateMany({
-        where: {
-          deliveryId: { in: deliveryIds },
-          status: ReplyDeliveryAttemptStatus.PROCESSING,
-        },
-        data: {
-          status: ReplyDeliveryAttemptStatus.UNKNOWN,
-          errorCode: 'LEASE_EXPIRED',
-          finishedAt: now,
-        },
-      });
-      await transaction.replyDelivery.updateMany({
-        where: {
-          id: { in: deliveryIds },
-          status: ReplyDeliveryStatus.PROCESSING,
-        },
-        data: {
-          status: ReplyDeliveryStatus.UNKNOWN,
-          leaseUntil: null,
-          lastErrorCode: 'LEASE_EXPIRED',
-        },
-      });
-      return expired.length;
-    });
+    const [row] = await this.prisma.$queryRaw<{ count: number }[]>(Prisma.sql`
+      WITH expired AS (
+        UPDATE "ReplyDelivery"
+        SET
+          "status" = 'UNKNOWN',
+          "leaseUntil" = NULL,
+          "leaseToken" = NULL,
+          "lastErrorCode" = 'LEASE_EXPIRED',
+          "updatedAt" = ${now}
+        WHERE "status" = 'PROCESSING'
+          AND "leaseUntil" < ${now}
+        RETURNING "id", "attemptCount"
+      ),
+      closed AS (
+        UPDATE "ReplyDeliveryAttempt" a
+        SET
+          "status" = 'UNKNOWN',
+          "errorCode" = 'LEASE_EXPIRED',
+          "finishedAt" = ${now}
+        FROM expired
+        WHERE a."deliveryId" = expired."id"
+          AND a."attemptNumber" = expired."attemptCount"
+          AND a."status" = 'PROCESSING'
+        RETURNING a."id"
+      )
+      SELECT (SELECT count(*) FROM expired)::int AS "count"
+    `);
+    return row?.count ?? 0;
   }
 
   private async transitionProcessingJob(
@@ -475,11 +494,12 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
         id: item.deliveryId,
         status: ReplyDeliveryStatus.PROCESSING,
         attemptCount: item.attemptNumber,
+        leaseToken: item.leaseToken,
       },
       data,
     });
     if (updated.count !== 1) {
-      throw new Error(`Delivery ${item.deliveryId} is no longer owned by this worker.`);
+      throw new DeliveryLeaseLostError(item.deliveryId);
     }
   }
 
@@ -500,6 +520,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
 
     return {
       deliveryId: delivery.id,
+      leaseToken: delivery.leaseToken,
       replyId: reply.id,
       attemptNumber: delivery.attemptCount,
       platform: reply.postPublication.socialAccount.platform as SocialPlatform,

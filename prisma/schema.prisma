@@ -122,6 +122,7 @@ model ReplyDelivery {
   attemptCount  Int                         @default(0)
   nextAttemptAt DateTime                    @default(now()) @db.Timestamptz(3)
   leaseUntil    DateTime?                   @db.Timestamptz(3)
+  leaseToken    String?                     @db.Uuid
   lastErrorCode String?
   createdAt     DateTime                    @default(now()) @db.Timestamptz(3)
   updatedAt     DateTime                    @updatedAt @db.Timestamptz(3)

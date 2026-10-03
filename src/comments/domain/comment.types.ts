@@ -102,6 +102,8 @@ export interface ReplyResult {
 
 export interface ReplyDeliveryWorkItem {
   deliveryId: string;
+  /** Ownership generation issued by the claim; required by every completion. */
+  leaseToken: string;
   replyId: string;
   attemptNumber: number;
   platform: SocialPlatform;

@@ -32,3 +32,15 @@ export class ProviderAdapterError extends Error {
     this.name = 'ProviderAdapterError';
   }
 }
+
+/**
+ * Raised when a worker tries to persist a result for a lease generation that no
+ * longer owns the delivery (expired, reconciled, or re-claimed by another
+ * worker). It is an internal signal and is never mapped to an HTTP response.
+ */
+export class DeliveryLeaseLostError extends Error {
+  constructor(public readonly deliveryId: string) {
+    super(`Delivery ${deliveryId} is no longer owned by this worker's lease.`);
+    this.name = 'DeliveryLeaseLostError';
+  }
+}

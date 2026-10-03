@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   CommentDirection,
   DeliveryStatus,
@@ -9,7 +10,9 @@ import {
 } from '@prisma/client';
 import { CommentsService } from '../../src/comments/application/comments.service';
 import { ReplyDeliveriesService } from '../../src/comments/application/reply-deliveries.service';
+import { loadDeliveryWorkerConfig } from '../../src/comments/application/delivery-worker.config';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
+import { DeliveryLeaseLostError } from '../../src/comments/domain/comment.errors';
 import {
   DeliveryStatus as DomainDeliveryStatus,
   SocialPlatform,
@@ -49,7 +52,11 @@ describe('comments persistence integration', () => {
     ]);
     service = new CommentsService(repository, adapters);
     deliveries = new ReplyDeliveriesService(deliveryRepository);
-    worker = new ReplyDeliveryWorker(deliveryRepository, adapters);
+    worker = new ReplyDeliveryWorker(
+      deliveryRepository,
+      adapters,
+      loadDeliveryWorkerConfig({}),
+    );
   });
   afterAll(async () => prisma.$disconnect());
 
@@ -569,5 +576,423 @@ describe('comments persistence integration', () => {
         data: { publishedAt: null },
       }),
     ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
+  });
+
+  describe('lease ownership', () => {
+    const at = (offsetMs: number) => new Date(workerNow.getTime() + offsetMs);
+    const lease = 30_000;
+    const deferredPromise = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const providerResult = {
+      externalCommentId: 'provider-reply-b',
+      remoteCreatedAt: new Date('2026-08-07T09:59:59.000Z'),
+    };
+
+    async function queue(key: string) {
+      const accepted = await service.replyToComment(
+        SEED_IDS.instagramComment,
+        `Lease test ${key}`,
+        key,
+      );
+      return accepted.reply.id;
+    }
+
+    function load(replyId: string) {
+      return prisma.comment.findUniqueOrThrow({
+        where: { id: replyId },
+        include: { delivery: { include: { attempts: true } } },
+      });
+    }
+
+    it('stores a fresh token with the lease on claim and clears both on leaving PROCESSING', async () => {
+      const replyId = await queue('lease-claim-and-clear');
+
+      const claimed = await deliveryRepository.claimNext(at(0), at(lease));
+
+      expect(claimed?.leaseToken).toMatch(/^[0-9a-f-]{36}$/);
+      const processing = await load(replyId);
+      expect(processing.delivery).toMatchObject({
+        status: ReplyDeliveryStatus.PROCESSING,
+        leaseToken: claimed?.leaseToken,
+        leaseUntil: at(lease),
+      });
+
+      await deliveryRepository.markUnknown(
+        claimed!,
+        'AMBIGUOUS_PROVIDER_RESULT',
+        at(1_000),
+        at(500),
+      );
+      const left = await load(replyId);
+      expect(left.delivery).toMatchObject({
+        status: ReplyDeliveryStatus.UNKNOWN,
+        leaseToken: null,
+        leaseUntil: null,
+        updatedAt: at(500),
+      });
+      expect(left.delivery?.attempts).toEqual([
+        expect.objectContaining({
+          status: ReplyDeliveryAttemptStatus.UNKNOWN,
+          finishedAt: at(500),
+        }),
+      ]);
+    });
+
+    it('prevents a stale worker from committing after its lease was recycled', async () => {
+      const replyId = await queue('lease-stale-worker');
+
+      // Worker A claims attempt 1.
+      const workerA = await deliveryRepository.claimNext(at(0), at(lease));
+      expect(workerA).not.toBeNull();
+
+      // A stalls; its lease expires and is reconciled to UNKNOWN.
+      await expect(
+        deliveryRepository.reconcileExpiredLeases(at(lease + 1_000)),
+      ).resolves.toBe(1);
+
+      // Worker B claims the same delivery for reconciliation: same attempt number,
+      // new ownership generation.
+      const workerB = await deliveryRepository.claimUnknown(
+        at(lease + 2_000),
+        at(2 * lease + 2_000),
+      );
+      expect(workerB).not.toBeNull();
+      expect(workerB?.deliveryId).toBe(workerA?.deliveryId);
+      expect(workerB?.attemptNumber).toBe(workerA?.attemptNumber);
+      expect(workerB?.leaseToken).not.toBe(workerA?.leaseToken);
+
+      // The guard that existed before tokens (status + attempt number) would have
+      // matched B's lease here. Every stale completion must now be refused.
+      const staleAt = at(lease + 3_000);
+      const staleWrites = [
+        () => deliveryRepository.markSucceeded(workerA!, providerResult, staleAt),
+        () =>
+          deliveryRepository.markRetryableFailure(
+            workerA!,
+            'PLATFORM_UNAVAILABLE',
+            staleAt,
+            5,
+            staleAt,
+          ),
+        () =>
+          deliveryRepository.markTerminalFailure(
+            workerA!,
+            'PLATFORM_UNAVAILABLE',
+            staleAt,
+          ),
+        () =>
+          deliveryRepository.markUnknown(
+            workerA!,
+            'AMBIGUOUS_PROVIDER_RESULT',
+            staleAt,
+            staleAt,
+          ),
+      ];
+      for (const write of staleWrites) {
+        await expect(write()).rejects.toBeInstanceOf(DeliveryLeaseLostError);
+      }
+
+      // B's lease and all derived state are untouched.
+      const intact = await load(replyId);
+      expect(intact.deliveryStatus).toBe(DeliveryStatus.PENDING);
+      expect(intact.externalCommentId).toBeNull();
+      expect(intact.providerErrorCode).toBeNull();
+      expect(intact.delivery).toMatchObject({
+        status: ReplyDeliveryStatus.PROCESSING,
+        leaseToken: workerB?.leaseToken,
+        leaseUntil: at(2 * lease + 2_000),
+        attemptCount: 1,
+        lastErrorCode: 'LEASE_EXPIRED',
+      });
+      expect(intact.delivery?.attempts).toEqual([
+        expect.objectContaining({
+          attemptNumber: 1,
+          status: ReplyDeliveryAttemptStatus.UNKNOWN,
+          errorCode: 'LEASE_EXPIRED',
+          finishedAt: at(lease + 1_000),
+        }),
+      ]);
+
+      // B completes normally with its own token.
+      await deliveryRepository.markSucceeded(
+        workerB!,
+        providerResult,
+        at(lease + 4_000),
+      );
+      const completed = await load(replyId);
+      expect(completed.deliveryStatus).toBe(DeliveryStatus.SENT);
+      expect(completed.externalCommentId).toBe('provider-reply-b');
+      expect(completed.delivery).toMatchObject({
+        status: ReplyDeliveryStatus.SUCCEEDED,
+        leaseToken: null,
+        leaseUntil: null,
+        attemptCount: 1,
+        lastErrorCode: null,
+      });
+      expect(completed.delivery?.attempts).toEqual([
+        expect.objectContaining({
+          attemptNumber: 1,
+          status: ReplyDeliveryAttemptStatus.SUCCEEDED,
+          finishedAt: at(lease + 4_000),
+        }),
+      ]);
+      expect(instagramReplySpy).not.toHaveBeenCalled();
+    });
+
+    it('discards the result of a worker whose provider call outlives its lease', async () => {
+      const replyId = await queue('lease-slow-provider');
+      const gate = deferredPromise();
+      instagramReplySpy.mockImplementation(async (input) => {
+        await gate.promise;
+        return deliverWithInstagram(input);
+      });
+
+      const slowWorker = worker.processNextDelivery(() => at(0));
+      for (let i = 0; i < 100; i += 1) {
+        const row = await prisma.replyDelivery.findUniqueOrThrow({
+          where: { replyId },
+        });
+        if (row.status === ReplyDeliveryStatus.PROCESSING) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const slowToken = (
+        await prisma.replyDelivery.findUniqueOrThrow({ where: { replyId } })
+      ).leaseToken;
+      expect(slowToken).not.toBeNull();
+
+      await deliveryRepository.reconcileExpiredLeases(at(lease + 1_000));
+      const reconciler = await deliveryRepository.claimUnknown(
+        at(lease + 2_000),
+        at(2 * lease + 2_000),
+      );
+      expect(reconciler?.leaseToken).not.toBe(slowToken);
+
+      gate.resolve();
+      await expect(slowWorker).resolves.toBe(true);
+
+      const afterStale = await load(replyId);
+      expect(afterStale.deliveryStatus).toBe(DeliveryStatus.PENDING);
+      expect(afterStale.delivery).toMatchObject({
+        status: ReplyDeliveryStatus.PROCESSING,
+        leaseToken: reconciler?.leaseToken,
+      });
+
+      // The reconciler's lookup finds the reply the slow worker's provider call
+      // created, so the reply is delivered exactly once.
+      const found = await instagram.lookupReply({
+        publicationExternalId: reconciler!.publicationExternalId,
+        parentExternalCommentId: reconciler!.parentExternalCommentId!,
+        accountExternalId: reconciler!.accountExternalId,
+        idempotencyKey: reconciler!.idempotencyKey!,
+      });
+      expect(found).not.toBeNull();
+      await deliveryRepository.markSucceeded(reconciler!, found!, at(lease + 5_000));
+      const done = await load(replyId);
+      expect(done.deliveryStatus).toBe(DeliveryStatus.SENT);
+      expect(done.externalCommentId).toBe(found?.externalCommentId);
+      expect(done.delivery).toMatchObject({
+        status: ReplyDeliveryStatus.SUCCEEDED,
+        attemptCount: 1,
+        leaseToken: null,
+      });
+      expect(done.delivery?.attempts).toHaveLength(1);
+      expect(instagramReplySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('issues a distinct token for every claim of the same delivery', async () => {
+      await queue('lease-distinct-tokens');
+      const first = await deliveryRepository.claimNext(at(0), at(lease));
+      await deliveryRepository.markUnknown(
+        first!,
+        'AMBIGUOUS_PROVIDER_RESULT',
+        at(0),
+        at(100),
+      );
+      const second = await deliveryRepository.claimUnknown(at(200), at(200 + lease));
+      await deliveryRepository.markRetryableFailure(
+        second!,
+        'PROVIDER_CONFIRMED_NOT_FOUND',
+        at(300),
+        5,
+        at(250),
+      );
+      const third = await deliveryRepository.claimNext(at(400), at(400 + lease));
+
+      const tokens = [first, second, third].map((item) => item?.leaseToken);
+      expect(new Set(tokens).size).toBe(3);
+      expect(tokens.every((token) => typeof token === 'string')).toBe(true);
+    });
+
+    it('reconciles only rows that are still genuinely expired and counts exactly those', async () => {
+      await queue('lease-expired-a');
+      await queue('lease-live-b');
+      await queue('lease-finished-c');
+
+      const expired = await deliveryRepository.claimNext(at(0), at(1_000));
+      const live = await deliveryRepository.claimNext(at(0), at(10 * lease));
+      const finished = await deliveryRepository.claimNext(at(0), at(1_000));
+      expect([expired, live, finished].every((item) => item !== null)).toBe(true);
+
+      // C completes after its (now stale) expiry snapshot would have been taken.
+      await deliveryRepository.markSucceeded(finished!, providerResult, at(500));
+
+      await expect(deliveryRepository.reconcileExpiredLeases(at(5_000))).resolves.toBe(
+        1,
+      );
+      await expect(deliveryRepository.reconcileExpiredLeases(at(5_000))).resolves.toBe(
+        0,
+      );
+
+      const [a, b, c] = await Promise.all([
+        load(expired!.replyId),
+        load(live!.replyId),
+        load(finished!.replyId),
+      ]);
+      const byStatus = (row: typeof a) => row.delivery?.status;
+      expect([byStatus(a), byStatus(b), byStatus(c)]).toEqual([
+        ReplyDeliveryStatus.UNKNOWN,
+        ReplyDeliveryStatus.PROCESSING,
+        ReplyDeliveryStatus.SUCCEEDED,
+      ]);
+      expect(a.delivery).toMatchObject({
+        leaseToken: null,
+        leaseUntil: null,
+        lastErrorCode: 'LEASE_EXPIRED',
+      });
+      expect(b.delivery).toMatchObject({
+        leaseToken: live?.leaseToken,
+        leaseUntil: at(10 * lease),
+      });
+      expect(c.delivery).toMatchObject({ leaseToken: null, lastErrorCode: null });
+      expect(a.delivery?.attempts[0]).toMatchObject({
+        status: ReplyDeliveryAttemptStatus.UNKNOWN,
+        errorCode: 'LEASE_EXPIRED',
+        finishedAt: at(5_000),
+      });
+      expect(b.delivery?.attempts[0]?.status).toBe(
+        ReplyDeliveryAttemptStatus.PROCESSING,
+      );
+      expect(c.delivery?.attempts[0]?.status).toBe(
+        ReplyDeliveryAttemptStatus.SUCCEEDED,
+      );
+    });
+
+    it('never both completes and expires a delivery when they race', async () => {
+      await queue('lease-race');
+      const claimed = await deliveryRepository.claimNext(at(0), at(1_000));
+
+      const [completion, reconciled] = await Promise.allSettled([
+        deliveryRepository.markSucceeded(claimed!, providerResult, at(2_000)),
+        deliveryRepository.reconcileExpiredLeases(at(2_000)),
+      ]);
+
+      const completed = completion.status === 'fulfilled';
+      const expired = reconciled.status === 'fulfilled' ? reconciled.value : -1;
+      expect(expired).toBe(completed ? 0 : 1);
+      if (!completed) {
+        expect(completion.reason).toBeInstanceOf(DeliveryLeaseLostError);
+      }
+      const row = await prisma.replyDelivery.findUniqueOrThrow({
+        where: { id: claimed!.deliveryId },
+        include: { attempts: true },
+      });
+      expect(row.status).toBe(
+        completed ? ReplyDeliveryStatus.SUCCEEDED : ReplyDeliveryStatus.UNKNOWN,
+      );
+      expect(row.leaseToken).toBeNull();
+      expect(row.attempts[0]?.status).toBe(
+        completed
+          ? ReplyDeliveryAttemptStatus.SUCCEEDED
+          : ReplyDeliveryAttemptStatus.UNKNOWN,
+      );
+    });
+
+    it('does not count provider lookup as another delivery attempt', async () => {
+      const replyId = await queue('lease-no-attempt-inflation');
+      const first = await deliveryRepository.claimNext(at(0), at(lease));
+      await deliveryRepository.reconcileExpiredLeases(at(lease + 1));
+
+      for (let round = 0; round < 3; round += 1) {
+        const lookup = await deliveryRepository.claimUnknown(
+          at(lease + 10 + round * 10),
+          at(2 * lease),
+        );
+        expect(lookup?.attemptNumber).toBe(first?.attemptNumber);
+        await deliveryRepository.markUnknown(
+          lookup!,
+          'RECONCILIATION_TIMEOUT',
+          at(0),
+          at(lease + 15 + round * 10),
+        );
+      }
+
+      const row = await load(replyId);
+      expect(row.delivery?.attemptCount).toBe(1);
+      expect(row.delivery?.attempts).toHaveLength(1);
+      expect(instagramReplySpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps normal and reconciliation claims mutually exclusive under concurrency', async () => {
+      const unknownReply = await queue('lease-concurrent-unknown');
+      await deliveryRepository.claimNext(at(0), at(1_000));
+      await deliveryRepository.reconcileExpiredLeases(at(5_000));
+      await queue('lease-concurrent-pending');
+
+      const claims = await Promise.all([
+        deliveryRepository.claimNext(at(6_000), at(6_000 + lease)),
+        deliveryRepository.claimNext(at(6_000), at(6_000 + lease)),
+        deliveryRepository.claimUnknown(at(6_000), at(6_000 + lease)),
+        deliveryRepository.claimUnknown(at(6_000), at(6_000 + lease)),
+      ]);
+
+      const won = claims.filter((claim) => claim !== null);
+      expect(won).toHaveLength(2);
+      expect(new Set(won.map((claim) => claim.deliveryId)).size).toBe(2);
+      expect(new Set(won.map((claim) => claim.leaseToken)).size).toBe(2);
+      expect(won.map((claim) => claim.replyId)).toContain(unknownReply);
+      await expect(
+        prisma.replyDelivery.count({
+          where: { status: ReplyDeliveryStatus.PROCESSING },
+        }),
+      ).resolves.toBe(2);
+    });
+
+    it('rejects impossible lease states at the database boundary', async () => {
+      const replyId = await queue('lease-constraints');
+
+      await expect(
+        prisma.replyDelivery.update({
+          where: { replyId },
+          data: { status: ReplyDeliveryStatus.PROCESSING, leaseUntil: at(lease) },
+        }),
+      ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
+      await expect(
+        prisma.replyDelivery.update({
+          where: { replyId },
+          data: { status: ReplyDeliveryStatus.PROCESSING, leaseToken: randomUUID() },
+        }),
+      ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
+      await expect(
+        prisma.replyDelivery.update({
+          where: { replyId },
+          data: { leaseToken: randomUUID() },
+        }),
+      ).rejects.toBeInstanceOf(Prisma.PrismaClientUnknownRequestError);
+      await expect(
+        prisma.replyDelivery.update({
+          where: { replyId },
+          data: {
+            status: ReplyDeliveryStatus.PROCESSING,
+            leaseUntil: at(lease),
+            leaseToken: randomUUID(),
+          },
+        }),
+      ).resolves.toMatchObject({ status: ReplyDeliveryStatus.PROCESSING });
+    });
   });
 });
