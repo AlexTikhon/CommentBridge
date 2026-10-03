@@ -1,6 +1,7 @@
 import type { PlatformCommentResult } from '../../../platforms/domain/platform.types';
 import type {
   ConditionalDeliveryActionResult,
+  DeliveryQueueSnapshot,
   ManualDeliveryActionInput,
   ReplyDeliveryView,
   ReplyDeliveryWorkItem,
@@ -51,6 +52,8 @@ export interface ReplyDeliveryRepository {
     nextAttemptAt: Date,
     completedAt: Date,
   ): Promise<void>;
+  /** Read-only queue depth and lag as of `now`, from one consistent statement. */
+  getQueueSnapshot(now: Date): Promise<DeliveryQueueSnapshot>;
   /** Moves genuinely expired PROCESSING deliveries to UNKNOWN; returns how many. */
   reconcileExpiredLeases(now: Date): Promise<number>;
 }

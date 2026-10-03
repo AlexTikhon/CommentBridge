@@ -13,11 +13,15 @@ import type {
   SocialPlatformAdapter,
 } from '../../platforms/domain/platform.types';
 import { DeliveryLeaseLostError, ProviderAdapterError } from '../domain/comment.errors';
-import type { ReplyDeliveryWorkItem } from '../domain/comment.types';
+import type {
+  DeliveryJobOutcome,
+  ReplyDeliveryWorkItem,
+} from '../domain/comment.types';
 import {
   DELIVERY_WORKER_CONFIG,
   type DeliveryWorkerConfig,
 } from './delivery-worker.config';
+import { DeliveryWorkerMetrics } from './delivery-worker.metrics';
 import {
   REPLY_DELIVERY_REPOSITORY,
   type ReplyDeliveryRepository,
@@ -46,6 +50,7 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
     private readonly adapters: PlatformAdapterRegistry,
     @Inject(DELIVERY_WORKER_CONFIG)
     private readonly config: DeliveryWorkerConfig,
+    private readonly metrics: DeliveryWorkerMetrics,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -83,7 +88,8 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
       !this.stopping && result.reconciled + result.delivered < maxJobsPerTick;
     if (this.stopping) return result;
 
-    await this.reconcileExpiredLeases(clock());
+    const startedAt = clock();
+    const expiredLeases = await this.reconcileExpiredLeases(startedAt);
 
     let reconciliationQueueDry = false;
     while (hasBudget() && result.reconciled < maxReconciliationsPerTick) {
@@ -106,6 +112,20 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
     while (deliveryQueueDry && !reconciliationQueueDry && hasBudget()) {
       if (!(await this.processNextReconciliation(clock))) break;
       result.reconciled += 1;
+    }
+
+    const finishedAt = clock();
+    const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+    this.metrics.recordDrain({ finishedAt, durationMs, expiredLeases });
+    if (expiredLeases + result.reconciled + result.delivered > 0) {
+      this.logger.log(
+        JSON.stringify({
+          event: 'delivery.drain',
+          durationMs,
+          expiredLeases,
+          ...result,
+        }),
+      );
     }
     return result;
   }
@@ -140,7 +160,10 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
       this.leaseUntil(claimedAt),
     );
     if (!item) return false;
-    await this.withOwnership(item, () => this.reconcileUnknown(item, clock));
+    this.metrics.recordJob(
+      'RECONCILIATION',
+      await this.withOwnership(item, () => this.reconcileUnknown(item, clock)),
+    );
     return true;
   }
 
@@ -149,7 +172,10 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
     const claimedAt = clock();
     const item = await this.repository.claimNext(claimedAt, this.leaseUntil(claimedAt));
     if (!item) return false;
-    await this.withOwnership(item, () => this.deliver(item, clock));
+    this.metrics.recordJob(
+      'DELIVERY',
+      await this.withOwnership(item, () => this.deliver(item, clock)),
+    );
     return true;
   }
 
@@ -164,6 +190,7 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
     try {
       await this.drain();
     } catch (error: unknown) {
+      this.metrics.recordDrainFailure();
       this.logger.error(
         'Reply delivery worker tick failed.',
         error instanceof Error ? error.stack : undefined,
@@ -178,26 +205,30 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
    */
   private async withOwnership(
     item: ReplyDeliveryWorkItem,
-    work: () => Promise<void>,
-  ): Promise<void> {
+    work: () => Promise<DeliveryJobOutcome>,
+  ): Promise<DeliveryJobOutcome> {
     try {
-      await work();
+      return await work();
     } catch (error: unknown) {
       if (!(error instanceof DeliveryLeaseLostError)) throw error;
       this.logger.warn(
         `Lost lease on delivery ${item.deliveryId} (attempt ${item.attemptNumber}); result discarded.`,
       );
+      return 'LEASE_LOST';
     }
   }
 
-  private async deliver(item: ReplyDeliveryWorkItem, clock: Clock): Promise<void> {
+  private async deliver(
+    item: ReplyDeliveryWorkItem,
+    clock: Clock,
+  ): Promise<DeliveryJobOutcome> {
     if (!item.parentExternalCommentId || !item.idempotencyKey) {
       await this.repository.markTerminalFailure(
         item,
         'INVALID_DELIVERY_CONTEXT',
         clock(),
       );
-      return;
+      return 'FAILED';
     }
 
     let adapter: SocialPlatformAdapter;
@@ -205,7 +236,7 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
       adapter = this.adapters.resolve(item.platform);
     } catch {
       await this.repository.markTerminalFailure(item, 'UNSUPPORTED_PLATFORM', clock());
-      return;
+      return 'FAILED';
     }
 
     let result: PlatformCommentResult;
@@ -217,46 +248,46 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
       const completedAt = clock();
       if (error instanceof ProviderAdapterError) {
         if (error.retryable) {
-          await this.repository.markRetryableFailure(
+          return this.repository.markRetryableFailure(
             item,
             error.safeCode,
             this.nextAttemptAt(completedAt, item.attemptNumber),
             this.config.maxAttempts,
             completedAt,
           );
-        } else {
-          await this.repository.markTerminalFailure(item, error.safeCode, completedAt);
         }
-      } else {
-        await this.repository.markUnknown(
-          item,
-          error instanceof ProviderCallTimedOutError
-            ? 'PROVIDER_TIMEOUT_UNKNOWN'
-            : 'AMBIGUOUS_PROVIDER_RESULT',
-          this.nextAttemptAt(completedAt, item.attemptNumber),
-          completedAt,
-        );
+        await this.repository.markTerminalFailure(item, error.safeCode, completedAt);
+        return 'FAILED';
       }
-      return;
+      await this.repository.markUnknown(
+        item,
+        error instanceof ProviderCallTimedOutError
+          ? 'PROVIDER_TIMEOUT_UNKNOWN'
+          : 'AMBIGUOUS_PROVIDER_RESULT',
+        this.nextAttemptAt(completedAt, item.attemptNumber),
+        completedAt,
+      );
+      return 'UNKNOWN';
     }
 
     // A persistence failure after provider acceptance must leave the leased job
     // in PROCESSING. Lease reconciliation will move it to UNKNOWN rather than
     // misclassifying or blindly retrying an ambiguously successful request.
     await this.repository.markSucceeded(item, result, clock());
+    return 'SUCCEEDED';
   }
 
   private async reconcileUnknown(
     item: ReplyDeliveryWorkItem,
     clock: Clock,
-  ): Promise<void> {
+  ): Promise<DeliveryJobOutcome> {
     if (!item.parentExternalCommentId || !item.idempotencyKey) {
       await this.repository.markTerminalFailure(
         item,
         'INVALID_DELIVERY_CONTEXT',
         clock(),
       );
-      return;
+      return 'FAILED';
     }
 
     let adapter: SocialPlatformAdapter;
@@ -264,7 +295,7 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
       adapter = this.adapters.resolve(item.platform);
     } catch {
       await this.repository.markTerminalFailure(item, 'UNSUPPORTED_PLATFORM', clock());
-      return;
+      return 'FAILED';
     }
 
     let result: PlatformCommentResult | null;
@@ -284,7 +315,7 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
         this.nextAttemptAt(completedAt, item.attemptNumber),
         completedAt,
       );
-      return;
+      return 'UNKNOWN';
     }
 
     // Keep persistence outside the provider error boundary. If this transition
@@ -293,10 +324,10 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
     const completedAt = clock();
     if (result) {
       await this.repository.markSucceeded(item, result, completedAt);
-      return;
+      return 'SUCCEEDED';
     }
 
-    await this.repository.markRetryableFailure(
+    return this.repository.markRetryableFailure(
       item,
       'PROVIDER_CONFIRMED_NOT_FOUND',
       this.nextAttemptAt(completedAt, item.attemptNumber),

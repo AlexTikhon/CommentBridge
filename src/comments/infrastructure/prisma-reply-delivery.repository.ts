@@ -15,6 +15,7 @@ import {
   ReplyDeliveryStatus as DomainReplyDeliveryStatus,
   SocialPlatform,
   type ConditionalDeliveryActionResult,
+  type DeliveryQueueSnapshot,
   type ManualDeliveryActionInput,
   type ReplyDeliveryView,
   type ReplyDeliveryWorkItem,
@@ -482,6 +483,48 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
       SELECT (SELECT count(*) FROM expired)::int AS "count"
     `);
     return row?.count ?? 0;
+  }
+
+  async getQueueSnapshot(now: Date): Promise<DeliveryQueueSnapshot> {
+    const rows = await this.prisma.$queryRaw<
+      {
+        status: DomainReplyDeliveryStatus;
+        count: number;
+        oldestDueDeliveryAt: Date | null;
+        oldestDueReconciliationAt: Date | null;
+        expiredLeases: number;
+      }[]
+    >(Prisma.sql`
+      SELECT
+        "status",
+        count(*)::int AS "count",
+        min("nextAttemptAt") FILTER (
+          WHERE "status" IN ('PENDING', 'RETRY') AND "nextAttemptAt" <= ${now}
+        ) AS "oldestDueDeliveryAt",
+        min("nextAttemptAt") FILTER (
+          WHERE "status" = 'UNKNOWN' AND "nextAttemptAt" <= ${now}
+        ) AS "oldestDueReconciliationAt",
+        (count(*) FILTER (
+          WHERE "status" = 'PROCESSING' AND "leaseUntil" < ${now}
+        ))::int AS "expiredLeases"
+      FROM "ReplyDelivery"
+      GROUP BY "status"
+    `);
+
+    const earliest = (dates: (Date | null)[]): Date | null => {
+      const present = dates.filter((date): date is Date => date !== null);
+      return present.length === 0
+        ? null
+        : new Date(Math.min(...present.map((date) => date.getTime())));
+    };
+    return {
+      countsByStatus: Object.fromEntries(rows.map((row) => [row.status, row.count])),
+      oldestDueDeliveryAt: earliest(rows.map((row) => row.oldestDueDeliveryAt)),
+      oldestDueReconciliationAt: earliest(
+        rows.map((row) => row.oldestDueReconciliationAt),
+      ),
+      expiredLeases: rows.reduce((total, row) => total + row.expiredLeases, 0),
+    };
   }
 
   private async transitionProcessingJob(

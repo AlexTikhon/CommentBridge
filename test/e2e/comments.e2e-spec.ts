@@ -406,4 +406,39 @@ describe('comments API (e2e)', () => {
     );
     expect(response.headers['x-request-id']).toBe(response.body.requestId);
   });
+
+  it('GET /api/v1/deliveries/stats reports queue depth and worker counters', async () => {
+    await request(app.getHttpServer())
+      .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
+      .set('Idempotency-Key', 'e2e-stats')
+      .send({ message: 'Counted' })
+      .expect(202);
+
+    const queued = await request(app.getHttpServer())
+      .get('/api/v1/deliveries/stats')
+      .expect(200);
+    expect(queued.body.queue.countsByStatus).toMatchObject({
+      PENDING: 1,
+      SUCCEEDED: 0,
+      DEAD_LETTERED: 0,
+    });
+    expect(queued.body.queue.oldestDueDeliveryAgeMs).toEqual(expect.any(Number));
+    expect(JSON.stringify(queued.body)).not.toMatch(/leaseToken/);
+
+    await worker.processNext(new Date('2100-01-01T00:00:00.000Z'));
+
+    const delivered = await request(app.getHttpServer())
+      .get('/api/v1/deliveries/stats')
+      .expect(200);
+    expect(delivered.body.queue.countsByStatus).toMatchObject({
+      PENDING: 0,
+      SUCCEEDED: 1,
+    });
+    expect(delivered.body.queue.oldestDueDeliveryAgeMs).toBeNull();
+    expect(delivered.body.worker).toMatchObject({
+      enabled: false,
+      jobs: { DELIVERY: { SUCCEEDED: expect.any(Number) } },
+    });
+    expect(delivered.body.worker.jobs.DELIVERY.SUCCEEDED).toBeGreaterThanOrEqual(1);
+  });
 });

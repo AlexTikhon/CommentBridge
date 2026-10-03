@@ -249,6 +249,28 @@ connection closes. A hard kill is still safe: the unfinished lease expires into
 
 Invalid values stop startup with an error naming the variable (never its value).
 
+## Delivery observability
+
+`GET /api/v1/deliveries/stats` is a read-only operations view with two parts:
+
+- `queue`: durable, cross-instance state from one SQL statement: row counts for
+  every delivery status, how long the oldest _due_ `PENDING`/`RETRY` delivery
+  (`oldestDueDeliveryAgeMs`) and the oldest due `UNKNOWN` delivery
+  (`oldestDueReconciliationAgeMs`) have waited, and `expiredLeases`, the
+  `PROCESSING` rows past their lease that maintenance has not yet reconciled.
+  Rising lag or a persistent `expiredLeases` means workers are down or behind.
+- `worker`: counters for the instance that served the request (reset on restart,
+  zero when `DELIVERY_WORKER_ENABLED=false`): drains and drain failures, expired
+  leases reconciled, last drain time and duration, and job outcomes
+  (`SUCCEEDED`, `RETRY`, `FAILED`, `UNKNOWN`, `LEASE_LOST`) separately for
+  deliveries and reconciliations. A growing `LEASE_LOST` count means leases are
+  shorter than real provider latency.
+
+A drain that did any work also writes one JSON log line
+(`{"event":"delivery.drain","durationMs":…,"expiredLeases":…,"reconciled":…,"delivered":…}`);
+idle drains are silent. Messages and provider payloads are never logged. Like the
+other operations endpoints, this one is unauthenticated until authentication is added.
+
 ## Pagination
 
 Pages use descending keyset pagination over effective creation time and UUID. An

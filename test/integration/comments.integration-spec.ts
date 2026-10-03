@@ -11,6 +11,7 @@ import {
 import { CommentsService } from '../../src/comments/application/comments.service';
 import { ReplyDeliveriesService } from '../../src/comments/application/reply-deliveries.service';
 import { loadDeliveryWorkerConfig } from '../../src/comments/application/delivery-worker.config';
+import { DeliveryWorkerMetrics } from '../../src/comments/application/delivery-worker.metrics';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
 import { DeliveryLeaseLostError } from '../../src/comments/domain/comment.errors';
 import {
@@ -56,6 +57,7 @@ describe('comments persistence integration', () => {
       deliveryRepository,
       adapters,
       loadDeliveryWorkerConfig({}),
+      new DeliveryWorkerMetrics(),
     );
   });
   afterAll(async () => prisma.$disconnect());
@@ -993,6 +995,65 @@ describe('comments persistence integration', () => {
           },
         }),
       ).resolves.toMatchObject({ status: ReplyDeliveryStatus.PROCESSING });
+    });
+  });
+
+  describe('queue snapshot', () => {
+    const at = (offsetMs: number) => new Date(workerNow.getTime() + offsetMs);
+
+    it('reports an empty queue as zero depth and no lag', async () => {
+      await expect(deliveryRepository.getQueueSnapshot(at(0))).resolves.toEqual({
+        countsByStatus: {},
+        oldestDueDeliveryAt: null,
+        oldestDueReconciliationAt: null,
+        expiredLeases: 0,
+      });
+    });
+
+    it('counts depth by status and measures only work that is actually due', async () => {
+      const states = [
+        { status: ReplyDeliveryStatus.PENDING, nextAttemptAt: at(-10_000) },
+        { status: ReplyDeliveryStatus.RETRY, nextAttemptAt: at(-2_000) },
+        { status: ReplyDeliveryStatus.RETRY, nextAttemptAt: at(60_000) },
+        { status: ReplyDeliveryStatus.UNKNOWN, nextAttemptAt: at(-30_000) },
+        { status: ReplyDeliveryStatus.UNKNOWN, nextAttemptAt: at(5_000) },
+        {
+          status: ReplyDeliveryStatus.PROCESSING,
+          nextAttemptAt: at(-90_000),
+          leaseUntil: at(-1_000),
+          leaseToken: randomUUID(),
+        },
+        {
+          status: ReplyDeliveryStatus.PROCESSING,
+          nextAttemptAt: at(-90_000),
+          leaseUntil: at(1_000),
+          leaseToken: randomUUID(),
+        },
+      ];
+      for (const [index, state] of states.entries()) {
+        const accepted = await service.replyToComment(
+          SEED_IDS.instagramComment,
+          `Snapshot ${index}`,
+          `snapshot-${index}`,
+        );
+        await prisma.replyDelivery.update({
+          where: { replyId: accepted.reply.id },
+          data: state,
+        });
+      }
+
+      await expect(deliveryRepository.getQueueSnapshot(at(0))).resolves.toEqual({
+        countsByStatus: {
+          [ReplyDeliveryStatus.PENDING]: 1,
+          [ReplyDeliveryStatus.RETRY]: 2,
+          [ReplyDeliveryStatus.UNKNOWN]: 2,
+          [ReplyDeliveryStatus.PROCESSING]: 2,
+        },
+        // PROCESSING rows are neither deliveries nor reconciliations awaiting a claim.
+        oldestDueDeliveryAt: at(-10_000),
+        oldestDueReconciliationAt: at(-30_000),
+        expiredLeases: 1,
+      });
     });
   });
 });

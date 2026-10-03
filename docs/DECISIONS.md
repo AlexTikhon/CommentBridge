@@ -125,6 +125,17 @@ rather than strict priority, trading a little reconciliation latency for the
 guarantee that fresh replies are never starved. Completion timestamps come from the
 worker's clock, not from hidden `new Date()` calls in the repository.
 
+## Worker observability
+
+Queue depth and lag are read from PostgreSQL in a single statement because the
+queue is the durable source of truth shared by every instance. Lag counts only work
+that is already due, so scheduled retries do not look like backlog. Worker counters
+stay in process memory: they describe one instance, reset on restart, and avoid a
+metrics dependency until a concrete scraper exists. The same snapshot and counter
+objects can be adapted to Prometheus or OpenTelemetry later without touching the
+worker. Each job reports a closed set of outcomes, including `LEASE_LOST`, so a
+stale write is visible instead of only logged.
+
 ## Error boundary and request IDs
 
 Custom application errors retain explicit RFC 7807-style mappings. General NestJS

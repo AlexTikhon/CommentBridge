@@ -3,6 +3,7 @@ import { PlatformAdapterRegistry } from '../../platforms/application/platform-ad
 import { MockInstagramAdapter } from '../../platforms/infrastructure/mock-instagram.adapter';
 import { DeliveryLeaseLostError, ProviderAdapterError } from '../domain/comment.errors';
 import { SocialPlatform, type ReplyDeliveryWorkItem } from '../domain/comment.types';
+import { DeliveryWorkerMetrics } from './delivery-worker.metrics';
 import {
   loadDeliveryWorkerConfig,
   type DeliveryWorkerConfig,
@@ -42,6 +43,7 @@ function repositoryMock(): jest.Mocked<ReplyDeliveryRepository> {
     markTerminalFailure: jest.fn(),
     markUnknown: jest.fn(),
     reconcileExpiredLeases: jest.fn().mockResolvedValue(0),
+    getQueueSnapshot: jest.fn(),
   };
 }
 
@@ -59,6 +61,7 @@ describe('ReplyDeliveryWorker', () => {
   let repository: jest.Mocked<ReplyDeliveryRepository>;
   let instagram: MockInstagramAdapter;
   let worker: ReplyDeliveryWorker;
+  let metrics: DeliveryWorkerMetrics;
 
   function createWorker(
     overrides: Partial<DeliveryWorkerConfig> = {},
@@ -67,6 +70,7 @@ describe('ReplyDeliveryWorker', () => {
       repository,
       new PlatformAdapterRegistry([instagram]),
       { ...loadDeliveryWorkerConfig({}), ...overrides },
+      metrics,
     );
   }
 
@@ -75,6 +79,7 @@ describe('ReplyDeliveryWorker', () => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation();
     repository = repositoryMock();
     instagram = new MockInstagramAdapter();
+    metrics = new DeliveryWorkerMetrics();
     worker = createWorker();
   });
 
@@ -417,6 +422,133 @@ describe('ReplyDeliveryWorker', () => {
         ([at, until]) => until.getTime() - at.getTime(),
       );
       expect(leaseSpans).toEqual([30_000, 30_000, 30_000]);
+    });
+  });
+
+  describe('observability', () => {
+    const lookupFound = { externalCommentId: 'provider-reply', remoteCreatedAt: now };
+
+    it('records a delivery that succeeded', async () => {
+      repository.claimNext.mockResolvedValue(workItem());
+
+      await worker.processNext(now);
+
+      expect(metrics.snapshot().jobs.DELIVERY.SUCCEEDED).toBe(1);
+    });
+
+    it('records whether a retryable failure was rescheduled or exhausted', async () => {
+      repository.claimNext.mockResolvedValue(workItem());
+      jest
+        .spyOn(instagram, 'replyToComment')
+        .mockRejectedValue(new ProviderAdapterError('PLATFORM_RATE_LIMITED', true));
+      repository.markRetryableFailure.mockResolvedValueOnce('RETRY');
+      repository.markRetryableFailure.mockResolvedValueOnce('FAILED');
+
+      await worker.processNext(now);
+      await worker.processNext(now);
+
+      const { jobs } = metrics.snapshot();
+      expect(jobs.DELIVERY.RETRY).toBe(1);
+      expect(jobs.DELIVERY.FAILED).toBe(1);
+    });
+
+    it('records terminal and ambiguous provider outcomes', async () => {
+      repository.claimNext.mockResolvedValue(workItem());
+      const send = jest.spyOn(instagram, 'replyToComment');
+      send.mockRejectedValueOnce(
+        new ProviderAdapterError('PLATFORM_UNAVAILABLE', false),
+      );
+      send.mockRejectedValueOnce(new Error('raw provider response'));
+
+      await worker.processNext(now);
+      await worker.processNext(now);
+
+      const { jobs } = metrics.snapshot();
+      expect(jobs.DELIVERY.FAILED).toBe(1);
+      expect(jobs.DELIVERY.UNKNOWN).toBe(1);
+    });
+
+    it('records reconciliation outcomes separately from deliveries', async () => {
+      repository.claimUnknown.mockResolvedValue(workItem());
+      const lookup = jest.spyOn(instagram, 'lookupReply');
+      lookup.mockResolvedValueOnce(lookupFound);
+      lookup.mockResolvedValueOnce(null);
+      lookup.mockRejectedValueOnce(
+        new ProviderAdapterError('PLATFORM_UNAVAILABLE', true),
+      );
+      repository.markRetryableFailure.mockResolvedValue('RETRY');
+
+      await worker.processNext(now);
+      await worker.processNext(now);
+      await worker.processNext(now);
+
+      const { jobs } = metrics.snapshot();
+      expect(jobs.RECONCILIATION).toMatchObject({ SUCCEEDED: 1, RETRY: 1, UNKNOWN: 1 });
+      expect(jobs.DELIVERY.SUCCEEDED).toBe(0);
+    });
+
+    it('records a lost lease as its own outcome', async () => {
+      repository.claimNext.mockResolvedValue(workItem());
+      repository.markSucceeded.mockRejectedValue(new DeliveryLeaseLostError('d'));
+
+      await worker.processNext(now);
+
+      const { jobs } = metrics.snapshot();
+      expect(jobs.DELIVERY.LEASE_LOST).toBe(1);
+      expect(jobs.DELIVERY.SUCCEEDED).toBe(0);
+    });
+
+    it('records each drain with its duration and reconciled expired leases', async () => {
+      repository.reconcileExpiredLeases.mockResolvedValue(2);
+      let tick = 0;
+      const clock = () => new Date(now.getTime() + 250 * tick++);
+
+      await worker.drain(clock);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot).toMatchObject({ drains: 1, expiredLeasesReconciled: 2 });
+      expect(snapshot.lastDrainDurationMs).toBeGreaterThan(0);
+      expect(snapshot.lastDrainAt).toBeInstanceOf(Date);
+    });
+
+    it('logs one structured line for a drain that did work', async () => {
+      const log = jest.spyOn(Logger.prototype, 'log').mockImplementation();
+      repository.reconcileExpiredLeases.mockResolvedValue(1);
+      repository.claimNext
+        .mockResolvedValueOnce(workItem())
+        .mockResolvedValueOnce(workItem())
+        .mockResolvedValue(null);
+
+      await worker.drain(() => now);
+
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({
+        event: 'delivery.drain',
+        durationMs: 0,
+        expiredLeases: 1,
+        reconciled: 0,
+        delivered: 2,
+      });
+    });
+
+    it('stays quiet when a drain finds nothing to do', async () => {
+      const log = jest.spyOn(Logger.prototype, 'log').mockImplementation();
+
+      await worker.drain(() => now);
+
+      expect(log).not.toHaveBeenCalled();
+      expect(metrics.snapshot().drains).toBe(1);
+    });
+
+    it('counts a scheduled drain that failed', async () => {
+      repository.reconcileExpiredLeases.mockRejectedValue(new Error('db down'));
+      worker = createWorker({ pollIntervalMs: 60_000 });
+
+      worker.onApplicationBootstrap();
+      await flush();
+      await worker.onModuleDestroy();
+
+      expect(metrics.snapshot()).toMatchObject({ drains: 0, drainFailures: 1 });
     });
   });
 

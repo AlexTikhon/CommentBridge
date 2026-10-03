@@ -114,6 +114,23 @@ export interface ReplyDeliveryWorkItem {
   idempotencyKey: string | null;
 }
 
+export type DeliveryJobKind = 'DELIVERY' | 'RECONCILIATION';
+
+/** How a claimed job ended; LEASE_LOST means another lease generation owns it. */
+export type DeliveryJobOutcome =
+  'SUCCEEDED' | 'RETRY' | 'FAILED' | 'UNKNOWN' | 'LEASE_LOST';
+
+export interface DeliveryQueueSnapshot {
+  /** Statuses with no rows may be absent. */
+  countsByStatus: Partial<Record<ReplyDeliveryStatus, number>>;
+  /** Earliest due time among PENDING/RETRY deliveries, or null when none is due. */
+  oldestDueDeliveryAt: Date | null;
+  /** Earliest due time among UNKNOWN deliveries awaiting lookup, or null. */
+  oldestDueReconciliationAt: Date | null;
+  /** PROCESSING deliveries whose lease has passed but are not yet reconciled. */
+  expiredLeases: number;
+}
+
 export interface ReplyDeliveryAttemptView {
   id: string;
   attemptNumber: number;
