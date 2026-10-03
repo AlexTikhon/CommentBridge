@@ -1,3 +1,17 @@
+# Delivery settings shared by the API and the worker. A variable that is not set
+# in your shell or .env is not passed, so the application defaults apply.
+x-delivery-settings: &delivery-settings
+  DELIVERY_POLL_INTERVAL_MS:
+  DELIVERY_LEASE_DURATION_MS:
+  DELIVERY_PROVIDER_TIMEOUT_MS:
+  DELIVERY_MAX_ATTEMPTS:
+  DELIVERY_BASE_RETRY_DELAY_MS:
+  DELIVERY_MAX_RETRY_DELAY_MS:
+  DELIVERY_MAX_JOBS_PER_TICK:
+  DELIVERY_MAX_RECONCILIATIONS_PER_TICK:
+  DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS:
+  DELIVERY_WORKER_STALE_AFTER_MS:
+
 services:
   postgres:
     image: postgres:17.5-alpine
@@ -33,6 +47,74 @@ services:
       timeout: 3s
       retries: 15
       start_period: 3s
+    restart: unless-stopped
+
+  # Application services are opt-in so that `docker compose up -d postgres` still
+  # starts only the database:
+  #   docker compose --profile app up -d --build api delivery-worker
+  migrate:
+    profiles: [app]
+    image: commentbridge-migrate:local
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/social_comments?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: [app]
+    image: commentbridge:local
+    build:
+      context: .
+      target: runtime
+    command: ['node', 'dist/main.js']
+    init: true
+    environment:
+      <<: *delivery-settings
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/social_comments?schema=public
+      PORT: '3000'
+      OPERATOR_API_KEYS: ${OPERATOR_API_KEYS:-}
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Same image as the API, different command, and no HTTP listener or published
+  # port. Its liveness is the heartbeat shown by GET /api/v1/deliveries/stats, so it
+  # has no container healthcheck; restart-on-exit covers crashes.
+  delivery-worker:
+    profiles: [app]
+    image: commentbridge:local
+    command: ['node', 'dist/worker.js']
+    init: true
+    environment:
+      <<: *delivery-settings
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/social_comments?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Longer than DELIVERY_PROVIDER_TIMEOUT_MS so the job in flight can finish
+    # before SIGKILL; a killed worker is still safe (its lease expires).
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

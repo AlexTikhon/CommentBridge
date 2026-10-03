@@ -1,14 +1,18 @@
 import { ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
+import type { TestingModule } from '@nestjs/testing';
 import { CommentDirection, DeliveryStatus, type PrismaClient } from '@prisma/client';
 import { ReplyDeliveryAttemptStatus, ReplyDeliveryStatus } from '@prisma/client';
 import * as request from 'supertest';
 import { AppModule } from '../../src/app.module';
+import { DeliveryWorkerMetrics } from '../../src/comments/application/delivery-worker.metrics';
+import { DeliveryWorkerRuntime } from '../../src/comments/application/delivery-worker.runtime';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
 import { ProblemDetailsFilter } from '../../src/common/errors/problem-details.filter';
 import { PrismaService } from '../../src/database/prisma.service';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
+import { WorkerModule } from '../../src/worker.module';
 import { SEED_IDS } from '../../prisma/seed';
 import { resetAndSeed } from '../database-test-utils';
 
@@ -16,16 +20,23 @@ const operatorAuth = `Bearer ${process.env.OPERATOR_API_KEYS?.split('=')[1] ?? '
 
 describe('comments API (e2e)', () => {
   let app: INestApplication;
+  let apiModule: TestingModule;
+  let workerModule: TestingModule;
+  let workerRuntime: DeliveryWorkerRuntime;
   let prisma: PrismaClient;
   let instagram: MockInstagramAdapter;
   let worker: ReplyDeliveryWorker;
   let instagramReplySpy: jest.SpiedFunction<MockInstagramAdapter['replyToComment']>;
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
+    // The API and the worker are separate module graphs, as they are separate
+    // processes in production. The worker module is compiled but never initialized
+    // here, so its runtime does not poll; tests drive it explicitly.
+    apiModule = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    workerModule = await Test.createTestingModule({
+      imports: [WorkerModule],
     }).compile();
-    app = moduleRef.createNestApplication();
+    app = apiModule.createNestApplication();
     app.useGlobalPipes(
       new ValidationPipe({
         transform: true,
@@ -35,9 +46,10 @@ describe('comments API (e2e)', () => {
     );
     app.useGlobalFilters(new ProblemDetailsFilter());
     await app.init();
-    prisma = moduleRef.get(PrismaService);
-    instagram = moduleRef.get(MockInstagramAdapter);
-    worker = moduleRef.get(ReplyDeliveryWorker);
+    prisma = apiModule.get(PrismaService);
+    instagram = workerModule.get(MockInstagramAdapter);
+    worker = workerModule.get(ReplyDeliveryWorker);
+    workerRuntime = workerModule.get(DeliveryWorkerRuntime);
     instagramReplySpy = jest.spyOn(instagram, 'replyToComment');
   });
 
@@ -46,7 +58,10 @@ describe('comments API (e2e)', () => {
     instagramReplySpy.mockClear();
   });
 
-  afterAll(async () => app.close());
+  afterAll(async () => {
+    await workerModule.close();
+    await app.close();
+  });
 
   it('GET /api/v1/posts/:postId/comments returns a normalized page', async () => {
     const response = await request(app.getHttpServer())
@@ -417,41 +432,126 @@ describe('comments API (e2e)', () => {
     expect(response.headers['x-request-id']).toBe(response.body.requestId);
   });
 
-  it('GET /api/v1/deliveries/stats reports queue depth and worker counters', async () => {
-    await request(app.getHttpServer())
-      .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
-      .set('Idempotency-Key', 'e2e-stats')
-      .send({ message: 'Counted' })
-      .expect(202);
+  describe('delivery stats', () => {
+    const getStats = () =>
+      request(app.getHttpServer())
+        .get('/api/v1/deliveries/stats')
+        .set('Authorization', operatorAuth)
+        .expect(200);
 
-    const queued = await request(app.getHttpServer())
-      .get('/api/v1/deliveries/stats')
-      .set('Authorization', operatorAuth)
-      .expect(200);
-    expect(queued.body.queue.countsByStatus).toMatchObject({
-      PENDING: 1,
-      SUCCEEDED: 0,
-      DEAD_LETTERED: 0,
-    });
-    expect(queued.body.queue.oldestDueDeliveryAgeMs).toEqual(expect.any(Number));
-    expect(JSON.stringify(queued.body)).not.toMatch(/leaseToken/);
+    it('GET /api/v1/deliveries/stats reports queue depth and no workers when none run', async () => {
+      await request(app.getHttpServer())
+        .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
+        .set('Idempotency-Key', 'e2e-stats')
+        .send({ message: 'Counted' })
+        .expect(202);
 
-    await worker.processNext(new Date('2100-01-01T00:00:00.000Z'));
+      const queued = await getStats();
 
-    const delivered = await request(app.getHttpServer())
-      .get('/api/v1/deliveries/stats')
-      .set('Authorization', operatorAuth)
-      .expect(200);
-    expect(delivered.body.queue.countsByStatus).toMatchObject({
-      PENDING: 0,
-      SUCCEEDED: 1,
+      expect(queued.body.queue.countsByStatus).toMatchObject({
+        PENDING: 1,
+        SUCCEEDED: 0,
+        DEAD_LETTERED: 0,
+      });
+      expect(queued.body.queue.oldestDueDeliveryAgeMs).toEqual(expect.any(Number));
+      expect(queued.body.workers).toEqual({
+        staleAfterMs: 30_000,
+        active: 0,
+        stale: 0,
+        instances: [],
+      });
+      expect(queued.body).not.toHaveProperty('worker');
     });
-    expect(delivered.body.queue.oldestDueDeliveryAgeMs).toBeNull();
-    expect(delivered.body.worker).toMatchObject({
-      enabled: false,
-      jobs: { DELIVERY: { SUCCEEDED: expect.any(Number) } },
+
+    it('reports a worker in another module graph through shared state, not API memory', async () => {
+      // The API application holds no worker objects at all, so nothing it reports
+      // can come from in-process metrics.
+      for (const worker of [
+        ReplyDeliveryWorker,
+        DeliveryWorkerRuntime,
+        DeliveryWorkerMetrics,
+      ]) {
+        expect(() => apiModule.get(worker, { strict: false })).toThrow();
+      }
+      await request(app.getHttpServer())
+        .post(`/api/v1/comments/${SEED_IDS.instagramComment}/replies`)
+        .set('Idempotency-Key', 'e2e-worker-state')
+        .send({ message: 'Observed' })
+        .expect(202);
+
+      try {
+        await workerRuntime.start();
+        let delivered = await getStats();
+        for (
+          let attempt = 0;
+          attempt < 100 && !delivered.body.workers.instances[0]?.lastDrain;
+          attempt += 1
+        ) {
+          await new Promise((done) => setTimeout(done, 50));
+          delivered = await getStats();
+        }
+
+        expect(delivered.body.queue.countsByStatus).toMatchObject({
+          PENDING: 0,
+          SUCCEEDED: 1,
+        });
+        expect(delivered.body.workers).toMatchObject({ active: 1, stale: 0 });
+        expect(delivered.body.workers.instances).toEqual([
+          {
+            instanceId: workerRuntime.instanceId,
+            status: 'ACTIVE',
+            startedAt: expect.any(String),
+            lastHeartbeatAt: expect.any(String),
+            lastDrain: {
+              completedAt: expect.any(String),
+              durationMs: expect.any(Number),
+              processed: 1,
+              succeeded: 1,
+              retry: 0,
+              failed: 0,
+              unknown: 0,
+              leaseLost: 0,
+              expiredLeases: 0,
+            },
+          },
+        ]);
+      } finally {
+        await workerRuntime.onModuleDestroy();
+      }
     });
-    expect(delivered.body.worker.jobs.DELIVERY.SUCCEEDED).toBeGreaterThanOrEqual(1);
+
+    it('reports a worker that stopped heartbeating as STALE', async () => {
+      await prisma.deliveryWorkerInstance.create({
+        data: {
+          instanceId: 'crashed-worker',
+          startedAt: new Date(Date.now() - 3_600_000),
+          lastHeartbeatAt: new Date(Date.now() - 5 * 60_000),
+        },
+      });
+
+      const response = await getStats();
+
+      expect(response.body.workers).toMatchObject({ active: 0, stale: 1 });
+      expect(response.body.workers.instances).toEqual([
+        expect.objectContaining({ instanceId: 'crashed-worker', status: 'STALE' }),
+      ]);
+    });
+
+    it('never exposes lease tokens, API keys, or connection details', async () => {
+      await prisma.deliveryWorkerInstance.create({
+        data: {
+          instanceId: 'visible-worker',
+          startedAt: new Date(),
+          lastHeartbeatAt: new Date(),
+        },
+      });
+
+      const { text } = await getStats();
+
+      expect(text).not.toMatch(/leaseToken|lease_token/i);
+      expect(text).not.toContain(process.env.OPERATOR_API_KEYS?.split('=')[1] ?? 'x');
+      expect(text).not.toMatch(/postgres(ql)?:\/\//);
+    });
   });
 
   describe('operator authentication', () => {

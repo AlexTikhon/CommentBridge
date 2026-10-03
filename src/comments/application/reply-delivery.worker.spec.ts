@@ -390,7 +390,7 @@ describe('ReplyDeliveryWorker', () => {
     it('stops early when both queues are empty', async () => {
       const result = await worker.drain(() => now);
 
-      expect(result).toEqual({ reconciled: 0, delivered: 0 });
+      expect(result).toMatchObject({ reconciled: 0, delivered: 0 });
       expect(repository.claimUnknown).toHaveBeenCalledTimes(1);
       expect(repository.claimNext).toHaveBeenCalledTimes(1);
     });
@@ -539,97 +539,98 @@ describe('ReplyDeliveryWorker', () => {
       expect(log).not.toHaveBeenCalled();
       expect(metrics.snapshot().drains).toBe(1);
     });
+  });
 
-    it('counts a scheduled drain that failed', async () => {
-      repository.reconcileExpiredLeases.mockRejectedValue(new Error('db down'));
-      worker = createWorker({ pollIntervalMs: 60_000 });
+  describe('drain result', () => {
+    it('tallies outcomes across deliveries and reconciliations', async () => {
+      repository.reconcileExpiredLeases.mockResolvedValue(2);
+      repository.claimUnknown
+        .mockResolvedValueOnce(workItem({ deliveryId: 'unknown-job' }))
+        .mockResolvedValue(null);
+      jest.spyOn(instagram, 'lookupReply').mockResolvedValue({
+        externalCommentId: 'provider-reply',
+        remoteCreatedAt: now,
+      });
+      repository.claimNext
+        .mockResolvedValueOnce(workItem())
+        .mockResolvedValueOnce(workItem())
+        .mockResolvedValueOnce(workItem())
+        .mockResolvedValue(null);
+      jest
+        .spyOn(instagram, 'replyToComment')
+        .mockResolvedValueOnce({ externalCommentId: 'ok', remoteCreatedAt: now })
+        .mockRejectedValueOnce(new ProviderAdapterError('PLATFORM_RATE_LIMITED', true))
+        .mockRejectedValueOnce(new Error('connection reset'));
+      repository.markRetryableFailure.mockResolvedValue('RETRY');
 
-      worker.onApplicationBootstrap();
-      await flush();
-      await worker.onModuleDestroy();
+      const result = await worker.drain(() => now);
 
-      expect(metrics.snapshot()).toMatchObject({ drains: 0, drainFailures: 1 });
+      expect(result).toMatchObject({
+        reconciled: 1,
+        delivered: 3,
+        expiredLeases: 2,
+        startedAt: now,
+        finishedAt: now,
+        durationMs: 0,
+        outcomes: { SUCCEEDED: 2, RETRY: 1, FAILED: 0, UNKNOWN: 1, LEASE_LOST: 0 },
+      });
+    });
+
+    it('counts a lost lease as its own outcome', async () => {
+      repository.claimNext.mockResolvedValueOnce(workItem()).mockResolvedValue(null);
+      repository.markSucceeded.mockRejectedValue(new DeliveryLeaseLostError('d'));
+
+      const result = await worker.drain(() => now);
+
+      expect(result.outcomes).toEqual({
+        SUCCEEDED: 0,
+        RETRY: 0,
+        FAILED: 0,
+        UNKNOWN: 0,
+        LEASE_LOST: 1,
+      });
+    });
+
+    it('reports an idle drain as no work', async () => {
+      const result = await worker.drain(() => now);
+
+      expect(result).toMatchObject({ reconciled: 0, delivered: 0, expiredLeases: 0 });
+      expect(Object.values(result.outcomes).every((count) => count === 0)).toBe(true);
     });
   });
 
-  describe('lifecycle', () => {
-    afterEach(() => {
-      jest.useRealTimers();
-    });
+  describe('stop', () => {
+    it('makes a later drain claim nothing and touch nothing', async () => {
+      repository.claimNext.mockResolvedValue(workItem());
 
-    it('does not start a drain when the worker is disabled', async () => {
-      worker = createWorker({ enabled: false });
+      worker.stop();
+      const result = await worker.drain(() => now);
 
-      worker.onApplicationBootstrap();
-      await flush();
-
+      expect(result).toMatchObject({ reconciled: 0, delivered: 0, expiredLeases: 0 });
       expect(repository.reconcileExpiredLeases).not.toHaveBeenCalled();
+      expect(repository.claimUnknown).not.toHaveBeenCalled();
+      expect(repository.claimNext).not.toHaveBeenCalled();
     });
 
-    it('stops scheduling new ticks once shutdown begins', async () => {
-      jest.useFakeTimers();
-      worker = createWorker({ pollIntervalMs: 1_000 });
-
-      worker.onApplicationBootstrap();
-      await jest.advanceTimersByTimeAsync(2_500);
-      const drainsBeforeShutdown = repository.reconcileExpiredLeases.mock.calls.length;
-      expect(drainsBeforeShutdown).toBeGreaterThanOrEqual(2);
-
-      await worker.onModuleDestroy();
-      await jest.advanceTimersByTimeAsync(10_000);
-
-      expect(repository.reconcileExpiredLeases).toHaveBeenCalledTimes(
-        drainsBeforeShutdown,
-      );
-    });
-
-    it('waits for the in-flight job and starts no new one after shutdown begins', async () => {
+    it('lets the job already in flight finish and then claims no more', async () => {
       const claim = deferred<ReplyDeliveryWorkItem | null>();
       repository.claimNext.mockReturnValueOnce(claim.promise);
       repository.claimNext.mockResolvedValue(workItem({ deliveryId: 'late-job' }));
-      worker = createWorker({ pollIntervalMs: 60_000 });
 
-      worker.onApplicationBootstrap();
+      const draining = worker.drain(() => now);
       await flush();
-      expect(repository.claimNext).toHaveBeenCalledTimes(1);
-
-      let destroyed = false;
-      const destroying = worker.onModuleDestroy().then(() => {
-        destroyed = true;
-      });
-      await flush();
-      expect(destroyed).toBe(false);
-
+      worker.stop();
       claim.resolve(workItem());
-      await destroying;
+      const result = await draining;
 
-      expect(destroyed).toBe(true);
+      expect(result.delivered).toBe(1);
       expect(repository.markSucceeded).toHaveBeenCalledTimes(1);
-      expect(repository.markSucceeded).toHaveBeenCalledWith(
-        workItem(),
-        expect.anything(),
-        expect.any(Date),
-      );
       expect(repository.claimNext).toHaveBeenCalledTimes(1);
     });
 
-    it('resolves immediately when shutdown begins while idle', async () => {
-      worker = createWorker({ pollIntervalMs: 60_000 });
-      worker.onApplicationBootstrap();
-      await flush();
-
-      await expect(worker.onModuleDestroy()).resolves.toBeUndefined();
-      await expect(worker.onModuleDestroy()).resolves.toBeUndefined();
-    });
-
-    it('does not let a drain failure escape the scheduler or block shutdown', async () => {
-      repository.reconcileExpiredLeases.mockRejectedValue(new Error('db down'));
-      worker = createWorker({ pollIntervalMs: 60_000 });
-
-      worker.onApplicationBootstrap();
-      await flush();
-
-      await expect(worker.onModuleDestroy()).resolves.toBeUndefined();
+    it('is idempotent', () => {
+      worker.stop();
+      expect(() => worker.stop()).not.toThrow();
     });
   });
 });

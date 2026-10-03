@@ -1,17 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { ReplyDeliveryStatus } from '../../domain/comment.types';
 
-const outcomeCounts = {
-  type: 'object',
-  properties: {
-    SUCCEEDED: { type: 'integer', minimum: 0 },
-    RETRY: { type: 'integer', minimum: 0 },
-    FAILED: { type: 'integer', minimum: 0 },
-    UNKNOWN: { type: 'integer', minimum: 0 },
-    LEASE_LOST: { type: 'integer', minimum: 0 },
-  },
-} as const;
-
 export class DeliveryQueueStatsDto {
   @ApiProperty({
     description: 'Durable row counts across all instances; every status is present.',
@@ -40,40 +29,80 @@ export class DeliveryQueueStatsDto {
   expiredLeases!: number;
 }
 
-export class DeliveryWorkerStatsDto {
-  @ApiProperty({ description: 'Whether this instance runs the delivery worker.' })
-  enabled!: boolean;
+export class DeliveryWorkerDrainDto {
+  @ApiProperty({ format: 'date-time' })
+  completedAt!: string;
+
+  @ApiProperty()
+  durationMs!: number;
+
+  @ApiProperty({ description: 'Jobs handled: deliveries plus reconciliations.' })
+  processed!: number;
+
+  @ApiProperty()
+  succeeded!: number;
+
+  @ApiProperty()
+  retry!: number;
+
+  @ApiProperty()
+  failed!: number;
+
+  @ApiProperty()
+  unknown!: number;
 
   @ApiProperty({
     description:
-      'Counters for this process only; they reset on restart and are zero when the worker is disabled.',
-    example: {
-      drains: 120,
-      drainFailures: 0,
-      expiredLeasesReconciled: 0,
-      lastDrainAt: '2026-10-03T12:00:00.000Z',
-      lastDrainDurationMs: 12,
-    },
+      'Jobs whose result was discarded because another owner held the lease.',
   })
-  drains!: number;
+  leaseLost!: number;
 
-  @ApiProperty()
-  drainFailures!: number;
+  @ApiProperty({ description: 'Expired leases this drain moved to UNKNOWN.' })
+  expiredLeases!: number;
+}
 
-  @ApiProperty()
-  expiredLeasesReconciled!: number;
+export class DeliveryWorkerInstanceDto {
+  @ApiProperty({
+    description:
+      'Identifies one worker process lifetime. Unrelated to any delivery lease.',
+  })
+  instanceId!: string;
 
-  @ApiProperty({ format: 'date-time', nullable: true })
-  lastDrainAt!: string | null;
+  @ApiProperty({ enum: ['ACTIVE', 'STALE'] })
+  status!: 'ACTIVE' | 'STALE';
 
-  @ApiProperty({ nullable: true })
-  lastDrainDurationMs!: number | null;
+  @ApiProperty({ format: 'date-time' })
+  startedAt!: string;
+
+  @ApiProperty({ format: 'date-time' })
+  lastHeartbeatAt!: string;
 
   @ApiProperty({
-    type: 'object',
-    properties: { DELIVERY: outcomeCounts, RECONCILIATION: outcomeCounts },
+    type: DeliveryWorkerDrainDto,
+    nullable: true,
+    description:
+      'The most recent drain that did work. Idle drains are not recorded, so an old value with a fresh heartbeat means an idle queue.',
   })
-  jobs!: Record<'DELIVERY' | 'RECONCILIATION', Record<string, number>>;
+  lastDrain!: DeliveryWorkerDrainDto | null;
+}
+
+export class DeliveryWorkersDto {
+  @ApiProperty({
+    description: 'A worker whose last heartbeat is older than this is STALE.',
+  })
+  staleAfterMs!: number;
+
+  @ApiProperty({ description: 'Worker processes with a recent heartbeat.' })
+  active!: number;
+
+  @ApiProperty({
+    description:
+      'Workers that stopped heartbeating within the retention window: crashed, stopped, or replaced.',
+  })
+  stale!: number;
+
+  @ApiProperty({ type: [DeliveryWorkerInstanceDto] })
+  instances!: DeliveryWorkerInstanceDto[];
 }
 
 export class DeliveryStatsResponseDto {
@@ -83,6 +112,10 @@ export class DeliveryStatsResponseDto {
   @ApiProperty({ type: DeliveryQueueStatsDto })
   queue!: DeliveryQueueStatsDto;
 
-  @ApiProperty({ type: DeliveryWorkerStatsDto })
-  worker!: DeliveryWorkerStatsDto;
+  @ApiProperty({
+    type: DeliveryWorkersDto,
+    description:
+      'Read from PostgreSQL, so it reflects workers running in other processes.',
+  })
+  workers!: DeliveryWorkersDto;
 }

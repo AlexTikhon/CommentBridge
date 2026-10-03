@@ -5,13 +5,32 @@ import {
   type DeliveryWorkerConfig,
 } from './delivery-worker.config';
 import {
-  DeliveryWorkerMetrics,
-  type DeliveryWorkerMetricsSnapshot,
-} from './delivery-worker.metrics';
+  activeSince,
+  classifyWorker,
+  retainedSince,
+  type DeliveryWorkerStatus,
+} from './delivery-worker.state';
+import {
+  DELIVERY_WORKER_STATE_REPOSITORY,
+  type DeliveryDrainRecord,
+  type DeliveryWorkerStateRepository,
+} from './ports/delivery-worker-state.repository';
 import {
   REPLY_DELIVERY_REPOSITORY,
   type ReplyDeliveryRepository,
 } from './ports/reply-delivery.repository';
+
+/** Bounds the response when many short-lived workers were started recently. */
+const MAX_REPORTED_WORKERS = 50;
+
+export interface DeliveryWorkerInstanceStats {
+  instanceId: string;
+  status: DeliveryWorkerStatus;
+  startedAt: Date;
+  lastHeartbeatAt: Date;
+  /** The most recent drain that did work; null if this instance has done none. */
+  lastDrain: DeliveryDrainRecord | null;
+}
 
 export interface DeliveryStats {
   generatedAt: Date;
@@ -21,24 +40,39 @@ export interface DeliveryStats {
     oldestDueReconciliationAgeMs: number | null;
     expiredLeases: number;
   };
-  worker: {
-    enabled: boolean;
-    metrics: DeliveryWorkerMetricsSnapshot;
+  workers: {
+    staleAfterMs: number;
+    active: number;
+    stale: number;
+    instances: DeliveryWorkerInstanceStats[];
   };
 }
 
+/**
+ * Everything here is read from PostgreSQL. Nothing depends on objects living in
+ * this process, because the workers that produce this state run in other ones.
+ */
 @Injectable()
 export class DeliveryStatsService {
   constructor(
     @Inject(REPLY_DELIVERY_REPOSITORY)
     private readonly repository: ReplyDeliveryRepository,
-    private readonly metrics: DeliveryWorkerMetrics,
+    @Inject(DELIVERY_WORKER_STATE_REPOSITORY)
+    private readonly workerState: DeliveryWorkerStateRepository,
     @Inject(DELIVERY_WORKER_CONFIG)
     private readonly config: DeliveryWorkerConfig,
   ) {}
 
   async getStats(now = new Date()): Promise<DeliveryStats> {
-    const snapshot = await this.repository.getQueueSnapshot(now);
+    const { staleAfterMs } = this.config;
+    const [snapshot, workers] = await Promise.all([
+      this.repository.getQueueSnapshot(now),
+      this.workerState.getSnapshot({
+        retainedSince: retainedSince(now, staleAfterMs),
+        activeSince: activeSince(now, staleAfterMs),
+        limit: MAX_REPORTED_WORKERS,
+      }),
+    ]);
     const countsByStatus = Object.fromEntries(
       Object.values(ReplyDeliveryStatus).map((status) => [
         status,
@@ -57,7 +91,18 @@ export class DeliveryStatsService {
         oldestDueReconciliationAgeMs: ageMs(snapshot.oldestDueReconciliationAt),
         expiredLeases: snapshot.expiredLeases,
       },
-      worker: { enabled: this.config.enabled, metrics: this.metrics.snapshot() },
+      workers: {
+        staleAfterMs,
+        active: workers.active,
+        stale: workers.stale,
+        instances: workers.instances.map((instance) => ({
+          instanceId: instance.instanceId,
+          status: classifyWorker(instance.lastHeartbeatAt, now, staleAfterMs),
+          startedAt: instance.startedAt,
+          lastHeartbeatAt: instance.lastHeartbeatAt,
+          lastDrain: instance.lastDrain,
+        })),
+      },
     };
   }
 }

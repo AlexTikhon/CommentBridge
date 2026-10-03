@@ -129,12 +129,46 @@ worker's clock, not from hidden `new Date()` calls in the repository.
 
 Queue depth and lag are read from PostgreSQL in a single statement because the
 queue is the durable source of truth shared by every instance. Lag counts only work
-that is already due, so scheduled retries do not look like backlog. Worker counters
-stay in process memory: they describe one instance, reset on restart, and avoid a
-metrics dependency until a concrete scraper exists. The same snapshot and counter
-objects can be adapted to Prometheus or OpenTelemetry later without touching the
-worker. Each job reports a closed set of outcomes, including `LEASE_LOST`, so a
-stale write is visible instead of only logged.
+that is already due, so scheduled retries do not look like backlog. Per-process
+counters remain inside the worker for logging and tests, avoiding a metrics
+dependency until a concrete scraper exists, but they are not an operational view:
+see _Persistent worker runtime state_ below. Each job reports a closed set of
+outcomes, including `LEASE_LOST`, so a stale write is visible instead of only logged.
+
+## Separate worker runtime
+
+HTTP request serving and asynchronous delivery have different lifecycle and scaling
+characteristics: the API scales with traffic and must stay responsive, while the
+worker scales with provider latency, holds leases, and needs a graceful drain on
+shutdown. Running the worker inside the API also meant every API replica polled the
+queue by default. The worker is therefore its own process (a Nest application
+context with no HTTP listener) built from a module that loads only the database,
+adapters, delivery repositories, and the runtime that polls. The API module does not
+contain the worker at all, so no shared environment can start a duplicate loop;
+`DELIVERY_WORKER_ENABLED` was removed instead of kept as a second switch whose
+meaning depends on which process reads it, and it now only produces a startup
+warning. Both processes use the same image with different commands. Delivery
+semantics (leases, `SKIP LOCKED`, reconciliation) are unchanged; this is a runtime
+change only.
+
+## Persistent worker runtime state
+
+Once the worker is a separate process, in-memory metrics in the API cannot describe
+it, and a stats endpoint reading them would report misleading zeros. Shared state
+lives in PostgreSQL, which both processes already depend on, rather than a new
+service: one `DeliveryWorkerInstance` row per worker process lifetime, so several
+workers never contend on a row and horizontal scaling needs no redesign. Liveness is
+the heartbeat age alone, because a crashed process cannot write a `STOPPED` state;
+graceful shutdown just ages out. The heartbeat runs on its own timer (default 10s)
+so a slow provider call is not mistaken for a dead worker, and a drain is written
+only when it did work, so an idle worker costs one small write per interval rather
+than one per poll. The worker instance ID identifies a process and is unrelated to a
+delivery's lease token, which guards ownership of one delivery. Cleanup is a single
+prune of rows past a 24-hour window when a worker starts: the table grows only with
+restarts, so a retention job would be disproportionate until delivery history gets
+one. Timestamps use each process clock, so host clock skew must stay well below the
+stale threshold; using the database clock for staleness is the upgrade if that
+becomes a problem.
 
 ## Operator authentication
 

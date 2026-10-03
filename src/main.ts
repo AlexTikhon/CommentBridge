@@ -5,9 +5,12 @@ import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { removedWorkerSettingWarnings } from './comments/application/delivery-worker.config';
 import { ProblemDetailsFilter } from './common/errors/problem-details.filter';
 
 export async function bootstrap(): Promise<void> {
+  for (const warning of removedWorkerSettingWarnings())
+    Logger.warn(warning, 'Bootstrap');
   const app = await NestFactory.create(AppModule);
   app.use(helmet());
   app.enableShutdownHooks();

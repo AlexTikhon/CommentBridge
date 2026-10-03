@@ -1,7 +1,6 @@
 export const DELIVERY_WORKER_CONFIG = Symbol('DELIVERY_WORKER_CONFIG');
 
 export interface DeliveryWorkerConfig {
-  enabled: boolean;
   pollIntervalMs: number;
   leaseDurationMs: number;
   providerTimeoutMs: number;
@@ -10,6 +9,10 @@ export interface DeliveryWorkerConfig {
   maxRetryDelayMs: number;
   maxJobsPerTick: number;
   maxReconciliationsPerTick: number;
+  /** How often a worker process refreshes its liveness row. */
+  heartbeatIntervalMs: number;
+  /** A worker whose last heartbeat is older than this is reported STALE. */
+  staleAfterMs: number;
 }
 
 export class InvalidDeliveryWorkerConfigError extends Error {
@@ -47,17 +50,7 @@ export function loadDeliveryWorkerConfig(
     return value;
   };
 
-  const boolean = (name: string, fallback: boolean): boolean => {
-    const raw = env[name]?.trim().toLowerCase();
-    if (!raw) return fallback;
-    if (raw === 'true') return true;
-    if (raw === 'false') return false;
-    problems.push(`${name} must be "true" or "false"`);
-    return fallback;
-  };
-
   const config: DeliveryWorkerConfig = {
-    enabled: boolean('DELIVERY_WORKER_ENABLED', true),
     pollIntervalMs: integer('DELIVERY_POLL_INTERVAL_MS', 1_000),
     leaseDurationMs: integer('DELIVERY_LEASE_DURATION_MS', 30_000),
     providerTimeoutMs: integer('DELIVERY_PROVIDER_TIMEOUT_MS', 10_000),
@@ -70,6 +63,8 @@ export function loadDeliveryWorkerConfig(
       3,
       10_000,
     ),
+    heartbeatIntervalMs: integer('DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS', 10_000),
+    staleAfterMs: integer('DELIVERY_WORKER_STALE_AFTER_MS', 30_000),
   };
 
   // Cross-field rules are only meaningful once each field parsed.
@@ -89,8 +84,28 @@ export function loadDeliveryWorkerConfig(
         'DELIVERY_MAX_RECONCILIATIONS_PER_TICK must not exceed DELIVERY_MAX_JOBS_PER_TICK',
       );
     }
+    if (config.staleAfterMs <= config.heartbeatIntervalMs) {
+      problems.push(
+        'DELIVERY_WORKER_STALE_AFTER_MS must be greater than DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS',
+      );
+    }
   }
 
   if (problems.length > 0) throw new InvalidDeliveryWorkerConfigError(problems);
   return config;
+}
+
+/**
+ * DELIVERY_WORKER_ENABLED used to switch an in-process worker on or off. Only the
+ * worker process starts a worker now, so the variable has no effect; say so rather
+ * than let a deployment that relied on the old default lose delivery silently.
+ */
+export function removedWorkerSettingWarnings(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  return env.DELIVERY_WORKER_ENABLED === undefined
+    ? []
+    : [
+        'DELIVERY_WORKER_ENABLED is no longer used: the API never runs the delivery worker. Run it as its own process ("pnpm start:worker").',
+      ];
 }

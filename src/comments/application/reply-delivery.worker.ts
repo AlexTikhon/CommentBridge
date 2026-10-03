@@ -1,10 +1,4 @@
-import {
-  Inject,
-  Injectable,
-  Logger,
-  type OnApplicationBootstrap,
-  type OnModuleDestroy,
-} from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import type {
   LookupPlatformReplyInput,
@@ -21,7 +15,10 @@ import {
   DELIVERY_WORKER_CONFIG,
   type DeliveryWorkerConfig,
 } from './delivery-worker.config';
-import { DeliveryWorkerMetrics } from './delivery-worker.metrics';
+import {
+  DeliveryWorkerMetrics,
+  type DeliveryJobCounts,
+} from './delivery-worker.metrics';
 import {
   REPLY_DELIVERY_REPOSITORY,
   type ReplyDeliveryRepository,
@@ -32,16 +29,34 @@ class ProviderCallTimedOutError extends Error {}
 type Clock = () => Date;
 const systemClock: Clock = () => new Date();
 
+const emptyOutcomes = (): DeliveryJobCounts => ({
+  SUCCEEDED: 0,
+  RETRY: 0,
+  FAILED: 0,
+  UNKNOWN: 0,
+  LEASE_LOST: 0,
+});
+
 export interface DrainResult {
   reconciled: number;
   delivered: number;
+  /** Expired leases moved to UNKNOWN by this drain's maintenance step. */
+  expiredLeases: number;
+  startedAt: Date;
+  finishedAt: Date;
+  durationMs: number;
+  /** Outcomes of every job in this drain, deliveries and reconciliations together. */
+  outcomes: DeliveryJobCounts;
 }
 
+/**
+ * Delivery processing without any scheduling: it runs when something calls
+ * `drain`. The standalone worker runtime owns the timers, heartbeat, and shutdown
+ * sequencing, so this class has no lifecycle hooks and never starts itself.
+ */
 @Injectable()
-export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
+export class ReplyDeliveryWorker {
   private readonly logger = new Logger(ReplyDeliveryWorker.name);
-  private timer: NodeJS.Timeout | undefined;
-  private activeDrain: Promise<void> | undefined;
   private stopping = false;
 
   constructor(
@@ -53,24 +68,13 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
     private readonly metrics: DeliveryWorkerMetrics,
   ) {}
 
-  onApplicationBootstrap(): void {
-    if (!this.config.enabled) return;
-    this.timer = setInterval(() => this.scheduleDrain(), this.config.pollIntervalMs);
-    this.timer.unref();
-    this.scheduleDrain();
-  }
-
   /**
-   * Stops scheduling, starts no further jobs, and waits for the job already in
-   * flight. This runs before the database connection is closed. A hard kill skips
-   * it entirely, which is safe: unfinished leases expire into UNKNOWN and are
-   * reconciled by provider lookup.
+   * Starts no further jobs: an in-flight drain finishes the job it is on and then
+   * returns. Idempotent. A hard kill never gets here, which is safe: unfinished
+   * leases expire into UNKNOWN and are reconciled by provider lookup.
    */
-  async onModuleDestroy(): Promise<void> {
+  stop(): void {
     this.stopping = true;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-    await this.activeDrain;
   }
 
   /**
@@ -83,47 +87,66 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
    */
   async drain(clock: Clock = systemClock): Promise<DrainResult> {
     const { maxJobsPerTick, maxReconciliationsPerTick } = this.config;
-    const result: DrainResult = { reconciled: 0, delivered: 0 };
+    const startedAt = clock();
+    const result: DrainResult = {
+      reconciled: 0,
+      delivered: 0,
+      expiredLeases: 0,
+      startedAt,
+      finishedAt: startedAt,
+      durationMs: 0,
+      outcomes: emptyOutcomes(),
+    };
+    if (this.stopping) return result;
     const hasBudget = () =>
       !this.stopping && result.reconciled + result.delivered < maxJobsPerTick;
-    if (this.stopping) return result;
 
-    const startedAt = clock();
-    const expiredLeases = await this.reconcileExpiredLeases(startedAt);
+    result.expiredLeases = await this.reconcileExpiredLeases(startedAt);
 
     let reconciliationQueueDry = false;
     while (hasBudget() && result.reconciled < maxReconciliationsPerTick) {
-      if (!(await this.processNextReconciliation(clock))) {
+      const outcome = await this.runReconciliation(clock);
+      if (outcome === null) {
         reconciliationQueueDry = true;
         break;
       }
+      result.outcomes[outcome] += 1;
       result.reconciled += 1;
     }
 
     let deliveryQueueDry = false;
     while (hasBudget()) {
-      if (!(await this.processNextDelivery(clock))) {
+      const outcome = await this.runDelivery(clock);
+      if (outcome === null) {
         deliveryQueueDry = true;
         break;
       }
+      result.outcomes[outcome] += 1;
       result.delivered += 1;
     }
 
     while (deliveryQueueDry && !reconciliationQueueDry && hasBudget()) {
-      if (!(await this.processNextReconciliation(clock))) break;
+      const outcome = await this.runReconciliation(clock);
+      if (outcome === null) break;
+      result.outcomes[outcome] += 1;
       result.reconciled += 1;
     }
 
-    const finishedAt = clock();
-    const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
-    this.metrics.recordDrain({ finishedAt, durationMs, expiredLeases });
-    if (expiredLeases + result.reconciled + result.delivered > 0) {
+    result.finishedAt = clock();
+    result.durationMs = Math.max(0, result.finishedAt.getTime() - startedAt.getTime());
+    this.metrics.recordDrain({
+      finishedAt: result.finishedAt,
+      durationMs: result.durationMs,
+      expiredLeases: result.expiredLeases,
+    });
+    if (result.expiredLeases + result.reconciled + result.delivered > 0) {
       this.logger.log(
         JSON.stringify({
           event: 'delivery.drain',
-          durationMs,
-          expiredLeases,
-          ...result,
+          durationMs: result.durationMs,
+          expiredLeases: result.expiredLeases,
+          reconciled: result.reconciled,
+          delivered: result.delivered,
         }),
       );
     }
@@ -154,48 +177,35 @@ export class ReplyDeliveryWorker implements OnApplicationBootstrap, OnModuleDest
 
   /** Claims one due UNKNOWN delivery and resolves it through provider lookup. */
   async processNextReconciliation(clock: Clock = systemClock): Promise<boolean> {
+    return (await this.runReconciliation(clock)) !== null;
+  }
+
+  /** Claims one due PENDING/RETRY delivery and sends it to the provider. */
+  async processNextDelivery(clock: Clock = systemClock): Promise<boolean> {
+    return (await this.runDelivery(clock)) !== null;
+  }
+
+  private async runReconciliation(clock: Clock): Promise<DeliveryJobOutcome | null> {
     const claimedAt = clock();
     const item = await this.repository.claimUnknown(
       claimedAt,
       this.leaseUntil(claimedAt),
     );
-    if (!item) return false;
-    this.metrics.recordJob(
-      'RECONCILIATION',
-      await this.withOwnership(item, () => this.reconcileUnknown(item, clock)),
+    if (!item) return null;
+    const outcome = await this.withOwnership(item, () =>
+      this.reconcileUnknown(item, clock),
     );
-    return true;
+    this.metrics.recordJob('RECONCILIATION', outcome);
+    return outcome;
   }
 
-  /** Claims one due PENDING/RETRY delivery and sends it to the provider. */
-  async processNextDelivery(clock: Clock = systemClock): Promise<boolean> {
+  private async runDelivery(clock: Clock): Promise<DeliveryJobOutcome | null> {
     const claimedAt = clock();
     const item = await this.repository.claimNext(claimedAt, this.leaseUntil(claimedAt));
-    if (!item) return false;
-    this.metrics.recordJob(
-      'DELIVERY',
-      await this.withOwnership(item, () => this.deliver(item, clock)),
-    );
-    return true;
-  }
-
-  private scheduleDrain(): void {
-    if (this.stopping || this.activeDrain) return;
-    this.activeDrain = this.runScheduledDrain().finally(() => {
-      this.activeDrain = undefined;
-    });
-  }
-
-  private async runScheduledDrain(): Promise<void> {
-    try {
-      await this.drain();
-    } catch (error: unknown) {
-      this.metrics.recordDrainFailure();
-      this.logger.error(
-        'Reply delivery worker tick failed.',
-        error instanceof Error ? error.stack : undefined,
-      );
-    }
+    if (!item) return null;
+    const outcome = await this.withOwnership(item, () => this.deliver(item, clock));
+    this.metrics.recordJob('DELIVERY', outcome);
+    return outcome;
   }
 
   /**

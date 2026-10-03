@@ -26,6 +26,7 @@ export function assertSafeTestDatabaseReset(
 
 export async function resetAndSeed(prisma: PrismaClient): Promise<void> {
   assertSafeTestDatabaseReset();
+  await prisma.deliveryWorkerInstance.deleteMany();
   await prisma.comment.deleteMany();
   await prisma.postPublication.deleteMany();
   await prisma.socialAccount.deleteMany();

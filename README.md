@@ -16,7 +16,8 @@ deterministic Instagram and LinkedIn mocks.
 - Parent-scoped idempotent replies with a database uniqueness constraint.
 - Durable `PENDING` delivery jobs, leased worker claims, attempt history, bounded
   retries, and `UNKNOWN` quarantine for ambiguous outcomes.
-- Operational delivery status and database-conditional retry for failed replies.
+- A standalone delivery worker process with PostgreSQL-backed heartbeat state, and
+  operational delivery status, queue statistics, and database-conditional retry.
 - Explicit dead-letter state and transactional audit history for manual actions.
 - Platform adapter registry with deterministic Instagram and LinkedIn mocks and
   platform-specific message limits.
@@ -36,13 +37,77 @@ flowchart LR
   Client --> Controller[REST controller]
   Controller --> Service[CommentsService]
   Service --> Repository[CommentRepository]
-  Repository --> Queue[(ReplyDelivery jobs)]
-  Worker[ReplyDeliveryWorker] --> Queue
-  Worker --> Registry[Adapter registry]
   Repository --> PostgreSQL[(PostgreSQL)]
+  Worker[Delivery worker process] --> PostgreSQL
+  Worker --> Registry[Adapter registry]
   Registry --> Instagram[Instagram mock]
   Registry --> LinkedIn[LinkedIn mock]
 ```
+
+## Runtime architecture
+
+CommentBridge is two independently runnable processes that share only PostgreSQL:
+
+```text
+API process (node dist/main.js)          Delivery worker process (node dist/worker.js)
+  Nest HTTP server                         Nest application context, no HTTP listener
+  controllers, operator auth, Swagger      ReplyDeliveryWorker (claim, send, reconcile)
+  CommentsService, repositories            DeliveryWorkerRuntime (register, poll, heartbeat)
+  queues replies, reports queue + workers  repositories, platform adapters
+            \                                       /
+             +------------ PostgreSQL ------------+
+               delivery queue, attempts, worker heartbeats
+```
+
+Request serving and asynchronous delivery have different lifecycles and scaling: the
+API scales with traffic and must stay responsive, while the worker scales with
+provider latency and is bounded by provider timeouts. The API only ever queues work;
+**it never runs the worker**, so an API deployment can never start a duplicate
+delivery loop by accident. `DELIVERY_WORKER_ENABLED` no longer exists (it is ignored
+with a startup warning); whether a worker runs is decided only by whether you start
+the worker process.
+
+`WorkerModule` loads just the database, platform adapters, delivery repositories,
+and the worker runtime: no controllers, Swagger, request middleware, or operator
+authentication. `AppModule` (the API) and `WorkerModule` share the Prisma
+configuration, repositories, and delivery settings through `DeliveryPersistenceModule`
+but each process builds its own Prisma client and connection pool.
+
+Run both locally (two terminals, PostgreSQL up and migrated):
+
+```bash
+pnpm dev                  # API with reload
+pnpm start:worker:dev     # worker with reload
+```
+
+Production uses the compiled output and the same artifact for both:
+
+```bash
+pnpm build
+pnpm start                # API:    node dist/main.js
+pnpm start:worker         # worker: node dist/worker.js
+```
+
+### Production deployment
+
+The `Dockerfile` produces one runtime image used with two commands. The Compose
+file defines both, opt-in behind the `app` profile so that
+`docker compose up -d postgres` still starts only the database. Name the services, since
+`--profile app` alone also starts `postgres-test`:
+
+```bash
+docker compose --profile app up -d --build api delivery-worker   # runs migrate first
+docker compose --profile app up -d --scale delivery-worker=3 api delivery-worker
+```
+
+`api` publishes a port and has an HTTP healthcheck. `delivery-worker` publishes no
+port and has no container healthcheck: its liveness is the heartbeat reported by
+`GET /api/v1/deliveries/stats`, and the restart policy covers crashes. Its
+`stop_grace_period` (30s) exceeds the provider timeout so the job in flight can
+finish on `SIGTERM`. Both services receive `DATABASE_URL` and the `DELIVERY_*`
+settings; only the API needs `OPERATOR_API_KEYS` and `PORT`. A `migrate` job applies
+migrations first from a build target that includes the Prisma CLI; the runtime image
+omits dev dependencies.
 
 ## Quick start
 
@@ -54,9 +119,11 @@ pnpm install
 docker compose up -d postgres
 pnpm db:migrate
 pnpm db:seed
-pnpm dev
+pnpm dev                  # API
+pnpm start:worker:dev     # delivery worker, in a second terminal
 ```
 
+The API only queues replies; they are delivered while the worker process runs.
 PowerShell users can replace the first command with
 `Copy-Item .env.example .env`. The API runs at `http://localhost:3000`, Swagger UI
 at `http://localhost:3000/api/docs`, and OpenAPI JSON at
@@ -253,28 +320,39 @@ replies. A slot one queue does not use goes to the other. Every job takes a fres
 clock reading, so a lease never starts in the past. (Keep the reconciliation quota
 below the job budget to guarantee normal deliveries a slot every tick.)
 
-On shutdown the worker stops its timer, starts no further jobs, and waits for the
-job already in flight (bounded by the provider timeout) before the database
-connection closes. A hard kill is still safe: the unfinished lease expires into
-`UNKNOWN` and is resolved by provider lookup.
+The worker process starts with `NestFactory.createApplicationContext` (no HTTP
+listener), registers itself, then polls and heartbeats until it receives a signal.
+A fatal startup error (invalid configuration, database unreachable) exits non-zero.
 
-| Variable                                | Default | Meaning                                      |
-| --------------------------------------- | ------- | -------------------------------------------- |
-| `DELIVERY_WORKER_ENABLED`               | `true`  | `false` on API-only instances                |
-| `DELIVERY_POLL_INTERVAL_MS`             | `1000`  | Delay between drains                         |
-| `DELIVERY_LEASE_DURATION_MS`            | `30000` | Must exceed the provider timeout             |
-| `DELIVERY_PROVIDER_TIMEOUT_MS`          | `10000` | Per provider call or lookup                  |
-| `DELIVERY_MAX_ATTEMPTS`                 | `5`     | Attempts before `FAILED`                     |
-| `DELIVERY_BASE_RETRY_DELAY_MS`          | `1000`  | First backoff; doubles per attempt           |
-| `DELIVERY_MAX_RETRY_DELAY_MS`           | `60000` | Backoff cap; at least the base delay         |
-| `DELIVERY_MAX_JOBS_PER_TICK`            | `10`    | Jobs per drain                               |
-| `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` | `3`     | Reconciliation slots; at most the job budget |
+On `SIGTERM` or `SIGINT` the runtime stops the poll and heartbeat timers, starts no
+further jobs, and waits for the job already in flight (bounded by the provider
+timeout) before the database connection closes and the process exits. A second signal
+exits immediately. A hard kill is still safe: the unfinished lease expires into
+`UNKNOWN` and is resolved by provider lookup. Shutdown writes nothing to shared
+state; the worker simply goes `STALE` when its heartbeat ages out.
 
-Invalid values stop startup with an error naming the variable (never its value).
+| Variable                                | Default | Meaning                                                                 |
+| --------------------------------------- | ------- | ----------------------------------------------------------------------- |
+| `DELIVERY_POLL_INTERVAL_MS`             | `1000`  | Delay between drains                                                    |
+| `DELIVERY_LEASE_DURATION_MS`            | `30000` | Must exceed the provider timeout                                        |
+| `DELIVERY_PROVIDER_TIMEOUT_MS`          | `10000` | Per provider call or lookup                                             |
+| `DELIVERY_MAX_ATTEMPTS`                 | `5`     | Attempts before `FAILED`                                                |
+| `DELIVERY_BASE_RETRY_DELAY_MS`          | `1000`  | First backoff; doubles per attempt                                      |
+| `DELIVERY_MAX_RETRY_DELAY_MS`           | `60000` | Backoff cap; at least the base delay                                    |
+| `DELIVERY_MAX_JOBS_PER_TICK`            | `10`    | Jobs per drain                                                          |
+| `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` | `3`     | Reconciliation slots; at most the job budget                            |
+| `DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` | How often a worker refreshes its heartbeat                              |
+| `DELIVERY_WORKER_STALE_AFTER_MS`        | `30000` | Heartbeat age after which a worker is `STALE`; must exceed the interval |
+
+Invalid values stop startup of the API and the worker with an error naming the
+variable (never its value). The API reads `DELIVERY_WORKER_STALE_AFTER_MS` to classify
+workers, so give both processes the same value.
 
 ## Delivery observability
 
-`GET /api/v1/deliveries/stats` is a read-only operations view with two parts:
+`GET /api/v1/deliveries/stats` is a read-only operations view with two parts, both
+read from PostgreSQL. It requires an operator API key like the other operations
+endpoints.
 
 - `queue`: durable, cross-instance state from one SQL statement: row counts for
   every delivery status, how long the oldest _due_ `PENDING`/`RETRY` delivery
@@ -282,17 +360,78 @@ Invalid values stop startup with an error naming the variable (never its value).
   (`oldestDueReconciliationAgeMs`) have waited, and `expiredLeases`, the
   `PROCESSING` rows past their lease that maintenance has not yet reconciled.
   Rising lag or a persistent `expiredLeases` means workers are down or behind.
-- `worker`: counters for the instance that served the request (reset on restart,
-  zero when `DELIVERY_WORKER_ENABLED=false`): drains and drain failures, expired
-  leases reconciled, last drain time and duration, and job outcomes
-  (`SUCCEEDED`, `RETRY`, `FAILED`, `UNKNOWN`, `LEASE_LOST`) separately for
-  deliveries and reconciliations. A growing `LEASE_LOST` count means leases are
-  shorter than real provider latency.
+- `workers`: the state of every worker process, shared through the
+  `DeliveryWorkerInstance` table. Worker counters used to live in the memory of the
+  process serving the request; once the worker became its own process the API could
+  only have reported zeros, so that model was replaced rather than kept.
+
+```json
+{
+  "queue": { "countsByStatus": { "PENDING": 0 }, "expiredLeases": 0, "...": "..." },
+  "workers": {
+    "staleAfterMs": 30000,
+    "active": 1,
+    "stale": 0,
+    "instances": [
+      {
+        "instanceId": "worker-host-41-9f3a1c2e",
+        "status": "ACTIVE",
+        "startedAt": "2026-10-03T12:00:00.000Z",
+        "lastHeartbeatAt": "2026-10-03T12:05:08.000Z",
+        "lastDrain": {
+          "completedAt": "2026-10-03T12:04:59.000Z",
+          "durationMs": 18,
+          "processed": 4,
+          "succeeded": 3,
+          "retry": 1,
+          "failed": 0,
+          "unknown": 0,
+          "leaseLost": 0,
+          "expiredLeases": 0
+        }
+      }
+    ]
+  }
+}
+```
+
+**Worker runtime state.** Each worker process generates an `instanceId` once at
+startup (host, pid, random suffix) and keeps one row for its lifetime, so any number
+of workers coexist without sharing a row. The id is only for operators; it is
+unrelated to a delivery's `leaseToken`, which protects ownership of one delivery and
+is never exposed. A worker registers on startup and then refreshes
+`lastHeartbeatAt` every `DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS` from a timer that is
+independent of the poll loop, so a slow provider call does not look like a dead
+worker. A drain is persisted only when it did work (a delivery, a reconciliation, or
+expired-lease maintenance); idle polls cost no writes, so `lastDrain` is the most
+recent drain that did something, and an old `lastDrain` beside a fresh heartbeat
+means an idle queue.
+
+**ACTIVE and STALE.** A worker is `ACTIVE` while its last heartbeat is at most
+`DELIVERY_WORKER_STALE_AFTER_MS` old and `STALE` afterwards. Heartbeat age is the only
+source of truth: a crashed process cannot record that it stopped, so there is no
+`STOPPED` state and a graceful shutdown just ages out. Timestamps come from each
+process clock, so keep host clocks roughly synchronized (skew must stay well below
+the stale threshold). Zero `active` workers with growing `queue` lag means nothing
+is delivering.
+
+Rows whose heartbeat is older than the retention window (24 hours, or twice the
+stale threshold if larger) are not reported and are pruned when any worker starts.
+That is the only cleanup; it keeps the table at roughly one row per recent restart
+until the general retention task covers delivery history. The `instances` list is
+capped at the 50 most recent heartbeats while `active` and `stale` count every row.
+
+Inside the worker process, `DeliveryWorkerMetrics` still keeps per-process counters
+(drains, drain failures, job outcomes by kind). They are not exposed through the API
+because they describe one process only; the worker logs its drain and failure totals
+at shutdown.
 
 A drain that did any work also writes one JSON log line
 (`{"event":"delivery.drain","durationMs":…,"expiredLeases":…,"reconciled":…,"delivered":…}`);
-idle drains are silent. Messages and provider payloads are never logged. It requires
-an operator API key like the other operations endpoints.
+idle drains are silent. The worker logs `delivery-worker.starting`,
+`delivery-worker.started`, `delivery-worker.shutdown-started`, and
+`delivery-worker.shutdown-complete` with its `workerInstanceId`; heartbeats are not
+logged. Messages, provider payloads, and credentials are never logged.
 
 ## Pagination
 
@@ -355,9 +494,8 @@ git diff --check
   in PostgreSQL as the normalized read model.
 - The API returns a bounded flat list rather than recursively expanding threads.
 - Mock adapters are deterministic and make no external requests.
-- Outbound jobs are polled by an in-process worker. Production deployments can run
-  the same worker separately; set `DELIVERY_WORKER_ENABLED=false` on API-only
-  instances. Operational limits are environment variables (see above).
+- Outbound jobs are polled by a separate worker process (`pnpm start:worker`), never
+  by the API. Operational limits are environment variables (see above).
 - Parent/publication consistency and delivery-field invariants are enforced by
   PostgreSQL as well as the application workflow.
 
@@ -367,8 +505,9 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for the engineering decisions.
 
 The durable delivery state machine, provider lookup reconciliation, delivery status,
 conditional manual retry, dead-letter controls, and manual-action audit trail are
-implemented. Operator API-key authentication and in-process worker observability are
-implemented. Production evolution should add a separate worker deployment, a
+implemented. Operator API-key authentication, the standalone worker process, and
+PostgreSQL-backed worker heartbeats are implemented. Production evolution should
+add a
 retention policy for finished deliveries and attempt history, and an external
 identity provider in place of static keys. Inbound sync could add authenticated
 webhooks or polling. Tenant authorization, encrypted provider credentials,

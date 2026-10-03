@@ -161,3 +161,24 @@ model ReplyDeliveryAttempt {
   @@unique([deliveryId, attemptNumber])
   @@index([status, startedAt])
 }
+
+// One row per delivery-worker process lifetime. Liveness is the heartbeat age;
+// the lastDrain* columns describe the most recent drain that did work.
+model DeliveryWorkerInstance {
+  instanceId              String    @id @db.VarChar(200)
+  startedAt               DateTime  @db.Timestamptz(3)
+  lastHeartbeatAt         DateTime  @db.Timestamptz(3)
+  lastDrainCompletedAt    DateTime? @db.Timestamptz(3)
+  lastDrainDurationMs     Int       @default(0)
+  lastDrainProcessedCount Int       @default(0)
+  lastDrainSucceededCount Int       @default(0)
+  lastDrainRetryCount     Int       @default(0)
+  lastDrainFailedCount    Int       @default(0)
+  lastDrainUnknownCount   Int       @default(0)
+  lastDrainLeaseLostCount Int       @default(0)
+  lastDrainExpiredLeases  Int       @default(0)
+  createdAt               DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([lastHeartbeatAt])
+}
