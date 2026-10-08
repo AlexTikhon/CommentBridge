@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../platforms/infrastructure/mock-instagram.adapter';
 import { DeliveryLeaseLostError, ProviderAdapterError } from '../domain/comment.errors';
@@ -353,9 +354,10 @@ describe('ReplyDeliveryWorker', () => {
     it('keeps claiming work when the expired-lease sweep cannot get its locks', async () => {
       const warn = jest.spyOn(Logger.prototype, 'warn');
       repository.reconcileExpiredLeases.mockRejectedValue(
-        Object.assign(new Error('canceling statement due to lock timeout'), {
-          name: 'PrismaClientKnownRequestError',
-        }),
+        new Prisma.PrismaClientKnownRequestError(
+          'canceling statement due to lock timeout postgresql://u:secret@db/app',
+          { code: 'P2010', clientVersion: '6.19.3', meta: { code: '55P03' } },
+        ),
       );
       repository.claimNext.mockResolvedValueOnce(workItem()).mockResolvedValue(null);
 
@@ -363,13 +365,18 @@ describe('ReplyDeliveryWorker', () => {
 
       expect(result).toMatchObject({ expiredLeases: 0, delivered: 1 });
       expect(repository.markSucceeded).toHaveBeenCalledTimes(1);
-      // Logged on every failed sweep, by error name only (messages can carry details).
+      // Logged on every failed sweep, by type and validated codes only (messages can
+      // carry connection details).
       expect(warn).toHaveBeenCalledWith(
         JSON.stringify({
           event: 'delivery.lease-sweep-failed',
-          error: 'PrismaClientKnownRequestError',
+          errorCategory: 'database',
+          errorClass: 'PrismaClientKnownRequestError',
+          errorCode: 'P2010',
+          sqlState: '55P03',
         }),
       );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('secret');
     });
 
     it('still surfaces a failing claim, which is not best effort', async () => {

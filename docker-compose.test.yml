@@ -4,6 +4,10 @@
 #   pnpm db:test:up      (docker compose -f docker-compose.test.yml --env-file .env.test.example ...)
 #
 # The password comes from .env.test.example, whose values are throwaway test values.
+#
+# postgres-roles-test is a second, separate cluster. Roles are cluster-wide in PostgreSQL,
+# so the role-contract suite, which creates, damages and drops commentbridge_api and
+# commentbridge_worker, must never share a cluster with the database the other suites use.
 
 name: commentbridge-test
 
@@ -20,6 +24,24 @@ services:
       - /var/lib/postgresql/data
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U postgres -d commentbridge_test']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+    restart: unless-stopped
+
+  postgres-roles-test:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_TEST_ADMIN_PASSWORD:?Run this through pnpm db:test:up so .env.test.example is loaded}
+      POSTGRES_DB: commentbridge_roles_test
+    ports:
+      - '127.0.0.1:${POSTGRES_ROLES_TEST_PORT:-55436}:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d commentbridge_roles_test']
       interval: 2s
       timeout: 3s
       retries: 15

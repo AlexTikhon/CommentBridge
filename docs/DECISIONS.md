@@ -334,8 +334,8 @@ Choices inside operational health:
   table, and they add no index.
 - Retention outcomes are stored per worker on its own row, so nothing is shared or
   contended, and combined at read time (newest success, newest failure). The only schema
-  change is nullable/defaulted columns on `DeliveryWorkerInstance`. Error codes are error
-  class names only.
+  change is nullable/defaulted columns on `DeliveryWorkerInstance`. Error codes are labels from a
+  fixed list of error classes (matched by type, never by `error.name`).
 - Lease-loss rate is not a signal: the data exists only as per-process counters and each
   worker's last drain, and a real rate needs an event store. It stays a logged metric.
 - Evaluation takes an explicit `now` and is a pure function over plain facts, so every
@@ -377,6 +377,43 @@ class-validator details are retained where useful. Unexpected exceptions become 
 safe 500. Responses never include stack traces or raw framework, database, or
 provider details, and every problem includes a correlation ID.
 
+## Errors are described, never printed
+
+`Error.stack`, `Error.message`, `Error.name` and `String(error)` are all attacker- or
+environment-controlled text: a driver puts the connection URL in a message, a provider SDK puts a
+token in a payload, `new URL(secret)` keeps the secret in an `input` property that
+`util.inspect` prints, and `name` can be reassigned to anything that looks like an identifier. The
+earlier code logged `error.stack` from the worker's poll loop, `error.stack`/`String(error)` for
+worker startup and shutdown failures, and `error.message` from the provisioning command, and the
+framework's own exception handler prints the whole startup exception object by itself.
+
+- **One small module** (`src/common/logging/safe-error.ts`). A log line is a fixed `event`
+  identifier, operation context (`workerInstanceId` where the process has one) and, for an error,
+  `errorCategory`, `errorClass`, and optionally `errorCode`/`sqlState`. The class label is chosen by
+  `instanceof` against a fixed list (Prisma's error types, the built-in error types, otherwise
+  `Error`), never from `name`. A code is kept only if it has the exact shape of one (`P2034`, a
+  five-character SQLSTATE, an allowlisted operating-system code), so a hostile `code` is dropped
+  rather than sanitised. Cause chains, stacks, messages and extra properties are never read, and
+  the function cannot throw even for an object that traps every property access.
+- **Actionable configuration problems stay actionable.** `ConfigurationError` is the one error whose
+  message is logged (`detail`, printable and capped at 500 characters). The three configuration
+  error classes and the provisioning command's role-contract and password errors extend it, and its
+  contract is that a message names a setting or an object and never a value. Anything else that is
+  thrown during startup, including a third-party error, is described by type only. A test passes a
+  malformed URL and an invalid setting through the real process and checks the output.
+- **The framework logger too.** `NestFactory.createApplicationContext` is given `SafeConsoleLogger`,
+  which replaces any error object reaching `error`, `warn` or `fatal` with the same safe line and
+  keeps only context labels from the other arguments (which drops stacks). Without it the secret
+  was printed by the framework before `worker.ts` could handle the error; the process-level test
+  was written against that behavior. It is installed for the worker only, because that is the
+  process the finding named.
+- **Persisted codes follow the same rule.** The retention error code stored on the worker row and
+  shown by operational health used to be `error.name` when it matched a character class, which a
+  secret-shaped name satisfies. It is now the class label, so an error with a custom name is stored
+  as `Error`.
+- Exit codes and recovery are unchanged: startup failure exits 1, shutdown failure sets exit code 1,
+  a failing poll, heartbeat, retention pass or state write is logged and the timer carries on.
+
 ## Database roles and the deployment boundary
 
 Three things were wrong at the database boundary: the development port was published on every
@@ -409,7 +446,8 @@ the schema or read the other process's secrets.
 - **Passwords.** A migration cannot carry a secret, so it creates the roles `NOLOGIN` and a separate
   idempotent command (`pnpm db:provision-roles`) sets login and password from the environment, which
   doubles as rotation. It refuses short, placeholder or identical passwords. A DBA who pre-creates
-  the roles is supported: they are reused and their attributes normalised.
+  the roles is supported: they are reused, their attributes normalised, and the command first
+  verifies them against the privilege contract (see "Existing roles are verified" below).
 - **Immutable audit rows.** Retention locks audit rows with `FOR UPDATE`, which PostgreSQL authorises
   as `UPDATE`, so the worker needs that privilege on `ReplyDeliveryManualAction`. A trigger rejects
   every update of those rows so the privilege cannot be used to alter the audit trail.
@@ -426,6 +464,47 @@ Moving to roles surfaced test assumptions as well: several fixtures wrote throug
 that was under test. Fixtures and resets now use the owner and the code under test uses the role its
 process uses in production, so every integration and E2E suite doubles as a check of the privilege
 matrix.
+
+### Existing roles are verified before a login or password changes
+
+The migration reuses a role that already exists and normalises its administrative attributes,
+but it kept whatever memberships, ownership and grants the role had. Verified reproduction: grant
+`pg_read_all_data` to a pre-existing `commentbridge_api`, apply every migration (it succeeds), and
+the API role can still `SELECT` from `_prisma_migrations`, contrary to the privilege matrix.
+
+- **Where.** In `pnpm db:provision-roles`, which is the step that enables logins and sets
+  passwords, rather than in a new migration. A migration that raises on an incompatible role would
+  leave Prisma with a failed migration that needs `migrate resolve` after the DBA fixes the role,
+  and it would still run before the operator has supplied any passwords. Failing at provisioning
+  keeps the migration forward-only and repeatable. The cost, documented in the README: until
+  provisioning has run, a pre-existing role that already had a login keeps what it was given.
+- **What.** For both roles: no administrative attribute; **no membership at all** (NOINHERIT is not
+  a control, because a member can `SET ROLE`, and PostgreSQL 16 grants can allow that without
+  inheriting); no owned object (`pg_shdepend` owner entries for this database and the shared
+  objects); and no effective privilege outside the matrix. Effective privileges are read from
+  PostgreSQL's own `has_*_privilege` functions, so PUBLIC, role membership and single-column grants
+  are all counted, and the check covers every relation in every non-system schema, sequences,
+  schema `CREATE`, database `CREATE`/`TEMPORARY` and tablespace `CREATE`. Only privileges in
+  excess of the matrix are violations; a missing one breaks the application, not its security.
+- **Fail closed, change nothing.** Both roles are checked before either is touched, and the two
+  `ALTER ROLE` statements share the transaction with the check, so a rejected run, or a failure
+  halfway, leaves both logins and password hashes exactly as they were. (The previous loop
+  changed the first role before discovering that the second did not exist.) The error lists role
+  names, object names and privilege names, never a credential, and says what to run. It does not
+  revoke or reassign anything: a cluster-wide membership or an object's owner is a decision for
+  the cluster's owner, and doing it silently could break something else that depends on it.
+- **Tested on a cluster of its own.** Roles are cluster-wide, so the suite that builds and wrecks
+  them (clean install, compatible pre-existing role with rotation, `pg_read_all_data`, a
+  `NOINHERIT` membership, a `SET`-only grant, owned table/schema/function, direct, column and
+  PUBLIC grants, administrative attributes, a missing role, and "credentials unchanged" for both
+  orders) runs against a second disposable PostgreSQL. It refuses any URL that shares a host and
+  port with another configured database, and any cluster holding databases or roles it did not
+  create. The privilege matrix is written out twice, here in the provisioner and in
+  `database-roles.integration-spec.ts`; a clean install must satisfy both, so they cannot drift.
+
+Not covered: objects the role owns in a different database of the same cluster, and
+`GRANT SET ON PARAMETER` (PostgreSQL 15+). Neither is reachable through the data the application
+uses, and a connection to one database cannot enumerate the other.
 
 ## Database execution budgets
 

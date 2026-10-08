@@ -3,6 +3,12 @@ import 'dotenv/config';
 import { Logger, type INestApplicationContext } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { removedWorkerSettingWarnings } from './comments/application/delivery-worker.config';
+import { DELIVERY_WORKER_INSTANCE_ID } from './comments/application/delivery-worker.state';
+import {
+  SafeConsoleLogger,
+  errorEventLine,
+  safeIdentifier,
+} from './common/logging/safe-error';
 import { WorkerModule } from './worker.module';
 
 const SHUTDOWN_SIGNALS = ['SIGTERM', 'SIGINT'] as const;
@@ -17,11 +23,23 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
     Logger.warn(warning, 'WorkerBootstrap');
   }
   // abortOnError: false makes a startup failure reject instead of aborting the
-  // process, so it can be logged and turned into a plain non-zero exit.
+  // process, so it can be logged and turned into a plain non-zero exit. The framework
+  // still logs that failure itself, as an object (stack and properties included), so
+  // the application logger is the one that never prints an error object.
   const app = await NestFactory.createApplicationContext(WorkerModule, {
     abortOnError: false,
+    logger: new SafeConsoleLogger(),
   });
   return app;
+}
+
+/** The worker's instance ID for log correlation, when the application can provide it. */
+function instanceIdOf(app: INestApplicationContext): string | undefined {
+  try {
+    return safeIdentifier(app.get(DELIVERY_WORKER_INSTANCE_ID, { strict: false }));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -45,7 +63,14 @@ export function closeOnSignals(app: INestApplicationContext): void {
           process.exitCode = 0;
         },
         (error: unknown) => {
-          logger.error('Shutdown failed.', error instanceof Error ? error.stack : '');
+          const workerInstanceId = instanceIdOf(app);
+          logger.error(
+            errorEventLine(
+              'delivery-worker.shutdown-failed',
+              workerInstanceId ? { workerInstanceId } : {},
+              error,
+            ),
+          );
           process.exitCode = 1;
         },
       );
@@ -53,13 +78,12 @@ export function closeOnSignals(app: INestApplicationContext): void {
   }
 }
 
-async function main(): Promise<void> {
+export async function main(start = bootstrapWorker): Promise<void> {
   try {
-    closeOnSignals(await bootstrapWorker());
+    closeOnSignals(await start());
   } catch (error: unknown) {
     new Logger('WorkerBootstrap').error(
-      'Delivery worker failed to start.',
-      error instanceof Error ? error.stack : String(error),
+      errorEventLine('delivery-worker.start-failed', {}, error),
     );
     process.exit(1);
   }

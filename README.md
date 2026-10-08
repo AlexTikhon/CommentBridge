@@ -152,6 +152,34 @@ passwords. The Prisma CLI reads `MIGRATION_DATABASE_URL` (`directUrl`) and refus
 run without it, so a runtime URL cannot be used to migrate by accident. The runtime
 never reads it.
 
+**Pre-existing roles are verified, not trusted.** If a DBA created `commentbridge_api` or
+`commentbridge_worker` beforehand, the migration reuses the role and normalises its
+administrative attributes, but it cannot know what the role was given elsewhere in the
+cluster. So `pnpm db:provision-roles` checks **both** roles first, and refuses to enable a
+login or change either password unless each one:
+
+- has no `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `REPLICATION` or `BYPASSRLS` attribute;
+- is a member of **no** other role (for example `pg_read_all_data`). `NOINHERIT` is not
+  enough: a member can still `SET ROLE` into the role it belongs to;
+- owns nothing (tables, schemas, functions, ... in this database, or the database itself);
+- holds no effective privilege beyond the matrix above, whether granted directly, on a
+  single column, through `PUBLIC` or through a role it belongs to. That includes
+  `_prisma_migrations`, any table the matrix does not list, `CREATE` on any schema, the
+  database or a tablespace, and `TEMPORARY` on the database.
+
+An incompatible role is rejected with a list of what to fix and the sentence "Nothing was
+changed". The command never revokes a membership or reassigns ownership itself: those are
+cluster-wide decisions for whoever owns the cluster. Both roles are checked before either is
+touched, and the two password changes commit in one transaction, so a failure never leaves
+one role rotated and the other not. A fresh installation and a compatible pre-existing role
+(rotation included) are unaffected.
+
+Sequencing: run `pnpm db:deploy` (migrate, then provision) rather than the migration alone.
+The migration deliberately does not fail on an incompatible role, so until provisioning has
+run, a pre-existing role that already had a login and a password keeps working with
+whatever it was given. Verification only sees the database it is connected to and the
+cluster-wide objects; ownership in another database of the same cluster is out of its sight.
+
 Known residual risk: PostgreSQL lets any role change its own password and nothing can
 revoke that. A compromised runtime role could lock itself out; `pnpm db:provision-roles`
 repairs it. It cannot widen its privileges.
@@ -524,6 +552,20 @@ idle drains are silent. The worker logs `delivery-worker.starting`,
 `delivery-worker.shutdown-complete` with its `workerInstanceId`; heartbeats are not
 logged. Messages, provider payloads, and credentials are never logged.
 
+Failures are logged the same way, as one JSON line with a fixed `event`
+(`delivery-worker.tick-failed`, `.drain-record-failed`, `.heartbeat-failed`,
+`.retention-failed`, `.retention-record-failed`, `.start-failed`, `.shutdown-failed`),
+the `workerInstanceId` where the process has one, and only these error fields:
+`errorCategory` (`configuration`, `database`, `system`, `internal`, `unknown`),
+`errorClass` (from a fixed list, never `error.name`), and, when they have the exact shape
+of one, `errorCode` (a Prisma `P2034`, or an operating-system code such as
+`ECONNREFUSED`) and `sqlState` (such as `42501`). An error's message, stack, cause and
+properties are never logged, because drivers put connection URLs in them and `new URL()`
+keeps its input. The one exception is a configuration error, which names the setting
+that is wrong (never its value) in a `detail` field so the process says how to fix it.
+`pnpm db:provision-roles` follows the same rule: it prints a role-contract or password
+problem in full, and anything else as `provision-roles.failed` plus those fields.
+
 ## Health endpoints
 
 Three different questions get three different answers. Mixing them is how an outage
@@ -745,8 +787,8 @@ statements per table per run, and rows another transaction holds are skipped rat
 waited for, so concurrent passes simply find less to do. A pass logs
 `{"event":"delivery-retention.completed","deletedAttempts":…,"deletedManualActions":…,"batchCount":…,"durationMs":…,"attemptCutoff":…,"manualActionCutoff":…,"capped":…}`
 when it deleted something (`debug` level when it found nothing) and
-`delivery-retention.failed` with the error name on failure. Row contents are never
-logged. Each pass's outcome (time, duration, counts, and on failure the error class name)
+`delivery-retention.failed` with the safe error fields on failure. Row contents are never
+logged. Each pass's outcome (time, duration, counts, and on failure the error class label)
 is also stored on the worker's own `DeliveryWorkerInstance` row so that
 `GET /api/v1/deliveries/health` can report when retention last succeeded or failed and
 whether it is overdue (_Health endpoints_). It is the latest outcome per worker, not a
@@ -824,6 +866,14 @@ pnpm test:e2e
 If port 55433 is taken, create `.env.test.local` with a different `POSTGRES_TEST_PORT` and the
 three database URLs, and start the database with `POSTGRES_TEST_PORT=<port> pnpm db:test:up`.
 Run the database suites sequentially (`--runInBand` is already set); they share one database.
+
+`pnpm db:test:up` also starts a second, separate PostgreSQL cluster (`postgres-roles-test`,
+port `POSTGRES_ROLES_TEST_PORT`, default 55436, URL in `ROLE_CONTRACT_DATABASE_URL`). Roles are
+cluster-wide, and `test/integration/database-role-contract.integration-spec.ts` creates, damages
+and drops `commentbridge_api` and `commentbridge_worker`, so it must never run on the cluster
+above. It refuses to start unless that URL names a `_test` database on a different host and port
+from every other configured URL, and the cluster holds nothing it did not create. Override the
+port and URL in `.env.test.local` the same way when 55436 is taken.
 
 Complete local validation:
 

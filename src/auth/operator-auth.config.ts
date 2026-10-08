@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ConfigurationError } from '../common/logging/safe-error';
 
 export const OPERATOR_AUTH_CONFIG = Symbol('OPERATOR_AUTH_CONFIG');
 
@@ -12,7 +13,8 @@ export interface OperatorAuthConfig {
   credentials: readonly OperatorCredential[];
 }
 
-export class InvalidOperatorAuthConfigError extends Error {
+/** Messages name settings, never their values (see ConfigurationError). */
+export class InvalidOperatorAuthConfigError extends ConfigurationError {
   constructor(problems: readonly string[]) {
     super(`Invalid operator authentication configuration: ${problems.join('; ')}`);
     this.name = 'InvalidOperatorAuthConfigError';

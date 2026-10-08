@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { errorEventLine } from '../../common/logging/safe-error';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import type {
   LookupPlatformReplyInput,
@@ -229,12 +230,7 @@ export class ReplyDeliveryWorker {
     try {
       return await this.reconcileExpiredLeases(now);
     } catch (error: unknown) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'delivery.lease-sweep-failed',
-          error: error instanceof Error ? error.name : 'unknown error',
-        }),
-      );
+      this.logger.warn(errorEventLine('delivery.lease-sweep-failed', {}, error));
       return 0;
     }
   }

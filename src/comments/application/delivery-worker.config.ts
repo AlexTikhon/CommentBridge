@@ -1,3 +1,4 @@
+import { ConfigurationError } from '../../common/logging/safe-error';
 import { readDatabaseBudgets } from '../../database/database.config';
 
 export const DELIVERY_WORKER_CONFIG = Symbol('DELIVERY_WORKER_CONFIG');
@@ -68,7 +69,8 @@ export interface DeliveryRetentionConfig {
   maxBatchesPerRun: number;
 }
 
-export class InvalidDeliveryWorkerConfigError extends Error {
+/** Messages name settings, never their values (see ConfigurationError). */
+export class InvalidDeliveryWorkerConfigError extends ConfigurationError {
   constructor(problems: readonly string[]) {
     super(`Invalid delivery worker configuration: ${problems.join('; ')}`);
     this.name = 'InvalidDeliveryWorkerConfigError';

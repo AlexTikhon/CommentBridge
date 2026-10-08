@@ -179,7 +179,8 @@ describe('DeliveryRetentionService', () => {
     expect(failure).toMatchObject({
       event: 'delivery-retention.failed',
       deletedAttempts: 2,
-      errorName: 'Error',
+      errorCategory: 'internal',
+      errorClass: 'Error',
     });
     expect(JSON.stringify(failure)).not.toContain('secret');
   });
@@ -189,8 +190,14 @@ describe('DeliveryRetentionService', () => {
     [
       'an error whose name carries unsafe text',
       Object.assign(new Error('x'), { name: 'Bad Name: secret=1' }),
-      'UnknownError',
+      'Error',
     ],
+    [
+      'an error whose name is a plausible identifier carrying a secret',
+      Object.assign(new Error('x'), { name: 'secret_token_abc123' }),
+      'Error',
+    ],
+    ['a TypeError', new TypeError('postgresql://u:secret@db'), 'TypeError'],
   ])('reduces %s to a safe code', async (_label, thrown, expected) => {
     repository.pruneAttempts.mockRejectedValueOnce(thrown);
 

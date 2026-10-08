@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { safeErrorClass, safeErrorFields } from '../../common/logging/safe-error';
 import {
   DELIVERY_WORKER_CONFIG,
   type DeliveryRetentionConfig,
@@ -25,17 +26,12 @@ export interface DeliveryRetentionResult {
   errorCode: string | null;
 }
 
-const SAFE_ERROR_CODE = /^[A-Za-z0-9_.-]{1,100}$/;
-
 /**
- * A short identifier safe to persist and expose. Driver messages can carry
- * connection strings, so only the error class name is kept, and only when it
- * looks like an identifier.
+ * A short identifier safe to persist and expose: the error's class from a fixed list,
+ * never its name, message or stack (driver messages can carry connection strings).
  */
 export function safeErrorCode(error: unknown): string {
-  return error instanceof Error && SAFE_ERROR_CODE.test(error.name)
-    ? error.name
-    : 'UnknownError';
+  return safeErrorClass(error);
 }
 
 /**
@@ -96,12 +92,12 @@ export class DeliveryRetentionService {
       result.failed = true;
       result.errorCode = safeErrorCode(error);
       result.durationMs = Date.now() - startedAt;
-      // Error name only: driver messages can carry connection details.
+      // Type and validated codes only: driver messages can carry connection details.
       this.logger.error(
         JSON.stringify({
           event: 'delivery-retention.failed',
           ...this.summary(result),
-          errorName: result.errorCode,
+          ...safeErrorFields(error),
         }),
       );
       return result;

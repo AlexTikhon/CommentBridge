@@ -1,4 +1,5 @@
 import type { Prisma } from '@prisma/client';
+import { ConfigurationError } from '../common/logging/safe-error';
 
 export const DATABASE_CONFIG = Symbol('DATABASE_CONFIG');
 
@@ -28,7 +29,8 @@ export interface DatabaseConfig extends DatabaseBudgets {
   url: string;
 }
 
-export class InvalidDatabaseConfigError extends Error {
+/** Messages name settings, never their values (see ConfigurationError). */
+export class InvalidDatabaseConfigError extends ConfigurationError {
   constructor(problems: readonly string[]) {
     super(`Invalid database configuration: ${problems.join('; ')}`);
     this.name = 'InvalidDatabaseConfigError';
