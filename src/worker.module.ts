@@ -19,7 +19,11 @@ import { PlatformsModule } from './platforms/platforms.module';
  * that starts polling, so importing `AppModule` can never start a worker.
  */
 @Module({
-  imports: [DatabaseModule, PlatformsModule, DeliveryPersistenceModule],
+  imports: [
+    DatabaseModule.forProcess('worker'),
+    PlatformsModule,
+    DeliveryPersistenceModule,
+  ],
   providers: [
     DeliveryWorkerMetrics,
     ReplyDeliveryWorker,

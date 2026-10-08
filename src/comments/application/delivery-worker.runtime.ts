@@ -5,6 +5,7 @@ import {
   type OnApplicationBootstrap,
   type OnModuleDestroy,
 } from '@nestjs/common';
+import { errorEventLine } from '../../common/logging/safe-error';
 import {
   DELIVERY_WORKER_CONFIG,
   type DeliveryWorkerConfig,
@@ -158,10 +159,7 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
       result = await this.worker.drain();
     } catch (error: unknown) {
       this.metrics.recordDrainFailure();
-      this.logger.error(
-        'Reply delivery worker tick failed.',
-        error instanceof Error ? error.stack : undefined,
-      );
+      this.logFailure('error', 'delivery-worker.tick-failed', error);
       return;
     }
 
@@ -170,9 +168,7 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
     try {
       await this.state.recordDrain(this.identity, toDrainRecord(result), new Date());
     } catch (error: unknown) {
-      this.logger.warn(
-        `Could not record drain summary for worker ${this.identity.instanceId}: ${errorName(error)}`,
-      );
+      this.logFailure('warn', 'delivery-worker.drain-record-failed', error);
     }
   }
 
@@ -182,9 +178,7 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
     try {
       await this.state.heartbeat(this.identity, new Date());
     } catch (error: unknown) {
-      this.logger.warn(
-        `Heartbeat failed for worker ${this.identity.instanceId}: ${errorName(error)}`,
-      );
+      this.logFailure('warn', 'delivery-worker.heartbeat-failed', error);
     }
   }
 
@@ -202,9 +196,7 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
       if (this.stopping && !result.failed) return;
       record = toRetentionRecord(result, new Date());
     } catch (error: unknown) {
-      this.logger.warn(
-        `Delivery retention run failed for worker ${this.identity.instanceId}: ${errorName(error)}`,
-      );
+      this.logFailure('warn', 'delivery-worker.retention-failed', error);
       record = {
         outcome: 'FAILED',
         finishedAt: new Date(),
@@ -217,9 +209,7 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
     try {
       await this.state.recordRetention(this.identity, record);
     } catch (error: unknown) {
-      this.logger.warn(
-        `Could not record retention outcome for worker ${this.identity.instanceId}: ${errorName(error)}`,
-      );
+      this.logFailure('warn', 'delivery-worker.retention-record-failed', error);
     }
   }
 
@@ -242,6 +232,16 @@ export class DeliveryWorkerRuntime implements OnApplicationBootstrap, OnModuleDe
     this.activeHeartbeat = this.beat().finally(() => {
       this.activeHeartbeat = undefined;
     });
+  }
+
+  /**
+   * Failures are reported by type and validated code only (see safe-error): driver
+   * messages and stacks can carry connection strings and are never logged.
+   */
+  private logFailure(level: 'error' | 'warn', event: string, error: unknown): void {
+    this.logger[level](
+      errorEventLine(event, { workerInstanceId: this.identity.instanceId }, error),
+    );
   }
 
   private logEvent(event: string, details: Record<string, unknown> = {}): void {
@@ -278,9 +278,4 @@ function toRetentionRecord(
     deletedManualActions: result.deletedManualActions,
     errorCode: result.errorCode,
   };
-}
-
-/** Error messages only: connection strings can ride along in driver stack traces. */
-function errorName(error: unknown): string {
-  return error instanceof Error ? error.name : 'unknown error';
 }

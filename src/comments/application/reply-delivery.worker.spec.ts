@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../platforms/infrastructure/mock-instagram.adapter';
 import { DeliveryLeaseLostError, ProviderAdapterError } from '../domain/comment.errors';
@@ -350,6 +351,40 @@ describe('ReplyDeliveryWorker', () => {
       expect(repository.reconcileExpiredLeases).toHaveBeenCalledWith(now);
     });
 
+    it('keeps claiming work when the expired-lease sweep cannot get its locks', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn');
+      repository.reconcileExpiredLeases.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError(
+          'canceling statement due to lock timeout postgresql://u:secret@db/app',
+          { code: 'P2010', clientVersion: '6.19.3', meta: { code: '55P03' } },
+        ),
+      );
+      repository.claimNext.mockResolvedValueOnce(workItem()).mockResolvedValue(null);
+
+      const result = await worker.drain(() => now);
+
+      expect(result).toMatchObject({ expiredLeases: 0, delivered: 1 });
+      expect(repository.markSucceeded).toHaveBeenCalledTimes(1);
+      // Logged on every failed sweep, by type and validated codes only (messages can
+      // carry connection details).
+      expect(warn).toHaveBeenCalledWith(
+        JSON.stringify({
+          event: 'delivery.lease-sweep-failed',
+          errorCategory: 'database',
+          errorClass: 'PrismaClientKnownRequestError',
+          errorCode: 'P2010',
+          sqlState: '55P03',
+        }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('secret');
+    });
+
+    it('still surfaces a failing claim, which is not best effort', async () => {
+      repository.claimNext.mockRejectedValue(new Error('database unavailable'));
+
+      await expect(worker.drain(() => now)).rejects.toThrow('database unavailable');
+    });
+
     it('serves both queues when both always have work', async () => {
       alwaysDue();
 
@@ -423,6 +458,217 @@ describe('ReplyDeliveryWorker', () => {
         ([at, until]) => until.getTime() - at.getTime(),
       );
       expect(leaseSpans).toEqual([30_000, 30_000, 30_000]);
+    });
+  });
+
+  describe('fairness for every accepted configuration', () => {
+    // Both queues always have work. Every accepted (jobs, reconciliations) pair must
+    // still let each queue make progress, including the ones the validation allows
+    // but that used to hand every slot to reconciliation.
+    function backlogs() {
+      repository.claimUnknown.mockImplementation(() =>
+        Promise.resolve(workItem({ deliveryId: 'unknown-job' })),
+      );
+      repository.claimNext.mockImplementation(() =>
+        Promise.resolve(workItem({ deliveryId: 'normal-job' })),
+      );
+      jest.spyOn(instagram, 'lookupReply').mockResolvedValue({
+        externalCommentId: 'provider-reply',
+        remoteCreatedAt: now,
+      });
+    }
+
+    describe('a budget of at least two slots', () => {
+      it.each([
+        // [maxJobsPerTick, maxReconciliationsPerTick, reconciled, delivered]
+        [2, 2, 1, 1],
+        [3, 3, 2, 1],
+        [4, 4, 3, 1],
+        [10, 10, 9, 1],
+        [10, 9, 9, 1],
+        [10, 3, 3, 7],
+        [2, 1, 1, 1],
+      ])(
+        'with %i jobs and a reconciliation quota of %i, reconciles %i and delivers %i',
+        async (jobs, quota, reconciled, delivered) => {
+          worker = createWorker({
+            maxJobsPerTick: jobs,
+            maxReconciliationsPerTick: quota,
+          });
+          backlogs();
+
+          const result = await worker.drain(() => now);
+
+          expect(result).toMatchObject({ reconciled, delivered });
+          expect(result.reconciled + result.delivered).toBe(jobs);
+        },
+      );
+
+      it('serves fresh replies on every tick of an endless UNKNOWN backlog when the quotas are equal', async () => {
+        worker = createWorker({ maxJobsPerTick: 5, maxReconciliationsPerTick: 5 });
+        backlogs();
+
+        for (let tick = 0; tick < 20; tick += 1) {
+          const result = await worker.drain(() => now);
+          expect(result.delivered).toBeGreaterThanOrEqual(1);
+          expect(result.reconciled).toBeGreaterThanOrEqual(1);
+        }
+      });
+
+      it('gives the reserved delivery slot to reconciliation when nothing normal is due', async () => {
+        worker = createWorker({ maxJobsPerTick: 4, maxReconciliationsPerTick: 4 });
+        repository.claimUnknown.mockResolvedValue(workItem());
+        jest.spyOn(instagram, 'lookupReply').mockResolvedValue(null);
+
+        const result = await worker.drain(() => now);
+
+        expect(result).toMatchObject({ reconciled: 4, delivered: 0 });
+      });
+
+      it('gives unused reconciliation slots to normal delivery', async () => {
+        worker = createWorker({ maxJobsPerTick: 4, maxReconciliationsPerTick: 4 });
+        repository.claimNext.mockResolvedValue(workItem());
+
+        const result = await worker.drain(() => now);
+
+        expect(result).toMatchObject({ reconciled: 0, delivered: 4 });
+      });
+    });
+
+    describe('a single-slot budget', () => {
+      beforeEach(() => {
+        worker = createWorker({ maxJobsPerTick: 1, maxReconciliationsPerTick: 1 });
+      });
+
+      it('alternates between the queues across drains while both have work', async () => {
+        backlogs();
+
+        const served: string[] = [];
+        for (let tick = 0; tick < 6; tick += 1) {
+          const result = await worker.drain(() => now);
+          expect(result.reconciled + result.delivered).toBe(1);
+          served.push(result.reconciled === 1 ? 'reconciliation' : 'delivery');
+        }
+
+        expect(served).toEqual([
+          'reconciliation',
+          'delivery',
+          'reconciliation',
+          'delivery',
+          'reconciliation',
+          'delivery',
+        ]);
+      });
+
+      it('never lets either queue wait more than one drain', async () => {
+        backlogs();
+
+        let sinceReconciliation = 0;
+        let sinceDelivery = 0;
+        for (let tick = 0; tick < 40; tick += 1) {
+          const result = await worker.drain(() => now);
+          sinceReconciliation = result.reconciled ? 0 : sinceReconciliation + 1;
+          sinceDelivery = result.delivered ? 0 : sinceDelivery + 1;
+          expect(sinceReconciliation).toBeLessThanOrEqual(1);
+          expect(sinceDelivery).toBeLessThanOrEqual(1);
+        }
+      });
+
+      it('spends the slot on normal delivery every drain when nothing is awaiting reconciliation', async () => {
+        repository.claimNext.mockResolvedValue(workItem());
+
+        for (let tick = 0; tick < 4; tick += 1) {
+          await expect(worker.drain(() => now)).resolves.toMatchObject({
+            reconciled: 0,
+            delivered: 1,
+          });
+        }
+      });
+
+      it('spends the slot on reconciliation every drain when no normal work is due', async () => {
+        repository.claimUnknown.mockResolvedValue(workItem());
+        jest.spyOn(instagram, 'lookupReply').mockResolvedValue(null);
+
+        for (let tick = 0; tick < 4; tick += 1) {
+          await expect(worker.drain(() => now)).resolves.toMatchObject({
+            reconciled: 1,
+            delivered: 0,
+          });
+        }
+      });
+
+      it('goes back to alternating as soon as the idle queue has work again', async () => {
+        // Only deliveries for two drains...
+        repository.claimNext.mockResolvedValue(workItem());
+        await worker.drain(() => now);
+        await worker.drain(() => now);
+
+        // ...then an UNKNOWN job appears: it is served next, not after another delivery.
+        repository.claimUnknown.mockResolvedValue(workItem());
+        jest.spyOn(instagram, 'lookupReply').mockResolvedValue(null);
+        const next = await worker.drain(() => now);
+        const after = await worker.drain(() => now);
+
+        expect(next.reconciled).toBe(1);
+        expect(after.delivered).toBe(1);
+      });
+
+      it('keeps its turn when a drain found nothing to do', async () => {
+        const idle = await worker.drain(() => now);
+        expect(idle).toMatchObject({ reconciled: 0, delivered: 0 });
+
+        backlogs();
+        // Reconciliation still has the first turn.
+        await expect(worker.drain(() => now)).resolves.toMatchObject({ reconciled: 1 });
+      });
+
+      it('keeps its turn when a claim fails, so the failed queue is retried first', async () => {
+        repository.claimUnknown.mockRejectedValueOnce(
+          new Error('database unavailable'),
+        );
+
+        await expect(worker.drain(() => now)).rejects.toThrow('database unavailable');
+
+        backlogs();
+        await expect(worker.drain(() => now)).resolves.toMatchObject({ reconciled: 1 });
+      });
+    });
+
+    describe('shutdown', () => {
+      it('starts no further job once stopped, whichever queue held the turn', async () => {
+        worker = createWorker({ maxJobsPerTick: 1, maxReconciliationsPerTick: 1 });
+        backlogs();
+        await worker.drain(() => now); // reconciliation served, delivery holds the turn
+
+        worker.stop();
+        const result = await worker.drain(() => now);
+
+        expect(result).toMatchObject({ reconciled: 0, delivered: 0 });
+        expect(repository.claimNext).not.toHaveBeenCalled();
+        expect(repository.claimUnknown).toHaveBeenCalledTimes(1);
+      });
+
+      it('finishes the reconciliation in flight and then claims nothing from either queue', async () => {
+        worker = createWorker({ maxJobsPerTick: 4, maxReconciliationsPerTick: 4 });
+        const claim = deferred<ReplyDeliveryWorkItem | null>();
+        repository.claimUnknown.mockReturnValueOnce(claim.promise);
+        repository.claimUnknown.mockResolvedValue(workItem());
+        repository.claimNext.mockResolvedValue(workItem());
+        jest.spyOn(instagram, 'lookupReply').mockResolvedValue({
+          externalCommentId: 'provider-reply',
+          remoteCreatedAt: now,
+        });
+
+        const draining = worker.drain(() => now);
+        await flush();
+        worker.stop();
+        claim.resolve(workItem());
+        const result = await draining;
+
+        expect(result).toMatchObject({ reconciled: 1, delivered: 0 });
+        expect(repository.claimUnknown).toHaveBeenCalledTimes(1);
+        expect(repository.claimNext).not.toHaveBeenCalled();
+      });
     });
   });
 

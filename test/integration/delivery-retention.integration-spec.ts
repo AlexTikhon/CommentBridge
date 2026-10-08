@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
   DeliveryStatus,
-  PrismaClient,
   ReplyDeliveryAttemptStatus,
   ReplyDeliveryManualActionType,
   ReplyDeliveryStatus,
@@ -15,12 +14,16 @@ import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delive
 import { PrismaCommentRepository } from '../../src/comments/infrastructure/prisma-comment.repository';
 import { PrismaDeliveryRetentionRepository } from '../../src/comments/infrastructure/prisma-delivery-retention.repository';
 import { PrismaReplyDeliveryRepository } from '../../src/comments/infrastructure/prisma-reply-delivery.repository';
-import type { PrismaService } from '../../src/database/prisma.service';
 import { PlatformAdapterRegistry } from '../../src/platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
 import { MockLinkedInAdapter } from '../../src/platforms/infrastructure/mock-linkedin.adapter';
 import { SEED_IDS } from '../../prisma/seed';
-import { resetAndSeed } from '../database-test-utils';
+import {
+  adminPrisma,
+  disconnectAdminPrisma,
+  resetAndSeed,
+  runtimePrismaService,
+} from '../database-test-utils';
 
 const DAY_MS = 86_400_000;
 const now = new Date('2026-10-03T12:00:00.000Z');
@@ -48,10 +51,14 @@ interface ActionSpec {
 }
 
 describe('delivery retention (PostgreSQL)', () => {
-  const prisma = new PrismaClient();
-  const prismaService = prisma as PrismaService;
-  const retentionRepository = new PrismaDeliveryRetentionRepository(prismaService);
-  const deliveryRepository = new PrismaReplyDeliveryRepository(prismaService);
+  // Fixtures use the schema owner. Retention and delivery run as the worker role;
+  // queueing replies and operator actions run as the API role.
+  const prisma = adminPrisma();
+  const apiService = runtimePrismaService('api');
+  const workerService = runtimePrismaService('worker');
+  const retentionRepository = new PrismaDeliveryRetentionRepository(workerService);
+  const deliveryRepository = new PrismaReplyDeliveryRepository(workerService);
+  const apiDeliveryRepository = new PrismaReplyDeliveryRepository(apiService);
   let comments: CommentsService;
   let deliveries: ReplyDeliveriesService;
   let worker: ReplyDeliveryWorker;
@@ -128,19 +135,22 @@ describe('delivery retention (PostgreSQL)', () => {
   const prune = (keepNewest = 1, limit = 500, cutoff = ATTEMPT_CUTOFF) =>
     retentionRepository.pruneAttempts({ cutoff, keepNewest, limit });
 
-  beforeAll(async () => prisma.$connect());
+  beforeAll(async () => {
+    await Promise.all([
+      prisma.$connect(),
+      apiService.$connect(),
+      workerService.$connect(),
+    ]);
+  });
   beforeEach(async () => {
-    await resetAndSeed(prisma);
+    await resetAndSeed();
     instagram = new MockInstagramAdapter();
     const adapters = new PlatformAdapterRegistry([
       instagram,
       new MockLinkedInAdapter(),
     ]);
-    comments = new CommentsService(
-      new PrismaCommentRepository(prismaService),
-      adapters,
-    );
-    deliveries = new ReplyDeliveriesService(deliveryRepository);
+    comments = new CommentsService(new PrismaCommentRepository(apiService), adapters);
+    deliveries = new ReplyDeliveriesService(apiDeliveryRepository);
     worker = new ReplyDeliveryWorker(
       deliveryRepository,
       adapters,
@@ -149,7 +159,13 @@ describe('delivery retention (PostgreSQL)', () => {
     );
   });
   afterEach(() => jest.restoreAllMocks());
-  afterAll(async () => prisma.$disconnect());
+  afterAll(async () => {
+    await Promise.all([
+      apiService.$disconnect(),
+      workerService.$disconnect(),
+      disconnectAdminPrisma(),
+    ]);
+  });
 
   describe('attempt eligibility', () => {
     it.each([

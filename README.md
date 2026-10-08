@@ -23,6 +23,10 @@ deterministic Instagram and LinkedIn mocks.
   platform-specific message limits.
 - RFC 7807-style errors, safe NestJS HTTP exception handling, validation details,
   request correlation IDs, and Swagger/OpenAPI.
+- Restricted PostgreSQL roles for the API and the worker, separate from the schema owner,
+  with externally supplied credentials and no published database port in the application
+  stack.
+- Finite, database-enforced statement and lock budgets on every runtime connection.
 - Unit, PostgreSQL integration, and E2E tests with an explicit destructive-reset
   guard.
 
@@ -90,14 +94,21 @@ pnpm start:worker         # worker: node dist/worker.js
 
 ### Production deployment
 
-The `Dockerfile` produces one runtime image used with two commands. The Compose
-file defines both, opt-in behind the `app` profile so that
-`docker compose up -d postgres` still starts only the database. Name the services, since
-`--profile app` alone also starts `postgres-test`:
+The `Dockerfile` produces one runtime image used with two commands. The application
+stack is its own Compose file, [docker-compose.app.yml](docker-compose.app.yml): PostgreSQL, a
+one-shot `migrate` job, the API, and the delivery worker. **It publishes no database
+port** (PostgreSQL is reachable only by the other services on the Compose network);
+only the API publishes a port.
 
 ```bash
-docker compose --profile app up -d --build api delivery-worker   # runs migrate first
-docker compose --profile app up -d --scale delivery-worker=3 api delivery-worker
+# Passwords come from your environment, a .env file next to the compose file, or a
+# secret manager. Compose refuses to start when one is missing. Use URL-safe values.
+export POSTGRES_ADMIN_PASSWORD=$(openssl rand -hex 24)
+export COMMENTBRIDGE_API_DB_PASSWORD=$(openssl rand -hex 24)
+export COMMENTBRIDGE_WORKER_DB_PASSWORD=$(openssl rand -hex 24)
+
+docker compose -f docker-compose.app.yml up -d --build            # runs migrate first
+docker compose -f docker-compose.app.yml up -d --scale delivery-worker=3
 ```
 
 `api` publishes a port and its healthcheck calls `GET /health/ready` (readiness, never
@@ -106,10 +117,102 @@ container healthcheck: its liveness is the heartbeat reported by
 `GET /api/v1/deliveries/stats` and judged by `GET /api/v1/deliveries/health`, and the
 restart policy covers crashes. Its
 `stop_grace_period` (30s) exceeds the provider timeout so the job in flight can
-finish on `SIGTERM`. Both services receive `DATABASE_URL` and the `DELIVERY_*`
-settings; only the API needs `OPERATOR_API_KEYS` and `PORT`. A `migrate` job applies
-migrations first from a build target that includes the Prisma CLI; the runtime image
-omits dev dependencies.
+finish on `SIGTERM`. Each runtime container receives only its own role's
+`DATABASE_URL` plus the `DELIVERY_*` and `DB_*` settings; only the API needs
+`OPERATOR_API_KEYS` and `PORT`. The `migrate` job is the only container that holds the
+admin password; it builds from a target that includes the Prisma CLI because the runtime
+image omits dev dependencies.
+
+### Database roles
+
+Three database identities, so that a compromised or buggy process cannot change the
+schema or reach more data than its job needs:
+
+| Identity               | Used by                                              | Can                                                                                                                           |
+| ---------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `postgres` (owner)     | `pnpm db:migrate`, `db:provision-roles`, `db:seed`   | Everything: it owns the schema. Never given to the API or worker.                                                             |
+| `commentbridge_api`    | the API (`DATABASE_URL`)                             | Read all tables; insert and update comments and deliveries (queue a reply, retry, dead-letter); insert audit rows. No delete. |
+| `commentbridge_worker` | the worker (`WORKER_DATABASE_URL` or `DATABASE_URL`) | Claim and complete deliveries, write attempts and its own heartbeat, prune history. Cannot create comments or deliveries.     |
+
+Neither runtime role is a superuser, owns an object, can create a table (permanent or
+temporary), schema, function, trigger, role or database, drop or alter anything, or
+use `COPY ... PROGRAM`. Migration `20261008000000_runtime_database_roles` creates the
+roles (`NOLOGIN`) and the grants; the exact privilege matrix is repeated in
+`test/integration/database-roles.integration-spec.ts`, which fails when a table exists
+that the matrix does not decide, so a later migration cannot leave one ungoverned.
+Two further guards: operator audit rows (`ReplyDeliveryManualAction`) cannot be updated
+by any role (the worker holds `UPDATE` only because its retention query takes row locks),
+and each role has role-level statement, lock and idle-in-transaction timeouts as a
+ceiling for any client that sets none.
+
+A migration cannot carry a password, so `pnpm db:provision-roles` applies the login and the
+password you supply (`COMMENTBRIDGE_API_DB_PASSWORD`, `COMMENTBRIDGE_WORKER_DB_PASSWORD`)
+and is also how you rotate them. It refuses short, placeholder, or identical
+passwords. The Prisma CLI reads `MIGRATION_DATABASE_URL` (`directUrl`) and refuses to
+run without it, so a runtime URL cannot be used to migrate by accident. The runtime
+never reads it.
+
+**Pre-existing roles are verified, not trusted.** If a DBA created `commentbridge_api` or
+`commentbridge_worker` beforehand, the migration reuses the role and normalises its
+administrative attributes, but it cannot know what the role was given elsewhere in the
+cluster. So `pnpm db:provision-roles` checks **both** roles first, and refuses to enable a
+login or change either password unless each one:
+
+- has no `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `REPLICATION` or `BYPASSRLS` attribute;
+- is a member of **no** other role (for example `pg_read_all_data`). `NOINHERIT` is not
+  enough: a member can still `SET ROLE` into the role it belongs to;
+- owns nothing (tables, schemas, functions, ... in this database, or the database itself);
+- holds no effective privilege beyond the matrix above, whether granted directly, on a
+  single column, through `PUBLIC` or through a role it belongs to. That includes
+  `_prisma_migrations`, any table the matrix does not list, `CREATE` on any schema, the
+  database or a tablespace, and `TEMPORARY` on the database.
+
+An incompatible role is rejected with a list of what to fix and the sentence "Nothing was
+changed". The command never revokes a membership or reassigns ownership itself: those are
+cluster-wide decisions for whoever owns the cluster. Both roles are checked before either is
+touched, and the two password changes commit in one transaction, so a failure never leaves
+one role rotated and the other not. A fresh installation and a compatible pre-existing role
+(rotation included) are unaffected.
+
+Sequencing: run `pnpm db:deploy` (migrate, then provision) rather than the migration alone.
+The migration deliberately does not fail on an incompatible role, so until provisioning has
+run, a pre-existing role that already had a login and a password keeps working with
+whatever it was given. Verification only sees the database it is connected to and the
+cluster-wide objects; ownership in another database of the same cluster is out of its sight.
+
+Known residual risk: PostgreSQL lets any role change its own password and nothing can
+revoke that. A compromised runtime role could lock itself out; `pnpm db:provision-roles`
+repairs it. It cannot widen its privileges.
+
+### Database budgets
+
+Every runtime connection (API and worker, pooled connections, raw queries, and interactive
+transactions) is opened with PostgreSQL startup parameters
+`statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`, so the
+**server** cancels an over-budget statement and releases its locks. A JavaScript timer
+that only stops waiting cancels nothing; readiness therefore runs its `SELECT 1` under a
+`SET LOCAL` statement budget, and the 2-second `Promise.race` that remains only bounds the
+HTTP response when the pool cannot hand out a connection at all.
+
+| Variable                    | Default | Meaning                                                            |
+| --------------------------- | ------- | ------------------------------------------------------------------ |
+| `DB_STATEMENT_TIMEOUT_MS`   | `5000`  | Longest any statement may run, lock waits included                 |
+| `DB_LOCK_TIMEOUT_MS`        | `2000`  | Longest a statement waits for one lock; below the statement budget |
+| `DB_TRANSACTION_TIMEOUT_MS` | `5000`  | Longest interactive transaction; at least the statement budget     |
+
+Startup fails with an error naming the variable if they are missing, non-positive, above one
+hour, or inconsistent. They also fix the minimum lease:
+`DELIVERY_LEASE_DURATION_MS` must exceed `DELIVERY_PROVIDER_TIMEOUT_MS` plus
+`DB_TRANSACTION_TIMEOUT_MS`, so a worker that is slow to record a delivery the provider
+accepted still owns the job. If recording fails (a lock budget expires, say), the transaction
+rolls back and the job stays `PROCESSING` until its lease expires, then reconciliation
+resolves it by provider lookup: a persistence failure after provider acceptance is never a
+blind redelivery.
+
+The expired-lease sweep waits for row locks like any update, so a lock held by someone else
+makes it fail after `DB_LOCK_TIMEOUT_MS`. The drain logs `delivery.lease-sweep-failed` and
+carries on, because claims skip locked rows; the next drain retries the sweep. A lock that
+stays held shows up as that log line repeating and as `UNKNOWN` age in operational health.
 
 ## Quick start
 
@@ -117,14 +220,18 @@ Requirements: Node.js 22 or 24, pnpm 11, Docker, and Docker Compose.
 
 ```bash
 cp .env.example .env
+# Fill in the three *_PASSWORD values (openssl rand -hex 24) and put the same passwords
+# into the three database URLs below them.
 pnpm install
-docker compose up -d postgres
-pnpm db:migrate
-pnpm db:seed
-pnpm dev                  # API
-pnpm start:worker:dev     # delivery worker, in a second terminal
+docker compose up -d --wait postgres      # published on 127.0.0.1 only
+pnpm db:deploy                            # migrate as the owner, then create the role logins
+pnpm db:seed                              # seeds as the owner
+pnpm dev                                  # API, as commentbridge_api
+pnpm start:worker:dev                     # delivery worker, as commentbridge_worker (second terminal)
 ```
 
+The development database is bound to `127.0.0.1` (use `127.0.0.1`, not `localhost`, in
+URLs: on Windows `localhost` tries `::1` first and every new connection pays a timeout).
 The API only queues replies; they are delivered while the worker process runs.
 PowerShell users can replace the first command with
 `Copy-Item .env.example .env`. The API runs at `http://localhost:3000`, Swagger UI
@@ -251,9 +358,12 @@ linking comments across publications. Additional checks require provider identit
 for inbound and sent comments and keep publication status aligned with
 `publishedAt`.
 
-Reads order by `COALESCE(remoteCreatedAt, createdAt), id`. Matching SQL expression
-indexes live in migrations because Prisma cannot represent them; required
-uniqueness indexes remain.
+Reads order by `paginationAt, id`, a persisted timestamp fixed when the comment is
+inserted (the provider timestamp if the row has one, otherwise the local creation time) and
+immutable afterwards: a database trigger derives it on insert and rejects any change, for
+every role. `remoteCreatedAt` stays provider metadata and is still recorded when delivery
+succeeds. Ordinary indexes on `(postPublicationId | parentId, paginationAt DESC, id DESC)`
+serve the listing; required uniqueness indexes remain.
 
 ## Platform adapter extension
 
@@ -315,12 +425,19 @@ outbound attempt, so `attemptCount` is unchanged.
 ## Worker scheduling and lifecycle
 
 Each poll runs one bounded drain: expired-lease maintenance once, then up to
-`DELIVERY_MAX_JOBS_PER_TICK` jobs. `UNKNOWN` reconciliation gets up to
-`DELIVERY_MAX_RECONCILIATIONS_PER_TICK` slots first and normal `PENDING`/`RETRY`
-deliveries get the remainder, so a large `UNKNOWN` backlog cannot starve fresh
-replies. A slot one queue does not use goes to the other. Every job takes a fresh
-clock reading, so a lease never starts in the past. (Keep the reconciliation quota
-below the job budget to guarantee normal deliveries a slot every tick.)
+`DELIVERY_MAX_JOBS_PER_TICK` jobs from two queues, with progress guaranteed for both under
+every accepted configuration:
+
+- **Two or more slots:** `UNKNOWN` reconciliation gets up to the smaller of
+  `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` and (slots - 1) first, so normal
+  `PENDING`/`RETRY` deliveries always keep at least one slot, even when the quota equals the
+  whole budget and `UNKNOWN` work is endlessly due.
+- **One slot:** the queues take alternate drains (reconciliation first), and the turn only
+  advances when a job was served.
+- **Spare capacity is never wasted:** a slot one queue does not use goes to the other, and
+  reconciliation may exceed its quota with slots delivery left idle.
+
+Every job takes a fresh clock reading, so a lease never starts in the past.
 
 The worker process starts with `NestFactory.createApplicationContext` (no HTTP
 listener), registers itself, then polls and heartbeats until it receives a signal.
@@ -333,18 +450,18 @@ exits immediately. A hard kill is still safe: the unfinished lease expires into
 `UNKNOWN` and is resolved by provider lookup. Shutdown writes nothing to shared
 state; the worker simply goes `STALE` when its heartbeat ages out.
 
-| Variable                                | Default | Meaning                                                                 |
-| --------------------------------------- | ------- | ----------------------------------------------------------------------- |
-| `DELIVERY_POLL_INTERVAL_MS`             | `1000`  | Delay between drains                                                    |
-| `DELIVERY_LEASE_DURATION_MS`            | `30000` | Must exceed the provider timeout                                        |
-| `DELIVERY_PROVIDER_TIMEOUT_MS`          | `10000` | Per provider call or lookup                                             |
-| `DELIVERY_MAX_ATTEMPTS`                 | `5`     | Attempts before `FAILED`                                                |
-| `DELIVERY_BASE_RETRY_DELAY_MS`          | `1000`  | First backoff; doubles per attempt                                      |
-| `DELIVERY_MAX_RETRY_DELAY_MS`           | `60000` | Backoff cap; at least the base delay                                    |
-| `DELIVERY_MAX_JOBS_PER_TICK`            | `10`    | Jobs per drain                                                          |
-| `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` | `3`     | Reconciliation slots; at most the job budget                            |
-| `DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` | How often a worker refreshes its heartbeat                              |
-| `DELIVERY_WORKER_STALE_AFTER_MS`        | `30000` | Heartbeat age after which a worker is `STALE`; must exceed the interval |
+| Variable                                | Default | Meaning                                                                  |
+| --------------------------------------- | ------- | ------------------------------------------------------------------------ |
+| `DELIVERY_POLL_INTERVAL_MS`             | `1000`  | Delay between drains                                                     |
+| `DELIVERY_LEASE_DURATION_MS`            | `30000` | Must exceed the provider timeout plus `DB_TRANSACTION_TIMEOUT_MS`        |
+| `DELIVERY_PROVIDER_TIMEOUT_MS`          | `10000` | Per provider call or lookup                                              |
+| `DELIVERY_MAX_ATTEMPTS`                 | `5`     | Attempts before `FAILED`                                                 |
+| `DELIVERY_BASE_RETRY_DELAY_MS`          | `1000`  | First backoff; doubles per attempt                                       |
+| `DELIVERY_MAX_RETRY_DELAY_MS`           | `60000` | Backoff cap; at least the base delay                                     |
+| `DELIVERY_MAX_JOBS_PER_TICK`            | `10`    | Jobs per drain                                                           |
+| `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` | `3`     | Reconciliation slots; at most the job budget (normal delivery keeps one) |
+| `DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` | How often a worker refreshes its heartbeat                               |
+| `DELIVERY_WORKER_STALE_AFTER_MS`        | `30000` | Heartbeat age after which a worker is `STALE`; must exceed the interval  |
 
 Invalid values stop startup of the API and the worker with an error naming the
 variable (never its value). The API reads `DELIVERY_WORKER_STALE_AFTER_MS` to classify
@@ -434,6 +551,20 @@ idle drains are silent. The worker logs `delivery-worker.starting`,
 `delivery-worker.started`, `delivery-worker.shutdown-started`, and
 `delivery-worker.shutdown-complete` with its `workerInstanceId`; heartbeats are not
 logged. Messages, provider payloads, and credentials are never logged.
+
+Failures are logged the same way, as one JSON line with a fixed `event`
+(`delivery-worker.tick-failed`, `.drain-record-failed`, `.heartbeat-failed`,
+`.retention-failed`, `.retention-record-failed`, `.start-failed`, `.shutdown-failed`),
+the `workerInstanceId` where the process has one, and only these error fields:
+`errorCategory` (`configuration`, `database`, `system`, `internal`, `unknown`),
+`errorClass` (from a fixed list, never `error.name`), and, when they have the exact shape
+of one, `errorCode` (a Prisma `P2034`, or an operating-system code such as
+`ECONNREFUSED`) and `sqlState` (such as `42501`). An error's message, stack, cause and
+properties are never logged, because drivers put connection URLs in them and `new URL()`
+keeps its input. The one exception is a configuration error, which names the setting
+that is wrong (never its value) in a `detail` field so the process says how to fix it.
+`pnpm db:provision-roles` follows the same rule: it prints a role-contract or password
+problem in full, and anything else as `provision-roles.failed` plus those fields.
 
 ## Health endpoints
 
@@ -656,8 +787,8 @@ statements per table per run, and rows another transaction holds are skipped rat
 waited for, so concurrent passes simply find less to do. A pass logs
 `{"event":"delivery-retention.completed","deletedAttempts":…,"deletedManualActions":…,"batchCount":…,"durationMs":…,"attemptCutoff":…,"manualActionCutoff":…,"capped":…}`
 when it deleted something (`debug` level when it found nothing) and
-`delivery-retention.failed` with the error name on failure. Row contents are never
-logged. Each pass's outcome (time, duration, counts, and on failure the error class name)
+`delivery-retention.failed` with the safe error fields on failure. Row contents are never
+logged. Each pass's outcome (time, duration, counts, and on failure the error class label)
 is also stored on the worker's own `DeliveryWorkerInstance` row so that
 `GET /api/v1/deliveries/health` can report when retention last succeeded or failed and
 whether it is overdue (_Health endpoints_). It is the latest outcome per worker, not a
@@ -679,10 +810,21 @@ shorter than the attempt retention.
 
 ## Pagination
 
-Pages use descending keyset pagination over effective creation time and UUID. An
-opaque base64url cursor contains that validated tuple, avoiding growing offset
-cost and page shifts from newer rows. Local `createdAt` is the deterministic
-fallback when provider time is absent.
+Pages use descending keyset pagination over the persisted `paginationAt` and UUID. An
+opaque base64url cursor contains that validated tuple, avoiding growing offset cost and page
+shifts from newer rows. `paginationAt` never changes after insertion, so completing a
+delivery between two page requests cannot make a comment repeat or disappear from a walk.
+
+Cursors carry a version (`v: 2`). Cursors issued before the upgrade have no version and
+held `COALESCE(remoteCreatedAt, createdAt)`; the migration backfills `paginationAt` with
+exactly that expression, so they address the same position and are accepted unchanged. A cursor
+with any other version is rejected as invalid rather than guessed at. A client that is
+mid-walk across the upgrade can still see the old anomaly for a reply that was delivered
+before it; nothing is made worse.
+
+A page selects its `limit + 1` candidate comments first, with every filter and the cursor
+applied and seeking the `paginationAt` indexes, and only then counts replies for those
+candidates with one indexed lookup each.
 
 ## Errors
 
@@ -703,16 +845,35 @@ pnpm test
 ```
 
 Integration and E2E suites use a disposable `commentbridge_test` database and load
-only `.env.test.example`. Before any `deleteMany()`, the guard requires
-`NODE_ENV=test` and a database name ending in `_test`; unsafe settings are refused
-without exposing the connection URL.
+`.env.test.example` (then an optional git-ignored `.env.test.local` for machine-specific
+overrides such as a different port). Before any destructive reset, the guard requires
+`NODE_ENV=test` and that **every** configured database URL names a database ending in
+`_test`; unsafe settings are refused without exposing a connection URL.
+
+The test database is an in-memory container bound to `127.0.0.1`, started from its own
+compose file with throwaway credentials that live in `.env.test.example` and protect nothing.
+Administrative credentials (`MIGRATION_DATABASE_URL`) are used only to migrate, provision roles,
+and set up fixtures; the code under test runs as the restricted `commentbridge_api` and
+`commentbridge_worker` roles, so every suite also exercises the privilege boundary.
 
 ```bash
-docker compose up -d postgres-test
-pnpm db:test:migrate
+pnpm db:test:up            # docker compose -f docker-compose.test.yml ...
+pnpm db:test:migrate       # migrate as the owner, then provision the runtime roles
 pnpm test:integration
 pnpm test:e2e
 ```
+
+If port 55433 is taken, create `.env.test.local` with a different `POSTGRES_TEST_PORT` and the
+three database URLs, and start the database with `POSTGRES_TEST_PORT=<port> pnpm db:test:up`.
+Run the database suites sequentially (`--runInBand` is already set); they share one database.
+
+`pnpm db:test:up` also starts a second, separate PostgreSQL cluster (`postgres-roles-test`,
+port `POSTGRES_ROLES_TEST_PORT`, default 55436, URL in `ROLE_CONTRACT_DATABASE_URL`). Roles are
+cluster-wide, and `test/integration/database-role-contract.integration-spec.ts` creates, damages
+and drops `commentbridge_api` and `commentbridge_worker`, so it must never run on the cluster
+above. It refuses to start unless that URL names a `_test` database on a different host and port
+from every other configured URL, and the cluster holds nothing it did not create. Override the
+port and URL in `.env.test.local` the same way when 55436 is taken.
 
 Complete local validation:
 
@@ -721,8 +882,10 @@ pnpm format:check
 pnpm lint
 pnpm typecheck
 pnpm test
-docker compose config
-docker compose up -d postgres-test
+# Compose files need their passwords: from .env, or the environment.
+docker compose config --quiet
+docker compose -f docker-compose.app.yml config --quiet
+pnpm db:test:up
 pnpm db:test:migrate
 pnpm test:integration
 pnpm test:e2e

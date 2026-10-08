@@ -1,0 +1,143 @@
+# Application deployment: PostgreSQL, a one-shot migration job, the API, and the
+# delivery worker.
+#
+#   docker compose -f docker-compose.app.yml up -d --build
+#   docker compose -f docker-compose.app.yml up -d --scale delivery-worker=3
+#
+# Nothing here publishes a database port: PostgreSQL is reachable only by the other
+# services on this Compose network. Only the API publishes a port.
+#
+# Credentials come from the environment (a .env file next to this file, your shell,
+# or your secret manager); none are defined in this file. Compose refuses to start
+# when one is missing. Use URL-safe passwords (for example `openssl rand -hex 24`),
+# because they are placed inside connection URLs.
+#
+# Three database identities, deliberately separate:
+# - postgres (admin) owns the schema. Only the one-shot `migrate` job gets its password.
+# - commentbridge_api and commentbridge_worker are restricted runtime roles created
+#   by migrations and given a login by `migrate`. Each runtime container receives
+#   only its own role's URL; neither can run DDL, alter roles, or read the others'
+#   credentials.
+
+name: commentbridge-app
+
+# Delivery settings shared by the API and the worker. A variable that is not set
+# in your shell or .env is not passed, so the application defaults apply.
+x-delivery-settings: &delivery-settings
+  DELIVERY_POLL_INTERVAL_MS:
+  DELIVERY_LEASE_DURATION_MS:
+  DELIVERY_PROVIDER_TIMEOUT_MS:
+  DELIVERY_MAX_ATTEMPTS:
+  DELIVERY_BASE_RETRY_DELAY_MS:
+  DELIVERY_MAX_RETRY_DELAY_MS:
+  DELIVERY_MAX_JOBS_PER_TICK:
+  DELIVERY_MAX_RECONCILIATIONS_PER_TICK:
+  DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS:
+  DELIVERY_WORKER_STALE_AFTER_MS:
+  DELIVERY_RETENTION_ENABLED:
+  DELIVERY_ATTEMPT_RETENTION_DAYS:
+  DELIVERY_MANUAL_ACTION_RETENTION_DAYS:
+  DELIVERY_RETENTION_INTERVAL_MS:
+  DELIVERY_RETENTION_BATCH_SIZE:
+  DELIVERY_RETENTION_MIN_ATTEMPTS_PER_DELIVERY:
+  DELIVERY_HEALTH_WORKER_REQUIRED:
+  DELIVERY_HEALTH_NO_WORKER_GRACE_MS:
+  DELIVERY_HEALTH_QUEUE_LAG_WARN_MS:
+  DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS:
+  DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS:
+  DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS:
+  DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER:
+  DB_STATEMENT_TIMEOUT_MS:
+  DB_LOCK_TIMEOUT_MS:
+  DB_TRANSACTION_TIMEOUT_MS:
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}
+      POSTGRES_DB: social_comments
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d social_comments']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # Applies migrations as the schema owner, then sets the runtime roles' passwords.
+  # It is the only service that holds the admin password.
+  migrate:
+    image: commentbridge-migrate:local
+    build:
+      context: .
+      target: migrate
+    environment:
+      MIGRATION_DATABASE_URL: postgresql://postgres:${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}@postgres:5432/social_comments?schema=public
+      # The Prisma CLI validates both variables; the migrate job never connects with it.
+      DATABASE_URL: postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@postgres:5432/social_comments?schema=public
+      COMMENTBRIDGE_API_DB_PASSWORD: ${COMMENTBRIDGE_API_DB_PASSWORD:?Set COMMENTBRIDGE_API_DB_PASSWORD}
+      COMMENTBRIDGE_WORKER_DB_PASSWORD: ${COMMENTBRIDGE_WORKER_DB_PASSWORD:?Set COMMENTBRIDGE_WORKER_DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: commentbridge:local
+    build:
+      context: .
+      target: runtime
+    command: ['node', 'dist/main.js']
+    init: true
+    environment:
+      <<: *delivery-settings
+      DATABASE_URL: postgresql://commentbridge_api:${COMMENTBRIDGE_API_DB_PASSWORD:?Set COMMENTBRIDGE_API_DB_PASSWORD}@postgres:5432/social_comments?schema=public
+      PORT: '3000'
+      OPERATOR_API_KEYS: ${OPERATOR_API_KEYS:-}
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Readiness (PostgreSQL reachable), not operational health: a delivery backlog
+    # or a stopped worker must never make Docker report the API as unhealthy.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health/ready').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Same image as the API, different command, and no HTTP listener or published
+  # port. Its liveness is the heartbeat shown by GET /api/v1/deliveries/stats and
+  # judged by GET /api/v1/deliveries/health, so it has no container healthcheck;
+  # restart-on-exit covers crashes.
+  delivery-worker:
+    image: commentbridge:local
+    command: ['node', 'dist/worker.js']
+    init: true
+    environment:
+      <<: *delivery-settings
+      DATABASE_URL: postgresql://commentbridge_worker:${COMMENTBRIDGE_WORKER_DB_PASSWORD:?Set COMMENTBRIDGE_WORKER_DB_PASSWORD}@postgres:5432/social_comments?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Longer than DELIVERY_PROVIDER_TIMEOUT_MS so the job in flight can finish
+    # before SIGKILL; a killed worker is still safe (its lease expires).
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

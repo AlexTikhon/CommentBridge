@@ -6,7 +6,15 @@ import {
   SocialPlatform,
 } from '@prisma/client';
 
-const prisma = new PrismaClient();
+// Seeding writes to every table, so it runs as the schema owner. The runtime roles
+// (the ones the API and worker use) deliberately cannot do this.
+function ownerClient(): PrismaClient {
+  const url = process.env.MIGRATION_DATABASE_URL;
+  if (!url) {
+    throw new Error('MIGRATION_DATABASE_URL (the schema owner) is required to seed.');
+  }
+  return new PrismaClient({ datasourceUrl: url });
+}
 
 export const SEED_IDS = {
   post: '11111111-1111-4111-8111-111111111111',
@@ -24,7 +32,7 @@ export const SEED_IDS = {
   seededReply: '55555555-5555-4555-8555-555555555551',
 } as const;
 
-export async function seed(client: PrismaClient = prisma): Promise<void> {
+export async function seed(client: PrismaClient): Promise<void> {
   const createdAt = new Date('2026-08-04T09:00:00.000Z');
 
   await client.post.upsert({
@@ -193,7 +201,8 @@ export async function seed(client: PrismaClient = prisma): Promise<void> {
 }
 
 if (require.main === module) {
-  void seed()
+  const prisma = ownerClient();
+  void seed(prisma)
     .then(() => {
       console.log(`Seed complete. Post ID: ${SEED_IDS.post}`);
     })

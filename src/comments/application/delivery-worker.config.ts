@@ -1,3 +1,6 @@
+import { ConfigurationError } from '../../common/logging/safe-error';
+import { readDatabaseBudgets } from '../../database/database.config';
+
 export const DELIVERY_WORKER_CONFIG = Symbol('DELIVERY_WORKER_CONFIG');
 
 export interface DeliveryWorkerConfig {
@@ -8,6 +11,11 @@ export interface DeliveryWorkerConfig {
   baseRetryDelayMs: number;
   maxRetryDelayMs: number;
   maxJobsPerTick: number;
+  /**
+   * Slots per tick reserved for reconciling UNKNOWN deliveries, at most
+   * `maxJobsPerTick`. A quota equal to the whole budget is accepted: the worker still
+   * keeps one slot for normal delivery (or alternates queues when the budget is one).
+   */
   maxReconciliationsPerTick: number;
   /** How often a worker process refreshes its liveness row. */
   heartbeatIntervalMs: number;
@@ -61,7 +69,8 @@ export interface DeliveryRetentionConfig {
   maxBatchesPerRun: number;
 }
 
-export class InvalidDeliveryWorkerConfigError extends Error {
+/** Messages name settings, never their values (see ConfigurationError). */
+export class InvalidDeliveryWorkerConfigError extends ConfigurationError {
   constructor(problems: readonly string[]) {
     super(`Invalid delivery worker configuration: ${problems.join('; ')}`);
     this.name = 'InvalidDeliveryWorkerConfigError';
@@ -138,6 +147,10 @@ export function loadDeliveryWorkerConfig(
     return fallback;
   };
 
+  // Parsed here only to keep the lease coherent with them; the database client reads
+  // the same variables through loadDatabaseConfig.
+  const databaseBudgets = readDatabaseBudgets(env, problems);
+
   const config: DeliveryWorkerConfig = {
     pollIntervalMs: integer('DELIVERY_POLL_INTERVAL_MS', 1_000),
     leaseDurationMs: integer('DELIVERY_LEASE_DURATION_MS', 30_000),
@@ -194,9 +207,18 @@ export function loadDeliveryWorkerConfig(
 
   // Cross-field rules are only meaningful once each field parsed.
   if (problems.length === 0) {
-    if (config.leaseDurationMs <= config.providerTimeoutMs) {
+    // The lease must outlive the provider call and then the longest transaction that
+    // records its outcome. Persistence is bounded by the transaction budget (and each
+    // statement by its own), so a worker that is slow to record a delivery the
+    // provider accepted still owns the job; if the budget is exceeded the
+    // transaction fails and the lease expiry reconciles the job as UNKNOWN instead of
+    // letting anything run past it.
+    if (
+      config.leaseDurationMs <=
+      config.providerTimeoutMs + databaseBudgets.transactionTimeoutMs
+    ) {
       problems.push(
-        'DELIVERY_LEASE_DURATION_MS must be greater than DELIVERY_PROVIDER_TIMEOUT_MS',
+        'DELIVERY_LEASE_DURATION_MS must be greater than DELIVERY_PROVIDER_TIMEOUT_MS plus DB_TRANSACTION_TIMEOUT_MS',
       );
     }
     if (config.baseRetryDelayMs > config.maxRetryDelayMs) {

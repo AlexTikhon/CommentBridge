@@ -264,7 +264,9 @@ describe('DeliveryWorkerRuntime', () => {
 
       expect(state.heartbeat).toHaveBeenCalledTimes(2);
       expect(warn).toHaveBeenCalledTimes(1);
-      expect(String(warn.mock.calls[0]?.[0])).toContain('Heartbeat failed');
+      expect(String(warn.mock.calls[0]?.[0])).toContain(
+        'delivery-worker.heartbeat-failed',
+      );
       expect(String(warn.mock.calls[0]?.[0])).not.toContain('secret');
       await runtime.onModuleDestroy();
     });
@@ -590,6 +592,142 @@ describe('DeliveryWorkerRuntime', () => {
       expect(state.recordRetention).not.toHaveBeenCalled();
       await runtime.onModuleDestroy();
     });
+  });
+
+  describe('error logging', () => {
+    const SECRET = 'SENTINEL-postgresql://user:hunter2@db.internal/app';
+    const hostile: [string, () => unknown][] = [
+      [
+        'an error with a secret in its message, stack and cause',
+        () => {
+          const error = new Error(`${SECRET} message`, {
+            cause: new Error(`${SECRET} cause`),
+          });
+          error.stack = `Error: ${SECRET}\n    at ${SECRET}`;
+          return error;
+        },
+      ],
+      [
+        'an error whose name is a plausible-looking identifier carrying the secret',
+        () => Object.assign(new Error('x'), { name: 'SENTINEL_hunter2_Name' }),
+      ],
+      ['a thrown string', () => SECRET],
+      ['a thrown object', () => ({ message: SECRET, toString: () => SECRET })],
+    ];
+
+    let error: jest.SpyInstance;
+    let log: jest.SpyInstance;
+    beforeEach(() => {
+      error = jest.spyOn(Logger.prototype, 'error');
+      log = jest.spyOn(Logger.prototype, 'log');
+    });
+
+    const everythingLogged = () =>
+      JSON.stringify(
+        [error, warn, log].flatMap((spy) => spy.mock.calls as unknown[][]),
+      );
+    const eventOf = (spy: jest.SpyInstance, event: string) =>
+      spy.mock.calls
+        .map((call: unknown[]) => call)
+        .filter(
+          ([line]) => typeof line === 'string' && line.includes(`"event":"${event}"`),
+        );
+
+    it.each(hostile)(
+      'a failing drain logs a fixed event and nothing from %s',
+      async (_l, make) => {
+        drain.mockRejectedValue(make());
+        const runtime = createRuntime();
+
+        await runtime.start();
+        await jest.advanceTimersByTimeAsync(0);
+        await runtime.onModuleDestroy();
+
+        const [call] = eventOf(error, 'delivery-worker.tick-failed');
+        expect(call).toHaveLength(1);
+        expect(JSON.parse(String(call?.[0]))).toMatchObject({
+          event: 'delivery-worker.tick-failed',
+          workerInstanceId: INSTANCE_ID,
+          errorCategory: expect.stringMatching(/^(internal|unknown)$/),
+        });
+        expect(everythingLogged()).not.toContain('SENTINEL');
+        expect(everythingLogged()).not.toContain('hunter2');
+        expect(metrics.snapshot().drainFailures).toBe(1);
+      },
+    );
+
+    it.each(hostile)(
+      'a failing drain summary write warns without %s',
+      async (_l, make) => {
+        drain.mockResolvedValue(drainResult({ delivered: 1 }));
+        state.recordDrain.mockRejectedValue(make());
+        const runtime = createRuntime();
+
+        await runtime.start();
+        await jest.advanceTimersByTimeAsync(0);
+        await runtime.onModuleDestroy();
+
+        const [call] = eventOf(warn, 'delivery-worker.drain-record-failed');
+        expect(JSON.parse(String(call?.[0]))).toMatchObject({
+          workerInstanceId: INSTANCE_ID,
+        });
+        expect(everythingLogged()).not.toContain('SENTINEL');
+      },
+    );
+
+    it.each(hostile)('a failing heartbeat warns without %s', async (_l, make) => {
+      state.heartbeat.mockRejectedValue(make());
+      const runtime = createRuntime();
+
+      await runtime.start();
+      await jest.advanceTimersByTimeAsync(10_000);
+      await runtime.onModuleDestroy();
+
+      const [call] = eventOf(warn, 'delivery-worker.heartbeat-failed');
+      expect(JSON.parse(String(call?.[0]))).toMatchObject({
+        workerInstanceId: INSTANCE_ID,
+      });
+      expect(everythingLogged()).not.toContain('SENTINEL');
+    });
+
+    it.each(hostile)(
+      'a failing retention run warns and records no part of %s',
+      async (_l, make) => {
+        retentionRun.mockRejectedValue(make());
+        const runtime = createRuntime();
+
+        await runtime.start();
+        await jest.advanceTimersByTimeAsync(0);
+        await runtime.onModuleDestroy();
+
+        const [call] = eventOf(warn, 'delivery-worker.retention-failed');
+        expect(JSON.parse(String(call?.[0]))).toMatchObject({
+          workerInstanceId: INSTANCE_ID,
+        });
+        const [, record] = state.recordRetention.mock.calls[0] ?? [];
+        expect(record).toMatchObject({ outcome: 'FAILED' });
+        expect(JSON.stringify(record)).not.toContain('SENTINEL');
+        expect(everythingLogged()).not.toContain('SENTINEL');
+      },
+    );
+
+    it.each(hostile)(
+      'a failing retention outcome write warns without %s',
+      async (_l, make) => {
+        state.recordRetention.mockRejectedValue(make());
+        const runtime = createRuntime();
+
+        await runtime.start();
+        await jest.advanceTimersByTimeAsync(0);
+        await runtime.onModuleDestroy();
+
+        const [call] = eventOf(warn, 'delivery-worker.retention-record-failed');
+        expect(JSON.parse(String(call?.[0]))).toMatchObject({
+          workerInstanceId: INSTANCE_ID,
+        });
+        expect(everythingLogged()).not.toContain('SENTINEL');
+      },
+    );
   });
 
   describe('retention maintenance', () => {

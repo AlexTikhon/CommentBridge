@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { errorEventLine } from '../../common/logging/safe-error';
 import { ApplicationError } from '../domain/comment.errors';
 import {
   evaluateDeliveryHealth,
@@ -79,13 +80,8 @@ export class DeliveryHealthService {
         this.config,
       );
     } catch (error: unknown) {
-      // The class name only: driver messages can carry connection details.
-      this.logger.error(
-        JSON.stringify({
-          event: 'delivery-health.unavailable',
-          errorName: error instanceof Error ? error.name : 'unknown',
-        }),
-      );
+      // Type and validated codes only: driver messages can carry connection details.
+      this.logger.error(errorEventLine('delivery-health.unavailable', {}, error));
       throw new ApplicationError(
         'DELIVERY_HEALTH_UNAVAILABLE',
         'Delivery health could not be evaluated because its data source is unavailable.',

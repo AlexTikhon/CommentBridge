@@ -1,5 +1,4 @@
 import { Logger } from '@nestjs/common';
-import { PrismaClient } from '@prisma/client';
 import { CommentsService } from '../../src/comments/application/comments.service';
 import { DeliveryRetentionService } from '../../src/comments/application/delivery-retention.service';
 import { DeliveryStatsService } from '../../src/comments/application/delivery-stats.service';
@@ -19,12 +18,16 @@ import { PrismaCommentRepository } from '../../src/comments/infrastructure/prism
 import { PrismaDeliveryRetentionRepository } from '../../src/comments/infrastructure/prisma-delivery-retention.repository';
 import { PrismaDeliveryWorkerStateRepository } from '../../src/comments/infrastructure/prisma-delivery-worker-state.repository';
 import { PrismaReplyDeliveryRepository } from '../../src/comments/infrastructure/prisma-reply-delivery.repository';
-import type { PrismaService } from '../../src/database/prisma.service';
 import { PlatformAdapterRegistry } from '../../src/platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
 import { MockLinkedInAdapter } from '../../src/platforms/infrastructure/mock-linkedin.adapter';
 import { SEED_IDS } from '../../prisma/seed';
-import { resetAndSeed } from '../database-test-utils';
+import {
+  adminPrisma,
+  disconnectAdminPrisma,
+  resetAndSeed,
+  runtimePrismaService,
+} from '../database-test-utils';
 
 const STALE_AFTER_MS = 30_000;
 const now = new Date('2026-10-03T12:00:00.000Z');
@@ -61,12 +64,11 @@ async function eventually<T>(
 describe('delivery worker runtime state (PostgreSQL)', () => {
   // The worker process and the API process each own a database client; only the
   // database is shared, as in production.
-  const workerPrisma = new PrismaClient();
-  const apiPrisma = new PrismaClient();
-  const workerState = new PrismaDeliveryWorkerStateRepository(
-    workerPrisma as PrismaService,
-  );
-  const apiState = new PrismaDeliveryWorkerStateRepository(apiPrisma as PrismaService);
+  const admin = adminPrisma();
+  const workerService = runtimePrismaService('worker');
+  const apiService = runtimePrismaService('api');
+  const workerState = new PrismaDeliveryWorkerStateRepository(workerService);
+  const apiState = new PrismaDeliveryWorkerStateRepository(apiService);
   const query = {
     retainedSince: retainedSince(now, STALE_AFTER_MS),
     activeSince: activeSince(now, STALE_AFTER_MS),
@@ -74,13 +76,21 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
   };
 
   beforeAll(async () => {
-    await Promise.all([workerPrisma.$connect(), apiPrisma.$connect()]);
+    await Promise.all([
+      admin.$connect(),
+      workerService.$connect(),
+      apiService.$connect(),
+    ]);
   });
   beforeEach(async () => {
-    await resetAndSeed(workerPrisma);
+    await resetAndSeed();
   });
   afterAll(async () => {
-    await Promise.all([workerPrisma.$disconnect(), apiPrisma.$disconnect()]);
+    await Promise.all([
+      workerService.$disconnect(),
+      apiService.$disconnect(),
+      disconnectAdminPrisma(),
+    ]);
   });
 
   describe('registration', () => {
@@ -88,7 +98,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       const startedAt = ago(5_000);
       await workerState.register({ instanceId: 'worker-a', startedAt }, now, ago(1e9));
 
-      const row = await workerPrisma.deliveryWorkerInstance.findUniqueOrThrow({
+      const row = await admin.deliveryWorkerInstance.findUniqueOrThrow({
         where: { instanceId: 'worker-a' },
       });
       expect(row.startedAt).toEqual(startedAt);
@@ -102,7 +112,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       await workerState.register(identity, ago(2_000), ago(1e9));
       await workerState.register(identity, now, ago(1e9));
 
-      await expect(workerPrisma.deliveryWorkerInstance.count()).resolves.toBe(1);
+      await expect(admin.deliveryWorkerInstance.count()).resolves.toBe(1);
       const snapshot = await apiState.getSnapshot(query);
       expect(snapshot.instances[0]?.lastHeartbeatAt).toEqual(now);
     });
@@ -124,7 +134,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
         retainedSince(now, STALE_AFTER_MS),
       );
 
-      const ids = (await workerPrisma.deliveryWorkerInstance.findMany()).map(
+      const ids = (await admin.deliveryWorkerInstance.findMany()).map(
         (row) => row.instanceId,
       );
       expect(ids.sort()).toEqual(['new', 'yesterday-ish']);
@@ -139,7 +149,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
 
       await workerState.heartbeat(identity, now);
 
-      const row = await workerPrisma.deliveryWorkerInstance.findUniqueOrThrow({
+      const row = await admin.deliveryWorkerInstance.findUniqueOrThrow({
         where: { instanceId: 'worker-a' },
       });
       expect(row.lastHeartbeatAt).toEqual(now);
@@ -150,7 +160,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
     it('recreates the row if it was removed while the worker kept running', async () => {
       const identity = { instanceId: 'worker-a', startedAt: ago(60_000) };
       await workerState.register(identity, ago(20_000), ago(1e9));
-      await workerPrisma.deliveryWorkerInstance.deleteMany();
+      await admin.deliveryWorkerInstance.deleteMany();
 
       await workerState.heartbeat(identity, now);
 
@@ -239,11 +249,11 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
 
       await Promise.all([
         ...identities.map((i) => workerState.heartbeat(i, now)),
-        ...identities.map((i) => apiState.recordDrain(i, drainRecord(), now)),
+        ...identities.map((i) => workerState.recordDrain(i, drainRecord(), now)),
         ...identities.map((i) => workerState.heartbeat(i, now)),
       ]);
 
-      await expect(workerPrisma.deliveryWorkerInstance.count()).resolves.toBe(3);
+      await expect(admin.deliveryWorkerInstance.count()).resolves.toBe(3);
     });
   });
 
@@ -332,7 +342,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       const metrics = new DeliveryWorkerMetrics();
       const runtime = new DeliveryWorkerRuntime(
         new ReplyDeliveryWorker(
-          new PrismaReplyDeliveryRepository(workerPrisma as PrismaService),
+          new PrismaReplyDeliveryRepository(workerService),
           adapters,
           runtimeConfig,
           metrics,
@@ -342,7 +352,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
         runtimeConfig,
         instanceId,
         new DeliveryRetentionService(
-          new PrismaDeliveryRetentionRepository(workerPrisma as PrismaService),
+          new PrismaDeliveryRetentionRepository(workerService),
           runtimeConfig,
         ),
       );
@@ -353,7 +363,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
     // The API side holds repositories only: no worker, metrics, or runtime object.
     const apiStats = () =>
       new DeliveryStatsService(
-        new PrismaReplyDeliveryRepository(apiPrisma as PrismaService),
+        new PrismaReplyDeliveryRepository(apiService),
         apiState,
         config,
       );
@@ -385,14 +395,14 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
     it('keeps heartbeating while idle without recording drains', async () => {
       await startableRuntime('runtime-a').start();
       const first = await eventually(async () => {
-        const row = await workerPrisma.deliveryWorkerInstance.findUnique({
+        const row = await admin.deliveryWorkerInstance.findUnique({
           where: { instanceId: 'runtime-a' },
         });
         return row;
       });
 
       const advanced = await eventually(async () => {
-        const row = await workerPrisma.deliveryWorkerInstance.findUniqueOrThrow({
+        const row = await admin.deliveryWorkerInstance.findUniqueOrThrow({
           where: { instanceId: 'runtime-a' },
         });
         return row.lastHeartbeatAt > first.lastHeartbeatAt ? row : null;
@@ -403,7 +413,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
 
     it('delivers a queued reply and publishes the drain through shared state', async () => {
       const comments = new CommentsService(
-        new PrismaCommentRepository(workerPrisma as PrismaService),
+        new PrismaCommentRepository(apiService),
         new PlatformAdapterRegistry([
           new MockInstagramAdapter(),
           new MockLinkedInAdapter(),
@@ -452,7 +462,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
 
     it('prunes eligible history on its own schedule and touches nothing else', async () => {
       const comments = new CommentsService(
-        new PrismaCommentRepository(workerPrisma as PrismaService),
+        new PrismaCommentRepository(apiService),
         new PlatformAdapterRegistry([new MockInstagramAdapter()]),
       );
       const queue = async (key: string) =>
@@ -464,11 +474,11 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
         [settledReply, 'SUCCEEDED'],
         [activeReply, 'UNKNOWN'],
       ] as const) {
-        const delivery = await workerPrisma.replyDelivery.update({
+        const delivery = await admin.replyDelivery.update({
           where: { replyId },
           data: { status, attemptCount: 4, nextAttemptAt: new Date('2100-01-01') },
         });
-        await workerPrisma.replyDeliveryAttempt.createMany({
+        await admin.replyDeliveryAttempt.createMany({
           data: [1, 2, 3, 4].map((attemptNumber) => ({
             deliveryId: delivery.id,
             attemptNumber,
@@ -488,19 +498,19 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       await startableRuntime('runtime-retention', retentionConfig).start();
 
       await eventually(async () =>
-        (await workerPrisma.replyDeliveryAttempt.count({
+        (await admin.replyDeliveryAttempt.count({
           where: { delivery: { replyId: settledReply } },
         })) === 1
           ? true
           : null,
       );
       await expect(
-        workerPrisma.replyDeliveryAttempt.count({
+        admin.replyDeliveryAttempt.count({
           where: { delivery: { replyId: activeReply } },
         }),
       ).resolves.toBe(4);
       await expect(
-        workerPrisma.replyDelivery.count({ where: { replyId: settledReply } }),
+        admin.replyDelivery.count({ where: { replyId: settledReply } }),
       ).resolves.toBe(1);
     });
 
@@ -513,7 +523,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       await startableRuntime('runtime-retention-health', retentionConfig).start();
 
       const row = await eventually(async () => {
-        const current = await workerPrisma.deliveryWorkerInstance.findUnique({
+        const current = await admin.deliveryWorkerInstance.findUnique({
           where: { instanceId: 'runtime-retention-health' },
         });
         return current?.lastRetentionSucceededAt ? current : null;
@@ -545,7 +555,7 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       await startableRuntime('runtime-retention-failing', retentionConfig).start();
 
       const row = await eventually(async () => {
-        const current = await workerPrisma.deliveryWorkerInstance.findUnique({
+        const current = await admin.deliveryWorkerInstance.findUnique({
           where: { instanceId: 'runtime-retention-failing' },
         });
         return current?.lastRetentionFailedAt ? current : null;
@@ -560,14 +570,12 @@ describe('delivery worker runtime state (PostgreSQL)', () => {
       const runtime = startableRuntime('runtime-a');
       await runtime.start();
       await runtime.onModuleDestroy();
-      const afterShutdown = await workerPrisma.deliveryWorkerInstance.findUniqueOrThrow(
-        {
-          where: { instanceId: 'runtime-a' },
-        },
-      );
+      const afterShutdown = await admin.deliveryWorkerInstance.findUniqueOrThrow({
+        where: { instanceId: 'runtime-a' },
+      });
 
       await new Promise((done) => setTimeout(done, 600));
-      const later = await workerPrisma.deliveryWorkerInstance.findUniqueOrThrow({
+      const later = await admin.deliveryWorkerInstance.findUniqueOrThrow({
         where: { instanceId: 'runtime-a' },
       });
       expect(later.lastHeartbeatAt).toEqual(afterShutdown.lastHeartbeatAt);

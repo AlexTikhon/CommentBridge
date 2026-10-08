@@ -5,7 +5,7 @@ import { DatabaseModule } from './database/database.module';
 import { HealthController } from './health/health.controller';
 
 @Module({
-  imports: [DatabaseModule, CommentsModule],
+  imports: [DatabaseModule.forProcess('api'), CommentsModule],
   controllers: [HealthController],
 })
 export class AppModule implements NestModule {

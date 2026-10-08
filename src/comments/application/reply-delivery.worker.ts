@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { errorEventLine } from '../../common/logging/safe-error';
 import { PlatformAdapterRegistry } from '../../platforms/application/platform-adapter.registry';
 import type {
   LookupPlatformReplyInput,
@@ -58,6 +59,8 @@ export interface DrainResult {
 export class ReplyDeliveryWorker {
   private readonly logger = new Logger(ReplyDeliveryWorker.name);
   private stopping = false;
+  /** Which queue a one-slot-per-tick worker serves first on its next busy drain. */
+  private singleSlotTurn: 'RECONCILIATION' | 'DELIVERY' = 'RECONCILIATION';
 
   constructor(
     @Inject(REPLY_DELIVERY_REPOSITORY)
@@ -79,14 +82,19 @@ export class ReplyDeliveryWorker {
 
   /**
    * One scheduled pass: expired-lease maintenance once, then a bounded number of
-   * jobs. Reconciliation of UNKNOWN deliveries is guaranteed up to
-   * `maxReconciliationsPerTick` slots and normal PENDING/RETRY deliveries get the
-   * rest, so neither queue can starve the other. Unused slots flow to whichever
-   * queue still has due work. Every job reads the clock afresh so leases never
-   * begin in the past.
+   * jobs from two queues, with progress guaranteed for both under every accepted
+   * configuration:
+   *
+   * - With two or more slots, reconciliation is capped at the smaller of its quota and
+   *   (slots - 1), so at least one slot always remains for normal delivery even when
+   *   the quota equals the whole budget and UNKNOWN work is endlessly due. Reconciliation
+   *   still gets up to that cap first, so it cannot be starved either.
+   * - With one slot, the queues take alternate drains.
+   * - Capacity a queue does not use flows to the other: an idle queue never wastes a slot.
+   *
+   * Every job reads the clock afresh so leases never begin in the past.
    */
   async drain(clock: Clock = systemClock): Promise<DrainResult> {
-    const { maxJobsPerTick, maxReconciliationsPerTick } = this.config;
     const startedAt = clock();
     const result: DrainResult = {
       reconciled: 0,
@@ -98,38 +106,13 @@ export class ReplyDeliveryWorker {
       outcomes: emptyOutcomes(),
     };
     if (this.stopping) return result;
-    const hasBudget = () =>
-      !this.stopping && result.reconciled + result.delivered < maxJobsPerTick;
 
-    result.expiredLeases = await this.reconcileExpiredLeases(startedAt);
+    result.expiredLeases = await this.sweepExpiredLeases(startedAt);
 
-    let reconciliationQueueDry = false;
-    while (hasBudget() && result.reconciled < maxReconciliationsPerTick) {
-      const outcome = await this.runReconciliation(clock);
-      if (outcome === null) {
-        reconciliationQueueDry = true;
-        break;
-      }
-      result.outcomes[outcome] += 1;
-      result.reconciled += 1;
-    }
-
-    let deliveryQueueDry = false;
-    while (hasBudget()) {
-      const outcome = await this.runDelivery(clock);
-      if (outcome === null) {
-        deliveryQueueDry = true;
-        break;
-      }
-      result.outcomes[outcome] += 1;
-      result.delivered += 1;
-    }
-
-    while (deliveryQueueDry && !reconciliationQueueDry && hasBudget()) {
-      const outcome = await this.runReconciliation(clock);
-      if (outcome === null) break;
-      result.outcomes[outcome] += 1;
-      result.reconciled += 1;
+    if (this.config.maxJobsPerTick === 1) {
+      await this.drainSingleSlot(clock, result);
+    } else {
+      await this.drainShared(clock, result);
     }
 
     result.finishedAt = clock();
@@ -153,6 +136,74 @@ export class ReplyDeliveryWorker {
     return result;
   }
 
+  /** Two or more slots: capped reconciliation, then delivery, then leftovers. */
+  private async drainShared(clock: Clock, result: DrainResult): Promise<void> {
+    const { maxJobsPerTick, maxReconciliationsPerTick } = this.config;
+    // Normal delivery keeps at least one slot, however large the configured quota.
+    const reconciliationCap = Math.min(maxReconciliationsPerTick, maxJobsPerTick - 1);
+    const hasBudget = () =>
+      !this.stopping && result.reconciled + result.delivered < maxJobsPerTick;
+
+    let reconciliationQueueDry = false;
+    while (hasBudget() && result.reconciled < reconciliationCap) {
+      const outcome = await this.runReconciliation(clock);
+      if (outcome === null) {
+        reconciliationQueueDry = true;
+        break;
+      }
+      result.outcomes[outcome] += 1;
+      result.reconciled += 1;
+    }
+
+    let deliveryQueueDry = false;
+    while (hasBudget()) {
+      const outcome = await this.runDelivery(clock);
+      if (outcome === null) {
+        deliveryQueueDry = true;
+        break;
+      }
+      result.outcomes[outcome] += 1;
+      result.delivered += 1;
+    }
+
+    // Slots delivery did not need go back to reconciliation, beyond its cap.
+    while (deliveryQueueDry && !reconciliationQueueDry && hasBudget()) {
+      const outcome = await this.runReconciliation(clock);
+      if (outcome === null) break;
+      result.outcomes[outcome] += 1;
+      result.reconciled += 1;
+    }
+  }
+
+  /**
+   * One slot: whichever queue has the turn goes first, and the other takes the slot
+   * only if that queue is empty. The turn then passes to the queue that was not served,
+   * so two backlogged queues alternate and neither waits more than one drain. A drain
+   * that served nothing, or failed, leaves the turn where it was.
+   */
+  private async drainSingleSlot(clock: Clock, result: DrainResult): Promise<void> {
+    if (this.stopping) return;
+    const order =
+      this.singleSlotTurn === 'RECONCILIATION'
+        ? (['RECONCILIATION', 'DELIVERY'] as const)
+        : (['DELIVERY', 'RECONCILIATION'] as const);
+
+    for (const queue of order) {
+      if (this.stopping) return;
+      const outcome =
+        queue === 'RECONCILIATION'
+          ? await this.runReconciliation(clock)
+          : await this.runDelivery(clock);
+      if (outcome === null) continue;
+
+      result.outcomes[outcome] += 1;
+      if (queue === 'RECONCILIATION') result.reconciled += 1;
+      else result.delivered += 1;
+      this.singleSlotTurn = queue === 'RECONCILIATION' ? 'DELIVERY' : 'RECONCILIATION';
+      return;
+    }
+  }
+
   /**
    * Single-step entry point: expired-lease maintenance, then one job with
    * UNKNOWN reconciliation ahead of normal delivery. The scheduled path uses
@@ -165,6 +216,23 @@ export class ReplyDeliveryWorker {
       (await this.processNextReconciliation(clock)) ||
       (await this.processNextDelivery(clock))
     );
+  }
+
+  /**
+   * The maintenance step of a drain. It is best effort: it waits for row locks like any
+   * update, so a lock held by someone else (an operator transaction, a long migration)
+   * makes it fail once the database lock budget runs out. That must not stop this
+   * drain from claiming work, because claims never wait for locks (they skip locked
+   * rows), and the lease it could not expire is simply swept by a later drain. The
+   * failure is logged every time it happens, so a lock that stays held is visible.
+   */
+  private async sweepExpiredLeases(now: Date): Promise<number> {
+    try {
+      return await this.reconcileExpiredLeases(now);
+    } catch (error: unknown) {
+      this.logger.warn(errorEventLine('delivery.lease-sweep-failed', {}, error));
+      return 0;
+    }
   }
 
   async reconcileExpiredLeases(now: Date): Promise<number> {
