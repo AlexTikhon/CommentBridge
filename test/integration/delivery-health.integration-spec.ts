@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { HttpStatus, Logger } from '@nestjs/common';
-import { PrismaClient, ReplyDeliveryStatus } from '@prisma/client';
+import { ReplyDeliveryStatus } from '@prisma/client';
 import type { Response } from 'express';
 import { CommentsService } from '../../src/comments/application/comments.service';
 import { DeliveryHealthService } from '../../src/comments/application/delivery-health.service';
@@ -8,24 +8,32 @@ import { loadDeliveryWorkerConfig } from '../../src/comments/application/deliver
 import { PrismaCommentRepository } from '../../src/comments/infrastructure/prisma-comment.repository';
 import { PrismaDeliveryWorkerStateRepository } from '../../src/comments/infrastructure/prisma-delivery-worker-state.repository';
 import { PrismaReplyDeliveryRepository } from '../../src/comments/infrastructure/prisma-reply-delivery.repository';
-import type { PrismaService } from '../../src/database/prisma.service';
 import { HealthController } from '../../src/health/health.controller';
 import { PlatformAdapterRegistry } from '../../src/platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
 import { MockLinkedInAdapter } from '../../src/platforms/infrastructure/mock-linkedin.adapter';
 import { ApplicationError } from '../../src/comments/domain/comment.errors';
 import { SEED_IDS } from '../../prisma/seed';
-import { resetAndSeed } from '../database-test-utils';
+import {
+  adminPrisma,
+  disconnectAdminPrisma,
+  resetAndSeed,
+  runtimePrismaService,
+} from '../database-test-utils';
 
 const SECOND = 1_000;
 const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 
 describe('delivery operational health (PostgreSQL)', () => {
-  const prisma = new PrismaClient();
-  const prismaService = prisma as PrismaService;
+  // Fixtures use the schema owner. Health is evaluated by the API, so its reads run
+  // as the API role; the worker writes its own state as the worker role.
+  const prisma = adminPrisma();
+  const prismaService = runtimePrismaService('api');
+  const workerService = runtimePrismaService('worker');
   const deliveryRepository = new PrismaReplyDeliveryRepository(prismaService);
-  const workerState = new PrismaDeliveryWorkerStateRepository(prismaService);
+  const apiWorkerState = new PrismaDeliveryWorkerStateRepository(prismaService);
+  const workerState = new PrismaDeliveryWorkerStateRepository(workerService);
   const comments = new CommentsService(
     new PrismaCommentRepository(prismaService),
     new PlatformAdapterRegistry([
@@ -97,17 +105,29 @@ describe('delivery operational health (PostgreSQL)', () => {
   const codes = (health: Awaited<ReturnType<DeliveryHealthService['evaluate']>>) =>
     health.issues.map((issue) => `${issue.code}:${issue.severity}`);
 
-  beforeAll(async () => prisma.$connect());
+  beforeAll(async () => {
+    await Promise.all([
+      prisma.$connect(),
+      prismaService.$connect(),
+      workerService.$connect(),
+    ]);
+  });
   beforeEach(async () => {
-    await resetAndSeed(prisma);
+    await resetAndSeed();
     jest.spyOn(Logger.prototype, 'log').mockImplementation();
     jest.spyOn(Logger.prototype, 'warn').mockImplementation();
     jest.spyOn(Logger.prototype, 'error').mockImplementation();
-    service = new DeliveryHealthService(deliveryRepository, workerState, config);
+    service = new DeliveryHealthService(deliveryRepository, apiWorkerState, config);
     now = new Date(service.startedAt.getTime() + HOUR);
   });
   afterEach(() => jest.restoreAllMocks());
-  afterAll(async () => prisma.$disconnect());
+  afterAll(async () => {
+    await Promise.all([
+      prismaService.$disconnect(),
+      workerService.$disconnect(),
+      disconnectAdminPrisma(),
+    ]);
+  });
 
   describe('workers', () => {
     it('counts a recent heartbeat as an active worker and reports HEALTHY', async () => {
@@ -562,17 +582,15 @@ describe('delivery operational health (PostgreSQL)', () => {
   describe('database unavailable', () => {
     // Connection refused is immediate, so these never wait on a network timeout.
     const unreachable = () =>
-      new PrismaClient({
-        datasources: {
-          db: { url: 'postgresql://x:y@127.0.0.1:1/none?connect_timeout=1' },
-        },
+      runtimePrismaService('api', {
+        DATABASE_URL: 'postgresql://x:y@127.0.0.1:1/none?connect_timeout=1',
       });
 
     it('cannot be evaluated and never reports HEALTHY', async () => {
       const broken = unreachable();
       const brokenService = new DeliveryHealthService(
-        new PrismaReplyDeliveryRepository(broken as PrismaService),
-        new PrismaDeliveryWorkerStateRepository(broken as PrismaService),
+        new PrismaReplyDeliveryRepository(broken),
+        new PrismaDeliveryWorkerStateRepository(broken),
         config,
       );
 
@@ -588,7 +606,7 @@ describe('delivery operational health (PostgreSQL)', () => {
 
     it('makes readiness fail while liveness stays UP', async () => {
       const broken = unreachable();
-      const controller = new HealthController(broken as PrismaService);
+      const controller = new HealthController(broken);
       const status = jest.fn();
 
       expect(controller.live()).toEqual({ status: 'UP' });

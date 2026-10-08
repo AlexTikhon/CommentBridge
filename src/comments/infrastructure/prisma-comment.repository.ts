@@ -6,6 +6,7 @@ import {
 } from '@prisma/client';
 import { decodeCursor, encodeCursor } from '../../common/pagination/cursor';
 import { PrismaService } from '../../database/prisma.service';
+import { buildCommentPageQuery } from './comment-page.query';
 import type {
   CommentRepository,
   CreatePendingReplyInput,
@@ -40,7 +41,7 @@ interface CommentRow {
   updatedAt: Date;
   platform: SocialPlatform;
   replyCount: number;
-  effectiveCreatedAt: Date;
+  paginationAt: Date;
 }
 
 @Injectable()
@@ -79,58 +80,10 @@ export class PrismaCommentRepository implements CommentRepository {
   }
 
   async findForPost(query: ListCommentsInput): Promise<CursorPage<CommentView>> {
-    const conditions: Prisma.Sql[] = [
-      Prisma.sql`p."postId" = ${query.postId}::uuid`,
-      Prisma.sql`p."status" = 'PUBLISHED'::"PublicationStatus"`,
-    ];
-    if (query.platform) {
-      conditions.push(Prisma.sql`sa."platform" = ${query.platform}::"SocialPlatform"`);
-    }
-    if (query.parentId) {
-      conditions.push(Prisma.sql`c."parentId" = ${query.parentId}::uuid`);
-    }
-    if (query.cursor) {
-      const cursor = decodeCursor(query.cursor);
-      const timestamp = new Date(cursor.timestamp);
-      conditions.push(Prisma.sql`(
-        COALESCE(c."remoteCreatedAt", c."createdAt") < ${timestamp}
-        OR (
-          COALESCE(c."remoteCreatedAt", c."createdAt") = ${timestamp}
-          AND c."id" < ${cursor.id}::uuid
-        )
-      )`);
-    }
-
-    const rows = await this.prisma.$queryRaw<CommentRow[]>(Prisma.sql`
-      SELECT
-        c."id",
-        c."postPublicationId",
-        c."parentId",
-        c."externalCommentId",
-        c."direction",
-        c."deliveryStatus",
-        c."idempotencyKey",
-        c."authorExternalId",
-        c."authorDisplayName",
-        c."body",
-        c."providerErrorCode",
-        c."remoteCreatedAt",
-        c."createdAt",
-        c."updatedAt",
-        sa."platform",
-        COUNT(r."id")::int AS "replyCount",
-        COALESCE(c."remoteCreatedAt", c."createdAt") AS "effectiveCreatedAt"
-      FROM "Comment" c
-      JOIN "PostPublication" p ON p."id" = c."postPublicationId"
-      JOIN "SocialAccount" sa ON sa."id" = p."socialAccountId"
-      LEFT JOIN "Comment" r
-        ON r."parentId" = c."id"
-        AND r."postPublicationId" = c."postPublicationId"
-      WHERE ${Prisma.join(conditions, ' AND ')}
-      GROUP BY c."id", sa."platform"
-      ORDER BY "effectiveCreatedAt" DESC, c."id" DESC
-      LIMIT ${query.limit + 1}
-    `);
+    const cursor = query.cursor ? decodeCursor(query.cursor) : null;
+    const rows = await this.prisma.$queryRaw<CommentRow[]>(
+      buildCommentPageQuery(query, cursor),
+    );
 
     const hasMore = rows.length > query.limit;
     const pageRows = hasMore ? rows.slice(0, query.limit) : rows;
@@ -145,7 +98,7 @@ export class PrismaCommentRepository implements CommentRepository {
       nextCursor:
         hasMore && last
           ? encodeCursor({
-              timestamp: last.effectiveCreatedAt.toISOString(),
+              timestamp: last.paginationAt.toISOString(),
               id: last.id,
             })
           : null,

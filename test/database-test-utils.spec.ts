@@ -1,5 +1,8 @@
-import type { PrismaClient } from '@prisma/client';
-import { assertSafeTestDatabaseReset, resetAndSeed } from './database-test-utils';
+import {
+  adminPrisma,
+  assertSafeTestDatabaseReset,
+  resetAndSeed,
+} from './database-test-utils';
 
 describe('test database safety', () => {
   it('accepts an explicit test environment and _test database', () => {
@@ -30,30 +33,43 @@ describe('test database safety', () => {
     expect((caught as Error).message).not.toContain('local-password');
   });
 
-  it('checks safety before issuing a destructive query', async () => {
-    const deleteMany = jest.fn();
-    const prisma = {
-      comment: { deleteMany },
-      postPublication: { deleteMany: jest.fn() },
-      socialAccount: { deleteMany: jest.fn() },
-      post: { deleteMany: jest.fn() },
-    } as unknown as PrismaClient;
-    const previousNodeEnv = process.env.NODE_ENV;
-    const previousDatabaseUrl = process.env.DATABASE_URL;
+  it('requires every configured database URL, not just one, to be a test database', () => {
+    const base = {
+      NODE_ENV: 'test',
+      DATABASE_URL: 'postgresql://api@localhost/app_test',
+      MIGRATION_DATABASE_URL: 'postgresql://owner@localhost/app_test',
+      WORKER_DATABASE_URL: 'postgresql://worker@localhost/app_test',
+    };
+    expect(() => assertSafeTestDatabaseReset(base)).not.toThrow();
+    for (const name of [
+      'DATABASE_URL',
+      'MIGRATION_DATABASE_URL',
+      'WORKER_DATABASE_URL',
+    ]) {
+      expect(() =>
+        assertSafeTestDatabaseReset({
+          ...base,
+          [name]: 'postgresql://x@localhost/app',
+        }),
+      ).toThrow('Refusing destructive test database');
+    }
+  });
+
+  it('checks safety before the administrative client is even created', async () => {
+    const previous = { ...process.env };
     process.env.NODE_ENV = 'production';
     process.env.DATABASE_URL =
       'postgresql://local-user:local-password@localhost/commentbridge';
+    process.env.MIGRATION_DATABASE_URL =
+      'postgresql://owner:owner-password@localhost/commentbridge';
 
     try {
-      await expect(resetAndSeed(prisma)).rejects.toThrow(
+      await expect(resetAndSeed()).rejects.toThrow(
         'Refusing destructive test database reset',
       );
-      expect(deleteMany).not.toHaveBeenCalled();
+      expect(() => adminPrisma()).toThrow('Refusing destructive test database reset');
     } finally {
-      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
-      else process.env.NODE_ENV = previousNodeEnv;
-      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
-      else process.env.DATABASE_URL = previousDatabaseUrl;
+      process.env = previous;
     }
   });
 });

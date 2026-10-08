@@ -1,0 +1,27 @@
+# Disposable PostgreSQL for the integration and E2E suites: published on the loopback
+# interface only, with an in-memory data directory that disappears with the container.
+#
+#   pnpm db:test:up      (docker compose -f docker-compose.test.yml --env-file .env.test.example ...)
+#
+# The password comes from .env.test.example, whose values are throwaway test values.
+
+name: commentbridge-test
+
+services:
+  postgres-test:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_TEST_ADMIN_PASSWORD:?Run this through pnpm db:test:up so .env.test.example is loaded}
+      POSTGRES_DB: commentbridge_test
+    ports:
+      - '127.0.0.1:${POSTGRES_TEST_PORT:-55433}:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d commentbridge_test']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+    restart: unless-stopped

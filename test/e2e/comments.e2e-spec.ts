@@ -11,11 +11,14 @@ import { DeliveryWorkerMetrics } from '../../src/comments/application/delivery-w
 import { DeliveryWorkerRuntime } from '../../src/comments/application/delivery-worker.runtime';
 import { ReplyDeliveryWorker } from '../../src/comments/application/reply-delivery.worker';
 import { ProblemDetailsFilter } from '../../src/common/errors/problem-details.filter';
-import { PrismaService } from '../../src/database/prisma.service';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
 import { WorkerModule } from '../../src/worker.module';
 import { SEED_IDS } from '../../prisma/seed';
-import { resetAndSeed } from '../database-test-utils';
+import {
+  adminPrisma,
+  disconnectAdminPrisma,
+  resetAndSeed,
+} from '../database-test-utils';
 
 const operatorAuth = `Bearer ${process.env.OPERATOR_API_KEYS?.split('=')[1] ?? ''}`;
 
@@ -47,7 +50,9 @@ describe('comments API (e2e)', () => {
     );
     app.useGlobalFilters(new ProblemDetailsFilter());
     await app.init();
-    prisma = apiModule.get(PrismaService);
+    // Fixtures use the schema owner; the API and worker modules under test connect
+    // with their own restricted roles.
+    prisma = adminPrisma();
     instagram = workerModule.get(MockInstagramAdapter);
     worker = workerModule.get(ReplyDeliveryWorker);
     workerRuntime = workerModule.get(DeliveryWorkerRuntime);
@@ -55,13 +60,14 @@ describe('comments API (e2e)', () => {
   });
 
   beforeEach(async () => {
-    await resetAndSeed(prisma);
+    await resetAndSeed();
     instagramReplySpy.mockClear();
   });
 
   afterAll(async () => {
     await workerModule.close();
     await app.close();
+    await disconnectAdminPrisma();
   });
 
   it('GET /api/v1/posts/:postId/comments returns a normalized page', async () => {

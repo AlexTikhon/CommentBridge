@@ -42,7 +42,7 @@ describe('loadDeliveryWorkerConfig', () => {
     expect(
       loadDeliveryWorkerConfig({
         DELIVERY_POLL_INTERVAL_MS: '250',
-        DELIVERY_LEASE_DURATION_MS: '5000',
+        DELIVERY_LEASE_DURATION_MS: '8000',
         DELIVERY_PROVIDER_TIMEOUT_MS: '2000',
         DELIVERY_MAX_ATTEMPTS: '3',
         DELIVERY_BASE_RETRY_DELAY_MS: '100',
@@ -54,7 +54,7 @@ describe('loadDeliveryWorkerConfig', () => {
       }),
     ).toEqual({
       pollIntervalMs: 250,
-      leaseDurationMs: 5_000,
+      leaseDurationMs: 8_000,
       providerTimeoutMs: 2_000,
       maxAttempts: 3,
       baseRetryDelayMs: 100,
@@ -93,6 +93,56 @@ describe('loadDeliveryWorkerConfig', () => {
         DELIVERY_PROVIDER_TIMEOUT_MS: '10000',
       }),
     ).toThrow(/DELIVERY_LEASE_DURATION_MS must be greater than/);
+  });
+
+  describe('lease coherence with the database budgets', () => {
+    // The lease must outlive the provider call AND the longest persistence step that
+    // can follow it. Otherwise a worker that is merely slow to record a delivery the
+    // provider accepted would be reconciled as UNKNOWN while it still owned the job.
+    it('requires the lease to exceed the provider timeout plus the transaction budget', () => {
+      expect(() =>
+        loadDeliveryWorkerConfig({
+          DELIVERY_PROVIDER_TIMEOUT_MS: '10000',
+          DB_TRANSACTION_TIMEOUT_MS: '5000',
+          DELIVERY_LEASE_DURATION_MS: '15000',
+        }),
+      ).toThrow(
+        /DELIVERY_LEASE_DURATION_MS must be greater than DELIVERY_PROVIDER_TIMEOUT_MS plus DB_TRANSACTION_TIMEOUT_MS/,
+      );
+      expect(
+        loadDeliveryWorkerConfig({
+          DELIVERY_PROVIDER_TIMEOUT_MS: '10000',
+          DB_TRANSACTION_TIMEOUT_MS: '5000',
+          DELIVERY_LEASE_DURATION_MS: '15001',
+        }).leaseDurationMs,
+      ).toBe(15_001);
+    });
+
+    it('accepts the defaults together', () => {
+      const config = loadDeliveryWorkerConfig({});
+      expect(config.leaseDurationMs).toBeGreaterThan(config.providerTimeoutMs + 5_000);
+    });
+
+    it('moves the minimum lease when the transaction budget is raised', () => {
+      expect(() =>
+        loadDeliveryWorkerConfig({
+          DB_TRANSACTION_TIMEOUT_MS: '30000',
+          DB_STATEMENT_TIMEOUT_MS: '5000',
+        }),
+      ).toThrow(/DELIVERY_LEASE_DURATION_MS must be greater than/);
+    });
+
+    it('reports invalid database budgets as an invalid delivery configuration', () => {
+      expect(() => loadDeliveryWorkerConfig({ DB_LOCK_TIMEOUT_MS: '0' })).toThrow(
+        InvalidDeliveryWorkerConfigError,
+      );
+      expect(() =>
+        loadDeliveryWorkerConfig({
+          DB_LOCK_TIMEOUT_MS: '9000',
+          DB_STATEMENT_TIMEOUT_MS: '5000',
+        }),
+      ).toThrow(/DB_LOCK_TIMEOUT_MS must be less than DB_STATEMENT_TIMEOUT_MS/);
+    });
   });
 
   it('requires the reconciliation quota to fit inside the tick budget', () => {

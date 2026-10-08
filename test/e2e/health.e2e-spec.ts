@@ -17,7 +17,11 @@ import { ProblemDetailsFilter } from '../../src/common/errors/problem-details.fi
 import { PrismaService } from '../../src/database/prisma.service';
 import { WorkerModule } from '../../src/worker.module';
 import { SEED_IDS } from '../../prisma/seed';
-import { resetAndSeed } from '../database-test-utils';
+import {
+  adminPrisma,
+  disconnectAdminPrisma,
+  resetAndSeed,
+} from '../database-test-utils';
 
 const operatorAuth = `Bearer ${process.env.OPERATOR_API_KEYS?.split('=')[1] ?? ''}`;
 
@@ -51,15 +55,18 @@ describe('health endpoints (e2e)', () => {
     );
     app.useGlobalFilters(new ProblemDetailsFilter());
     await app.init();
-    prisma = apiModule.get(PrismaService);
+    // Fixtures use the schema owner; the API and worker modules under test connect
+    // with their own restricted roles.
+    prisma = adminPrisma();
   });
 
   beforeEach(async () => {
-    await resetAndSeed(prisma);
+    await resetAndSeed();
   });
 
   afterAll(async () => {
     await app.close();
+    await disconnectAdminPrisma();
     if (previousGrace === undefined)
       delete process.env.DELIVERY_HEALTH_NO_WORKER_GRACE_MS;
     else process.env.DELIVERY_HEALTH_NO_WORKER_GRACE_MS = previousGrace;
@@ -113,7 +120,7 @@ describe('health endpoints (e2e)', () => {
 
     it('readiness answers 503 without leaking details when PostgreSQL fails, while liveness stays UP', async () => {
       const query = jest
-        .spyOn(prisma, '$queryRaw')
+        .spyOn(apiModule.get(PrismaService), 'checkConnection')
         .mockRejectedValue(new Error('postgresql://user:secret@db/app unreachable'));
       try {
         const notReady = await ready().expect(503);

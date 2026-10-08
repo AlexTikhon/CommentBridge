@@ -2,9 +2,13 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// `url` is what the API and worker connect with: a restricted runtime role.
+// `directUrl` is used by the Prisma CLI (migrate deploy) and must name a role that
+// owns the schema. The runtime never reads it.
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("MIGRATION_DATABASE_URL")
 }
 
 enum SocialPlatform {
@@ -104,6 +108,9 @@ model Comment {
   providerErrorCode String?
   remoteCreatedAt   DateTime?        @db.Timestamptz(3)
   createdAt         DateTime         @default(now()) @db.Timestamptz(3)
+  // Listing order. Set by a trigger at insertion (remoteCreatedAt, else createdAt) and
+  // immutable afterwards; the default only satisfies NOT NULL for inserts that omit it.
+  paginationAt      DateTime         @default(now()) @db.Timestamptz(3)
   updatedAt         DateTime         @updatedAt @db.Timestamptz(3)
   postPublication   PostPublication  @relation(fields: [postPublicationId], references: [id], onDelete: Cascade)
   parent            Comment?         @relation("CommentReplies", fields: [parentId, postPublicationId], references: [id, postPublicationId], onDelete: Restrict)
@@ -113,6 +120,8 @@ model Comment {
   @@unique([postPublicationId, externalCommentId])
   @@unique([parentId, idempotencyKey])
   @@unique([id, postPublicationId])
+  @@index([postPublicationId, paginationAt(sort: Desc), id(sort: Desc)])
+  @@index([parentId, paginationAt(sort: Desc), id(sort: Desc)])
 }
 
 model ReplyDelivery {

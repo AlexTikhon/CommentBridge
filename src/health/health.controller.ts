@@ -9,10 +9,18 @@ import type { Response } from 'express';
 import { PrismaService } from '../database/prisma.service';
 
 /**
- * Longer than any healthy `SELECT 1` and shorter than a typical orchestrator probe
- * timeout, so a hung connection pool reads as "not ready" instead of a probe that
- * times out on its own. The abandoned query is not cancelled; it finishes or fails
- * on its own and its result is ignored.
+ * How long PostgreSQL itself lets the readiness probe run. The server cancels the
+ * statement when this passes, so a stuck probe does not keep running in the
+ * background.
+ */
+export const READINESS_STATEMENT_BUDGET_MS = 1_500;
+
+/**
+ * How long a probe waits before answering "not ready". It exists only so the HTTP
+ * response is bounded when the pool cannot hand out a connection at all (nothing has
+ * reached the server to cancel). It is longer than the statement budget on purpose:
+ * a slow-but-alive database is cancelled by PostgreSQL first, and only an
+ * unreachable one is cut off here. It cancels nothing.
  */
 export const READINESS_TIMEOUT_MS = 2_000;
 
@@ -109,7 +117,9 @@ export class HealthController {
     });
     try {
       return await Promise.race([
-        this.prisma.$queryRaw`SELECT 1`.then(() => true as const),
+        this.prisma
+          .checkConnection(READINESS_STATEMENT_BUDGET_MS)
+          .then(() => true as const),
         timedOut,
       ]);
     } catch {

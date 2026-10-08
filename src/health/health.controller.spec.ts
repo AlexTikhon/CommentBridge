@@ -1,10 +1,14 @@
 import { HttpStatus } from '@nestjs/common';
 import type { Response } from 'express';
 import type { PrismaService } from '../database/prisma.service';
-import { HealthController, READINESS_TIMEOUT_MS } from './health.controller';
+import {
+  HealthController,
+  READINESS_STATEMENT_BUDGET_MS,
+  READINESS_TIMEOUT_MS,
+} from './health.controller';
 
 describe('HealthController', () => {
-  let queryRaw: jest.Mock;
+  let checkConnection: jest.Mock;
   let status: jest.Mock;
   let controller: HealthController;
 
@@ -12,10 +16,10 @@ describe('HealthController', () => {
 
   beforeEach(() => {
     jest.useFakeTimers();
-    queryRaw = jest.fn().mockResolvedValue([{ '?column?': 1 }]);
+    checkConnection = jest.fn().mockResolvedValue(undefined);
     status = jest.fn();
     controller = new HealthController({
-      $queryRaw: queryRaw,
+      checkConnection,
     } as unknown as PrismaService);
   });
   afterEach(() => jest.useRealTimers());
@@ -23,11 +27,11 @@ describe('HealthController', () => {
   describe('GET /health/live', () => {
     it('reports UP without touching the database', () => {
       expect(controller.live()).toEqual({ status: 'UP' });
-      expect(queryRaw).not.toHaveBeenCalled();
+      expect(checkConnection).not.toHaveBeenCalled();
     });
 
     it('does not depend on a hung or failing database at all', () => {
-      queryRaw.mockRejectedValue(new Error('down'));
+      checkConnection.mockRejectedValue(new Error('down'));
       expect(controller.live()).toEqual({ status: 'UP' });
     });
   });
@@ -39,11 +43,13 @@ describe('HealthController', () => {
         checks: { database: 'UP' },
       });
       expect(status).not.toHaveBeenCalled();
-      expect(queryRaw).toHaveBeenCalledTimes(1);
+      expect(checkConnection).toHaveBeenCalledTimes(1);
     });
 
     it('is NOT_READY with 503 when the query fails, and leaks nothing', async () => {
-      queryRaw.mockRejectedValue(new Error('postgresql://user:secret@db/app refused'));
+      checkConnection.mockRejectedValue(
+        new Error('postgresql://user:secret@db/app refused'),
+      );
 
       const body = await controller.ready(response());
 
@@ -53,7 +59,7 @@ describe('HealthController', () => {
     });
 
     it('gives up on a hung database instead of hanging the probe', async () => {
-      queryRaw.mockReturnValue(new Promise(() => undefined));
+      checkConnection.mockReturnValue(new Promise(() => undefined));
 
       const pending = controller.ready(response());
       await jest.advanceTimersByTimeAsync(READINESS_TIMEOUT_MS - 1);
@@ -72,10 +78,13 @@ describe('HealthController', () => {
       expect(jest.getTimerCount()).toBe(0);
     });
 
-    it('issues a single trivial statement, not a statistics query', async () => {
+    it('asks PostgreSQL to cancel its own probe, with a budget below the response bound', async () => {
       await controller.ready(response());
-      const [strings] = queryRaw.mock.calls[0] as [TemplateStringsArray];
-      expect(strings.join('').trim()).toBe('SELECT 1');
+      expect(checkConnection).toHaveBeenCalledTimes(1);
+      expect(checkConnection).toHaveBeenCalledWith(READINESS_STATEMENT_BUDGET_MS);
+      // The server gives up first, so the abandoned-query case the JavaScript timer
+      // cannot clean up only arises when the pool cannot hand out a connection.
+      expect(READINESS_STATEMENT_BUDGET_MS).toBeLessThan(READINESS_TIMEOUT_MS);
     });
   });
 
@@ -87,7 +96,7 @@ describe('HealthController', () => {
         database: 'up',
       });
 
-      queryRaw.mockRejectedValue(new Error('down'));
+      checkConnection.mockRejectedValue(new Error('down'));
       await expect(controller.check(response())).resolves.toEqual({
         status: 'not_ready',
         application: 'up',

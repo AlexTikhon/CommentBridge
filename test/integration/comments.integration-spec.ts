@@ -3,7 +3,6 @@ import {
   CommentDirection,
   DeliveryStatus,
   Prisma,
-  PrismaClient,
   ReplyDeliveryAttemptStatus,
   ReplyDeliveryManualActionType,
   ReplyDeliveryStatus,
@@ -20,20 +19,28 @@ import {
 } from '../../src/comments/domain/comment.types';
 import { PrismaCommentRepository } from '../../src/comments/infrastructure/prisma-comment.repository';
 import { PrismaReplyDeliveryRepository } from '../../src/comments/infrastructure/prisma-reply-delivery.repository';
-import type { PrismaService } from '../../src/database/prisma.service';
 import { PlatformAdapterRegistry } from '../../src/platforms/application/platform-adapter.registry';
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
 import { MockLinkedInAdapter } from '../../src/platforms/infrastructure/mock-linkedin.adapter';
 import { SEED_IDS } from '../../prisma/seed';
-import { resetAndSeed } from '../database-test-utils';
+import {
+  adminPrisma,
+  disconnectAdminPrisma,
+  resetAndSeed,
+  runtimePrismaService,
+} from '../database-test-utils';
 
 const workerNow = new Date('2100-01-01T00:00:00.000Z');
 
 describe('comments persistence integration', () => {
-  const prisma = new PrismaClient();
-  const prismaService = prisma as PrismaService;
-  const repository = new PrismaCommentRepository(prismaService);
-  const deliveryRepository = new PrismaReplyDeliveryRepository(prismaService);
+  // Fixtures and inspection use the schema owner; the code under test connects as
+  // the restricted role of the process that would run it in production.
+  const prisma = adminPrisma();
+  const apiService = runtimePrismaService('api');
+  const workerService = runtimePrismaService('worker');
+  const repository = new PrismaCommentRepository(apiService);
+  const apiDeliveryRepository = new PrismaReplyDeliveryRepository(apiService);
+  const deliveryRepository = new PrismaReplyDeliveryRepository(workerService);
   let instagram: MockInstagramAdapter;
   let deliverWithInstagram: MockInstagramAdapter['replyToComment'];
   let instagramReplySpy: jest.SpiedFunction<MockInstagramAdapter['replyToComment']>;
@@ -41,9 +48,15 @@ describe('comments persistence integration', () => {
   let deliveries: ReplyDeliveriesService;
   let worker: ReplyDeliveryWorker;
 
-  beforeAll(async () => prisma.$connect());
+  beforeAll(async () => {
+    await Promise.all([
+      prisma.$connect(),
+      apiService.$connect(),
+      workerService.$connect(),
+    ]);
+  });
   beforeEach(async () => {
-    await resetAndSeed(prisma);
+    await resetAndSeed();
     instagram = new MockInstagramAdapter();
     deliverWithInstagram = instagram.replyToComment.bind(instagram);
     instagramReplySpy = jest.spyOn(instagram, 'replyToComment');
@@ -52,7 +65,7 @@ describe('comments persistence integration', () => {
       new MockLinkedInAdapter(),
     ]);
     service = new CommentsService(repository, adapters);
-    deliveries = new ReplyDeliveriesService(deliveryRepository);
+    deliveries = new ReplyDeliveriesService(apiDeliveryRepository);
     worker = new ReplyDeliveryWorker(
       deliveryRepository,
       adapters,
@@ -60,7 +73,13 @@ describe('comments persistence integration', () => {
       new DeliveryWorkerMetrics(),
     );
   });
-  afterAll(async () => prisma.$disconnect());
+  afterAll(async () => {
+    await Promise.all([
+      apiService.$disconnect(),
+      workerService.$disconnect(),
+      disconnectAdminPrisma(),
+    ]);
+  });
 
   it('retrieves publications, filters by platform and parent, and counts replies', async () => {
     const all = await service.listComments({ postId: SEED_IDS.post, limit: 20 });
@@ -330,8 +349,8 @@ describe('comments persistence integration', () => {
       reason: 'Provider incident resolved.',
     };
     const results = await Promise.all([
-      deliveryRepository.retryFailed(accepted.reply.id, retryAt, manualAction),
-      deliveryRepository.retryFailed(accepted.reply.id, retryAt, manualAction),
+      apiDeliveryRepository.retryFailed(accepted.reply.id, retryAt, manualAction),
+      apiDeliveryRepository.retryFailed(accepted.reply.id, retryAt, manualAction),
     ]);
     expect(results.map((result) => result.outcome).sort()).toEqual([
       'COMPLETED',
@@ -383,8 +402,8 @@ describe('comments persistence integration', () => {
     };
 
     const results = await Promise.all([
-      deliveryRepository.deadLetter(accepted.reply.id, deadLetterAt, action),
-      deliveryRepository.deadLetter(accepted.reply.id, deadLetterAt, action),
+      apiDeliveryRepository.deadLetter(accepted.reply.id, deadLetterAt, action),
+      apiDeliveryRepository.deadLetter(accepted.reply.id, deadLetterAt, action),
     ]);
     expect(results.map((result) => result.outcome).sort()).toEqual([
       'COMPLETED',

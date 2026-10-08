@@ -20,7 +20,8 @@ without a parent.
 
 `createdAt` is local persistence time. `remoteCreatedAt` is the optional provider
 timestamp. The API exposes both instead of describing the local fallback as a
-remote publication time.
+remote publication time. Neither is the listing order: see _Cursor pagination and
+indexes_.
 
 ## Parent/publication invariant
 
@@ -50,12 +51,68 @@ required parent rule.
 
 ## Cursor pagination and indexes
 
-Keyset pagination orders by `COALESCE(remoteCreatedAt, createdAt)` and UUID. SQL
-expression indexes match the publication and parent query shapes; they remain in
-the migration because Prisma cannot represent expression indexes. Ordinary
-compound indexes over the separate timestamp columns were removed because they
-did not match the executed ordering expression. Required external-ID and
-idempotency uniqueness indexes remain.
+Keyset pagination orders by `paginationAt` and UUID, where `paginationAt` is a column
+persisted with the comment and never changed. It used to be `COALESCE(remoteCreatedAt,
+createdAt)`, which is not a stable sort key: a queued reply has no provider time and sorts by
+its local creation time, and when delivery succeeded the provider time was filled in and the
+same row moved. A client holding a cursor then saw that reply twice (it moved below the cursor)
+or never (it moved above it). Keyset pagination is only correct over a key that cannot change
+between requests, so the fix is the key, not the query.
+
+`paginationAt` is derived once, by a `BEFORE INSERT` trigger, as `COALESCE(remoteCreatedAt,
+createdAt)` of the inserted row, and any value a writer supplies is replaced. A second trigger
+rejects every update to it, for every role including the schema owner. A trigger rather than
+application code because several writers exist (the API, the seed, tests, a future importer) and
+the invariant has to hold for all of them. `remoteCreatedAt` stays provider metadata and is still
+written when delivery succeeds.
+
+Upgrade: the migration adds the column, backfills it with exactly the expression the old queries
+ordered by (so no existing row changes position), then makes it `NOT NULL` and installs the
+triggers. Cursors keep their shape and gain a version: new cursors carry `v: 2`, and cursors
+without `v` (issued before the upgrade) are accepted as the same position, because the backfill
+makes their timestamp equal to the stored column for every row that had not been delivered since.
+A cursor with any other version is rejected, so a future format change cannot be misread. Old
+instances during a rolling deploy keep working: the column has a default and the trigger fills it,
+so their inserts need not name it. They keep the old query, and so the old anomaly, until replaced.
+The migration holds locks on `Comment` while it backfills and builds indexes; the notes in the
+migration describe creating the indexes concurrently first on a large table.
+
+Indexes are ordinary b-trees on `(postPublicationId, paginationAt DESC, id DESC)` and
+`(parentId, paginationAt DESC, id DESC)`, which Prisma can now represent, so the SQL-only
+expression indexes on `COALESCE(...)` are dropped. Required external-ID and idempotency
+uniqueness indexes remain.
+
+### Selecting a page before counting its replies
+
+The original query joined every comment to its replies and grouped before applying `LIMIT`, so a
+page of 20 aggregated every reply of every matching comment. The statement now selects the
+`limit + 1` candidate comments first (visibility, platform and parent filters, cursor, ordering),
+then counts replies with one indexed lookup per candidate. Counting semantics are unchanged:
+replies are the comments whose `parentId` is the candidate in the same publication.
+
+Candidate selection has two shapes because the two listings seek different indexes. A whole-post
+listing takes the newest `limit + 1` rows of each published publication through `LATERAL` (an
+ordered index scan with `LIMIT` per publication) and keeps the newest overall. Joining comments to
+publications first leaves the planner free to read every comment of the post and sort them, which
+is what it chose. A thread listing (`parentId`) seeks the parent index directly; per-publication
+seeking there would rescan a large thread once for every publication that does not own it.
+
+Measured on 1,020,001 comments (identical data on the old and new schema, one old thread of
+100,000 replies, `EXPLAIN (ANALYZE, BUFFERS)`, warm cache, one machine):
+
+| Request                            | Before                   | After                  |
+| ---------------------------------- | ------------------------ | ---------------------- |
+| First page, whole post             | 1,482 ms, 3.15 M buffers | 0.4 ms, 88 buffers     |
+| First page, one platform           | 1,264 ms, 2.70 M buffers | 0.5 ms, 84 buffers     |
+| Deep page (cursor mid-history)     | 962 ms, 2.01 M buffers   | 0.5 ms, 88 buffers     |
+| Thread of the 100,000-reply parent | 147 ms, 302 k buffers    | 0.3 ms, 73 buffers     |
+| Page containing that parent itself | 42 ms, 17.9 k buffers    | 17.5 ms, 3.1 k buffers |
+
+The last row is the honest floor: counting a parent's 100,000 replies is inherent in returning its
+`replyCount`, and it is paid only on pages that contain that parent. Absolute times depend on the
+machine; the buffer counts and rows read do not. The regression suite therefore asserts rows read
+from a 50,000-comment fixture with a 20,000-reply thread (at most `publications x (limit + 1)` comment
+rows and a handful of reply rows per page), never elapsed time.
 
 ## Platform adapters
 
@@ -120,10 +177,19 @@ misclassified and the returned count is exact. The migration assigns tokens to a
 in-flight `PROCESSING` rows without touching their status or expiry; they can only
 end by expiring into `UNKNOWN`.
 
-Scheduling reserves a bounded share of each drain for `UNKNOWN` reconciliation
-rather than strict priority, trading a little reconciliation latency for the
-guarantee that fresh replies are never starved. Completion timestamps come from the
-worker's clock, not from hidden `new Date()` calls in the repository.
+Scheduling guarantees progress for both queues under every configuration validation accepts.
+Reconciliation originally ran first up to `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` and normal
+delivery got the remainder, but the configuration also allowed the quota to equal the whole
+per-tick budget, which left the remainder at zero: a continuously due `UNKNOWN` backlog then
+consumed every slot and fresh replies were never claimed. Rejecting that combination would have
+broken existing deployments for no gain, so it is accepted and made safe. With two or more slots,
+normal delivery always keeps one: reconciliation is capped at the smaller of its quota and
+(slots - 1). With a single slot the two queues take alternate drains, reconciliation first, and
+the turn passes to the queue that was not served; a drain that served nothing or failed leaves it
+unchanged, so a transient claim error does not skip a queue's turn. In both modes a slot a queue
+does not use goes to the other, so an idle queue never wastes capacity. The turn is process-local
+state: several workers each alternate on their own, which only improves the mix. Completion
+timestamps come from the worker's clock, not from hidden `new Date()` calls in the repository.
 
 ## Worker observability
 
@@ -230,8 +296,11 @@ how an infrastructure blip becomes an outage.
   restart every healthy API instance during exactly the moment restarts can't help, and
   the pool reconnects would then land on a database that is trying to recover.
 - **Readiness** (`/health/ready`) asks whether this instance should receive traffic. The
-  API cannot serve without PostgreSQL, so it runs `SELECT 1`, bounded to 2 seconds so a
-  hung pool reads as "not ready" instead of a probe timeout. It deliberately runs no queue
+  API cannot serve without PostgreSQL, so it runs `SELECT 1` under a `SET LOCAL` statement budget of
+  1.5 seconds, enforced by PostgreSQL, so a slow database reads as "not ready" and its statement is
+  cancelled rather than abandoned. A 2-second `Promise.race` remains only to bound the HTTP response
+  when the pool cannot hand out a connection at all; it cancels nothing and is not described as
+  doing so. It deliberately runs no queue
   statistics: probes fire every few seconds on every instance. The pre-existing `/health`
   was already this check (same query, `503` on failure, used by the Compose healthcheck),
   so it keeps its body and status codes untouched instead of being redefined.
@@ -308,10 +377,108 @@ class-validator details are retained where useful. Unexpected exceptions become 
 safe 500. Responses never include stack traces or raw framework, database, or
 provider details, and every problem includes a correlation ID.
 
+## Database roles and the deployment boundary
+
+Three things were wrong at the database boundary: the development port was published on every
+interface, the credentials were literals in the compose file, and migrations, the API and the
+worker all ran as the PostgreSQL superuser. Anything that could run SQL through the API could drop
+the schema or read the other process's secrets.
+
+- **Network.** Development databases publish only on `127.0.0.1`. The application stack is its own
+  compose file (`docker-compose.app.yml`) and publishes no database port at all; the test database
+  has its own file for the same reason Compose interpolates every service: one file with required
+  variables for services you are not starting cannot be used selectively. Local URLs use
+  `127.0.0.1` because on Windows `localhost` resolves to `::1` first and a loopback-only listener
+  makes every new connection wait for the fallback.
+- **Credentials.** No compose file contains a credential; each required password is an interpolation
+  that fails the command when it is missing. `.env.example` has empty secrets. The only committed
+  passwords are in `.env.test.example`, for a throwaway in-memory test database on loopback, and are
+  labelled as such.
+- **Ownership.** The schema owner (the bootstrap `postgres` role in Compose; in a managed database,
+  a dedicated owner role) runs migrations, provisions roles and seeds, through
+  `MIGRATION_DATABASE_URL`, which Prisma reads as `directUrl`. The API and worker connect as
+  `commentbridge_api` and `commentbridge_worker` through `DATABASE_URL` (the worker prefers
+  `WORKER_DATABASE_URL`, so one `.env` can hold both; a container just sets its own
+  `DATABASE_URL`). The runtime never reads the owner URL, and `prisma migrate deploy` refuses to
+  run without it, so a runtime URL cannot migrate by accident.
+- **Two roles, not one.** The API writes comments and deliveries and appends audit rows but never
+  deletes; the worker completes deliveries, writes attempts and heartbeats and prunes history but
+  cannot create comments or deliveries. Their union is much wider than either, and the split costs
+  one table in a migration. Grants are per table, written next to the schema in a migration and
+  repeated in a test that fails when a table is not decided.
+- **Passwords.** A migration cannot carry a secret, so it creates the roles `NOLOGIN` and a separate
+  idempotent command (`pnpm db:provision-roles`) sets login and password from the environment, which
+  doubles as rotation. It refuses short, placeholder or identical passwords. A DBA who pre-creates
+  the roles is supported: they are reused and their attributes normalised.
+- **Immutable audit rows.** Retention locks audit rows with `FOR UPDATE`, which PostgreSQL authorises
+  as `UPDATE`, so the worker needs that privilege on `ReplyDeliveryManualAction`. A trigger rejects
+  every update of those rows so the privilege cannot be used to alter the audit trail.
+- **No temporary objects either.** `TEMPORARY` on the database is revoked from `PUBLIC` and `CREATE` on
+  the schema from `PUBLIC`, so "cannot create a table" holds for temporary tables too.
+
+Residual risk, accepted and documented: a role can always change its own password in PostgreSQL. A
+compromised runtime role can lock itself out, not widen itself; re-running the provisioning command
+restores it. This was found by the privilege test, which at first expected that statement to fail.
+Operations that need the owner (migrations, role provisioning, seeding) are separate commands and a
+separate container, so the runtime images never hold the owner's password.
+
+Moving to roles surfaced test assumptions as well: several fixtures wrote through the same client
+that was under test. Fixtures and resets now use the owner and the code under test uses the role its
+process uses in production, so every integration and E2E suite doubles as a check of the privilege
+matrix.
+
+## Database execution budgets
+
+The supplied database configuration had no statement or lock timeout, so one stuck lock or runaway
+statement could hold a worker or API connection indefinitely, and readiness used `Promise.race`,
+which stops waiting without stopping the query. A timeout on the client side is a statement about the
+caller's patience, not about the database's work.
+
+- **Where the budget lives.** `statement_timeout`, `lock_timeout` and
+  `idle_in_transaction_session_timeout` are passed as connection startup parameters
+  (`options=-c ...`) on the runtime URL. The server applies them to every connection the pool opens,
+  including reconnects, to raw queries and to interactive transactions alike; there is no code path
+  that can forget them. Defaults are 5 s statement, 2 s lock, 5 s transaction, configurable with
+  `DB_*_MS` and validated at startup (lock < statement <= transaction, all positive and finite).
+- **A second ceiling in the database.** Each runtime role also has role-level timeouts (30 s
+  statement, 10 s lock, 60 s idle in transaction), so a session of those credentials that sets nothing
+  (a person with `psql`) is still bounded. Startup parameters override them, so the application values
+  are the tighter ones.
+- **Readiness.** The probe runs `SELECT 1` in a transaction after `set_config('statement_timeout', ...,
+true)` (`SET LOCAL`), so the tighter budget ends with the transaction and never leaks to the next user
+  of a pooled connection. The server cancels the statement on expiry, which a test verifies by looking
+  at `pg_stat_activity` afterwards. The 2 s `Promise.race` stays only as a response bound for the case
+  where no connection can be obtained; it is documented as cancelling nothing.
+- **Coherence with delivery.** A delivery has three time scales: the provider call, the transaction that
+  records its outcome, and the lease that keeps other workers away meanwhile. The lease must outlive the
+  first two, so `DELIVERY_LEASE_DURATION_MS` must exceed `DELIVERY_PROVIDER_TIMEOUT_MS` plus
+  `DB_TRANSACTION_TIMEOUT_MS`, validated at startup. Defaults satisfy it (30 s > 10 s + 5 s). Upgrade
+  note: a deployment with a lease between the provider timeout and that sum now fails fast at startup
+  instead of being able to lose its lease while still recording a result.
+- **Ambiguity is preserved.** If the provider accepts a reply and recording it fails (here, a lock
+  budget expires), the transaction rolls back as a whole, the job stays `PROCESSING`, and lease expiry
+  moves it to `UNKNOWN`, where provider lookup finds the reply. A test holds a lock on the comment row
+  to force exactly this and asserts the provider was called once.
+- **Maintenance must not block work.** The expired-lease sweep updates rows and therefore waits for
+  locks, while claims skip locked rows. A sweep that fails on a lock is logged
+  (`delivery.lease-sweep-failed`) and the drain carries on, so one locked row cannot stall all
+  delivery; the next drain retries. The cost is that a lock held indefinitely is visible only through
+  that log line and the age of `UNKNOWN` work in operational health.
+- **Shutdown.** Stopping waits for the drain, retention batch and heartbeat in flight. Each is now
+  bounded by the budgets, so shutdown takes about one lock budget instead of as long as the lock is held; a test blocks a drain on a held lock and checks shutdown
+  completes within the lock budget, nothing is left waiting server-side, and the connection closes.
+  Retention uses `SKIP LOCKED` and cannot block on locks, so only the statement budget applies to it.
+
+Not done: a pool-wait timeout (`pool_timeout`) and a cap on pool size were left at Prisma's defaults;
+they bound connection acquisition rather than database work and are better chosen with real load
+figures.
+
 ## Test database safety
 
-Integration and E2E suites target a dedicated Compose database named
-`commentbridge_test`. Destructive setup checks `NODE_ENV=test` and the `_test`
-database suffix before issuing any delete. Both conditions are required, and the
-failure message does not echo the connection URL. The test container uses a
-disposable in-memory filesystem to keep this protection simple and local.
+Integration and E2E suites target a dedicated compose database named `commentbridge_test`. Destructive
+helpers require `NODE_ENV=test` and that **every** configured database URL (runtime, worker and owner)
+names a database ending in `_test`; one unsafe URL among the three is enough to refuse. The failure
+message does not echo any URL. The container uses a disposable in-memory filesystem and loopback-only
+binding, and its throwaway passwords are the only credentials committed to the repository. Machine-
+specific overrides go in a git-ignored `.env.test.local`, loaded after the committed file, so a busy
+port never requires editing tracked files.

@@ -18,6 +18,23 @@ import { closeOnSignals } from './worker';
 const compile = (module: unknown): Promise<TestingModule> =>
   Test.createTestingModule({ imports: [module as never] }).compile();
 
+// Compiling the modules builds the database client, whose settings are validated at
+// startup. Nothing connects, so the URL only has to parse.
+const previousUrls = {
+  DATABASE_URL: process.env.DATABASE_URL,
+  WORKER_DATABASE_URL: process.env.WORKER_DATABASE_URL,
+};
+beforeAll(() => {
+  process.env.DATABASE_URL = 'postgresql://unused:unused@127.0.0.1:1/unused';
+  delete process.env.WORKER_DATABASE_URL;
+});
+afterAll(() => {
+  for (const [name, value] of Object.entries(previousUrls)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+});
+
 describe('WorkerModule', () => {
   it('provides what the delivery worker needs', async () => {
     const moduleRef = await compile(WorkerModule);
