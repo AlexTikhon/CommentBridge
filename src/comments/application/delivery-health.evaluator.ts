@@ -2,7 +2,8 @@ import type { DeliveryWorkerConfig } from './delivery-worker.config';
 
 export type HealthStatus = 'HEALTHY' | 'DEGRADED' | 'CRITICAL';
 export type HealthIssueSeverity = 'DEGRADED' | 'CRITICAL';
-export type HealthSignalName = 'workers' | 'queue' | 'unknown' | 'retention';
+export type HealthSignalName =
+  'workers' | 'queue' | 'unknown' | 'expiredLeases' | 'retention';
 
 /**
  * Stable, machine-readable identifiers. Severity travels beside the code rather
@@ -13,6 +14,7 @@ export type DeliveryHealthIssueCode =
   | 'NO_ACTIVE_WORKER'
   | 'QUEUE_LAG'
   | 'UNKNOWN_AGE'
+  | 'EXPIRED_LEASE_AGE'
   | 'RETENTION_OVERDUE'
   | 'RETENTION_RECENT_FAILURE';
 
@@ -50,6 +52,13 @@ export interface DeliveryHealthInput {
     /** When the oldest still-unresolved UNKNOWN outcome began; null when none. */
     oldestSince: Date | null;
   };
+  expiredLeases: {
+    /**
+     * Oldest `leaseUntil` among PROCESSING deliveries already past it at `now`; null
+     * when none has expired. A live lease, or one ending exactly now, is not here.
+     */
+    oldestLeaseUntil: Date | null;
+  };
   retention: {
     /** Latest successful run across all retained worker rows. */
     lastSucceededAt: Date | null;
@@ -79,6 +88,13 @@ export interface DeliveryHealth {
       status: HealthStatus;
       count: number;
       oldestAgeMs: number | null;
+      warnAfterMs: number;
+      criticalAfterMs: number;
+    };
+    expiredLeases: {
+      status: HealthStatus;
+      /** Now minus the oldest expired `leaseUntil`; null when nothing has expired. */
+      oldestExpiredAgeMs: number | null;
       warnAfterMs: number;
       criticalAfterMs: number;
     };
@@ -188,6 +204,31 @@ export function evaluateDeliveryHealth(
       : 'An UNKNOWN delivery has been unresolved past the warning age',
   );
 
+  // Expired leases: how long the oldest PROCESSING delivery has been past its lease.
+  // Recovery normally moves such a delivery to UNKNOWN within a poll or two, so one
+  // that stays expired is a delivery recovery cannot take (a lock that stays held,
+  // for example) and would otherwise be invisible: it is not queued, not UNKNOWN, and
+  // not late. The exact count stays on the stats endpoint.
+  const expiredAge = input.expiredLeases.oldestLeaseUntil
+    ? ageMs(input.expiredLeases.oldestLeaseUntil, now)
+    : null;
+  const expiredStatus =
+    expiredAge === null
+      ? 'HEALTHY'
+      : bySeverity(
+          expiredAge,
+          thresholds.expiredLeaseAgeWarnMs,
+          thresholds.expiredLeaseAgeCriticalMs,
+        );
+  report(
+    expiredStatus,
+    'EXPIRED_LEASE_AGE',
+    'expiredLeases',
+    expiredStatus === 'CRITICAL'
+      ? 'A delivery lease has stayed expired past the critical age'
+      : 'A delivery lease has stayed expired past the warning age',
+  );
+
   // Retention. A worker runs it immediately at startup, so a worker that has been
   // up for the whole window without a success is overdue; a younger one is not.
   const { retention } = config;
@@ -218,7 +259,13 @@ export function evaluateDeliveryHealth(
   }
 
   return {
-    status: worst([workersStatus, queueStatus, unknownStatus, retentionStatus]),
+    status: worst([
+      workersStatus,
+      queueStatus,
+      unknownStatus,
+      expiredStatus,
+      retentionStatus,
+    ]),
     evaluatedAt: now,
     signals: {
       workers: {
@@ -240,6 +287,12 @@ export function evaluateDeliveryHealth(
         oldestAgeMs: unknownAge,
         warnAfterMs: thresholds.unknownAgeWarnMs,
         criticalAfterMs: thresholds.unknownAgeCriticalMs,
+      },
+      expiredLeases: {
+        status: expiredStatus,
+        oldestExpiredAgeMs: expiredAge,
+        warnAfterMs: thresholds.expiredLeaseAgeWarnMs,
+        criticalAfterMs: thresholds.expiredLeaseAgeCriticalMs,
       },
       retention: {
         status: retentionStatus,

@@ -34,6 +34,8 @@ describe('loadDeliveryWorkerConfig', () => {
         queueLagCriticalMs: 300_000,
         unknownAgeWarnMs: 300_000,
         unknownAgeCriticalMs: 1_800_000,
+        expiredLeaseAgeWarnMs: 60_000,
+        expiredLeaseAgeCriticalMs: 300_000,
         retentionOverdueMultiplier: 3,
       },
     });
@@ -337,6 +339,8 @@ describe('loadDeliveryWorkerConfig health settings', () => {
         DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS: '2000',
         DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS: '3000',
         DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS: '4000',
+        DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS: '5000',
+        DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS: '6000',
         DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER: '1.5',
       }).health,
     ).toEqual({
@@ -346,6 +350,8 @@ describe('loadDeliveryWorkerConfig health settings', () => {
       queueLagCriticalMs: 2_000,
       unknownAgeWarnMs: 3_000,
       unknownAgeCriticalMs: 4_000,
+      expiredLeaseAgeWarnMs: 5_000,
+      expiredLeaseAgeCriticalMs: 6_000,
       retentionOverdueMultiplier: 1.5,
     });
   });
@@ -355,6 +361,11 @@ describe('loadDeliveryWorkerConfig health settings', () => {
     ['DELIVERY_HEALTH_QUEUE_LAG_WARN_MS', '-5'],
     ['DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS', 'soon'],
     ['DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS', '1.5'],
+    ['DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS', '0'],
+    ['DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS', '-1'],
+    ['DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS', '1.5'],
+    ['DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS', '0'],
+    ['DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS', 'soon'],
     ['DELIVERY_HEALTH_NO_WORKER_GRACE_MS', '-1'],
     ['DELIVERY_HEALTH_NO_WORKER_GRACE_MS', 'abc'],
     ['DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER', 'many'],
@@ -397,6 +408,35 @@ describe('loadDeliveryWorkerConfig health settings', () => {
     ).toThrow(
       /DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS must be greater than DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS/,
     );
+  });
+
+  it('defaults the expired-lease thresholds to 60 s and 5 min', () => {
+    expect(loadDeliveryWorkerConfig({}).health).toMatchObject({
+      expiredLeaseAgeWarnMs: 60_000,
+      expiredLeaseAgeCriticalMs: 300_000,
+    });
+  });
+
+  it('requires the critical expired-lease age to exceed the warning threshold', () => {
+    const env = {
+      DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS: '7000',
+      DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS: '7000',
+    };
+    expect(() => loadDeliveryWorkerConfig(env)).toThrow(
+      /DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS must be greater than DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS/,
+    );
+    expect(
+      loadDeliveryWorkerConfig({
+        ...env,
+        DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS: '7001',
+      }).health.expiredLeaseAgeCriticalMs,
+    ).toBe(7_001);
+  });
+
+  it('checks a lone expired-lease warning override against the default critical threshold', () => {
+    expect(() =>
+      loadDeliveryWorkerConfig({ DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS: '300000' }),
+    ).toThrow(/DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS must be greater than/);
   });
 
   it('requires an overdue multiplier above 1 so a single interval is never overdue', () => {

@@ -212,11 +212,11 @@ blind redelivery.
 The expired-lease sweep skips rows that another transaction has locked (the delivery, or the
 attempt it would close) instead of waiting for them, exactly as claims do, so one locked row
 cannot fail the recovery of unrelated leases. A skipped lease is recovered by a later drain;
-a lock that stays held shows up as that delivery's age in operational health and in
-`expiredLeases` of the queue snapshot. Operations that must wait for a row, such as a worker
-recording a completion or an operator action, still fail after `DB_LOCK_TIMEOUT_MS`. If the
-sweep fails for another reason (statement budget, connection) the drain logs
-`delivery.lease-sweep-failed` and carries on; the next drain retries it.
+a lock that stays held shows up as that delivery's age (`EXPIRED_LEASE_AGE`) in operational
+health and as the count `expiredLeases` of the queue snapshot. Operations that must wait for
+a row, such as a worker recording a completion or an operator action, still fail after
+`DB_LOCK_TIMEOUT_MS`. If the sweep fails for another reason (statement budget, connection)
+the drain logs `delivery.lease-sweep-failed` and carries on; the next drain retries it.
 
 ## Quick start
 
@@ -492,7 +492,8 @@ endpoints.
   (`oldestDueDeliveryAgeMs`) and the oldest due `UNKNOWN` delivery
   (`oldestDueReconciliationAgeMs`) have waited, and `expiredLeases`, the
   `PROCESSING` rows past their lease that maintenance has not yet reconciled.
-  Rising lag or a persistent `expiredLeases` means workers are down or behind.
+  Rising lag or a persistent `expiredLeases` means workers are down or behind;
+  `GET /api/v1/deliveries/health` turns the oldest of them into an age with thresholds.
 - `workers`: the state of every worker process, shared through the
   `DeliveryWorkerInstance` table. Worker counters used to live in the memory of the
   process serving the request; once the worker became its own process the API could
@@ -615,7 +616,7 @@ operational endpoint below.
 `GET /api/v1/deliveries/health` answers "is delivery actually working?", which can be
 false while the API is perfectly ready. It needs an operator API key (it is not public)
 and reports a deterministic `HEALTHY` / `DEGRADED` / `CRITICAL` status: the worst of
-four signals, with no scores or weights. Every non-healthy state lists the issues that
+five signals, with no scores or weights. Every non-healthy state lists the issues that
 caused it.
 
 ```json
@@ -642,6 +643,12 @@ caused it.
       "oldestAgeMs": null,
       "warnAfterMs": 300000,
       "criticalAfterMs": 1800000
+    },
+    "expiredLeases": {
+      "status": "HEALTHY",
+      "oldestExpiredAgeMs": null,
+      "warnAfterMs": 60000,
+      "criticalAfterMs": 300000
     },
     "retention": {
       "status": "HEALTHY",
@@ -679,13 +686,14 @@ turned into an empty, healthy-looking result.
 **Stable issue codes.** Match on `code`; `message` is for humans. Severity is a separate
 field, so there is one code per condition.
 
-| Code                       | Signal      | Raised when                                                                              | Severity                                     |
-| -------------------------- | ----------- | ---------------------------------------------------------------------------------------- | -------------------------------------------- |
-| `NO_ACTIVE_WORKER`         | `workers`   | No worker heartbeat within `DELIVERY_WORKER_STALE_AFTER_MS` (and workers are required)   | `DEGRADED` inside the grace, then `CRITICAL` |
-| `QUEUE_LAG`                | `queue`     | Oldest _due_ `PENDING`/`RETRY` delivery waited ≥ warn / ≥ critical                       | `DEGRADED` / `CRITICAL`                      |
-| `UNKNOWN_AGE`              | `unknown`   | Oldest unresolved `UNKNOWN` outcome is ≥ warn / ≥ critical old                           | `DEGRADED` / `CRITICAL`                      |
-| `RETENTION_OVERDUE`        | `retention` | No successful retention run for ≥ interval × multiplier                                  | `DEGRADED`                                   |
-| `RETENTION_RECENT_FAILURE` | `retention` | The latest retention outcome (across workers) is a failure newer than the latest success | `DEGRADED`                                   |
+| Code                       | Signal          | Raised when                                                                              | Severity                                     |
+| -------------------------- | --------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `NO_ACTIVE_WORKER`         | `workers`       | No worker heartbeat within `DELIVERY_WORKER_STALE_AFTER_MS` (and workers are required)   | `DEGRADED` inside the grace, then `CRITICAL` |
+| `QUEUE_LAG`                | `queue`         | Oldest _due_ `PENDING`/`RETRY` delivery waited ≥ warn / ≥ critical                       | `DEGRADED` / `CRITICAL`                      |
+| `UNKNOWN_AGE`              | `unknown`       | Oldest unresolved `UNKNOWN` outcome is ≥ warn / ≥ critical old                           | `DEGRADED` / `CRITICAL`                      |
+| `EXPIRED_LEASE_AGE`        | `expiredLeases` | Oldest `PROCESSING` delivery is ≥ warn / ≥ critical past its `leaseUntil`                | `DEGRADED` / `CRITICAL`                      |
+| `RETENTION_OVERDUE`        | `retention`     | No successful retention run for ≥ interval × multiplier                                  | `DEGRADED`                                   |
+| `RETENTION_RECENT_FAILURE` | `retention`     | The latest retention outcome (across workers) is a failure newer than the latest success | `DEGRADED`                                   |
 
 Every threshold is inclusive: a value equal to the threshold already has that severity.
 
@@ -719,21 +727,37 @@ Every threshold is inclusive: a value equal to the threshold already has that se
   worker. With no success at all, a worker that has been up for the whole overdue window
   counts as overdue; a younger one does not, because retention runs immediately at worker
   start. Nothing is reported when retention is disabled.
+- **Expired leases.** `now − min(leaseUntil)` over `PROCESSING` rows whose
+  `leaseUntil < now`; a lease that ends exactly now is not expired, matching the
+  recovery statement. Recovery normally moves an expired lease to `UNKNOWN` within a
+  poll or two, so a lease that stays expired is one recovery cannot take: its delivery
+  row (or current attempt) is locked by a transaction that never finishes, or its
+  current attempt row is missing, which the recovery join cannot match. Until it is
+  recovered such a delivery is not queued, not `UNKNOWN` and not late, so none of the
+  other signals sees it. The read takes no row locks and does not join the attempt, so
+  it sees exactly the rows recovery skips, and it is a single index probe on
+  `(status, leaseUntil)` (3 to 5 buffers whether the table holds ten rows or 300,000
+  settled ones, and whether five leases are expired or 30,000). Recovery or completion
+  removes the row from the set and the signal clears on the next evaluation. There is
+  deliberately no count here: `expiredLeases` on `GET /api/v1/deliveries/stats` already
+  has it, and age is what pages someone.
 
 **Lease-loss rate is deliberately not a signal.** `LEASE_LOST` outcomes exist only in
 per-process counters and in each worker's single most recent drain; neither can answer
 "how many in the last N minutes, cluster-wide" without a new event table. That is more
 infrastructure than this task warrants, so lease loss stays a logged metric.
 
-| Variable                                       | Default   | Meaning                                                         |
-| ---------------------------------------------- | --------- | --------------------------------------------------------------- |
-| `DELIVERY_HEALTH_WORKER_REQUIRED`              | `true`    | `false` stops "no worker" being an issue                        |
-| `DELIVERY_HEALTH_NO_WORKER_GRACE_MS`           | `60000`   | Time with no worker before `DEGRADED` becomes `CRITICAL` (0 ok) |
-| `DELIVERY_HEALTH_QUEUE_LAG_WARN_MS`            | `60000`   | Oldest due delivery age that is `DEGRADED`                      |
-| `DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS`        | `300000`  | Oldest due delivery age that is `CRITICAL` (above warn)         |
-| `DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS`          | `300000`  | Oldest unresolved `UNKNOWN` age that is `DEGRADED`              |
-| `DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS`      | `1800000` | Oldest unresolved `UNKNOWN` age that is `CRITICAL` (above warn) |
-| `DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER` | `3`       | Overdue after this many retention intervals (greater than 1)    |
+| Variable                                        | Default   | Meaning                                                               |
+| ----------------------------------------------- | --------- | --------------------------------------------------------------------- |
+| `DELIVERY_HEALTH_WORKER_REQUIRED`               | `true`    | `false` stops "no worker" being an issue                              |
+| `DELIVERY_HEALTH_NO_WORKER_GRACE_MS`            | `60000`   | Time with no worker before `DEGRADED` becomes `CRITICAL` (0 ok)       |
+| `DELIVERY_HEALTH_QUEUE_LAG_WARN_MS`             | `60000`   | Oldest due delivery age that is `DEGRADED`                            |
+| `DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS`         | `300000`  | Oldest due delivery age that is `CRITICAL` (above warn)               |
+| `DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS`           | `300000`  | Oldest unresolved `UNKNOWN` age that is `DEGRADED`                    |
+| `DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS`       | `1800000` | Oldest unresolved `UNKNOWN` age that is `CRITICAL` (above warn)       |
+| `DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS`     | `60000`   | Oldest expired `PROCESSING` lease age that is `DEGRADED`              |
+| `DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS` | `300000`  | Oldest expired `PROCESSING` lease age that is `CRITICAL` (above warn) |
+| `DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER`  | `3`       | Overdue after this many retention intervals (greater than 1)          |
 
 Everything else is intentionally fixed: the readiness query timeout (2 s) and the 24-hour
 worker-row window the stale/retained logic already used. Invalid or inconsistent values

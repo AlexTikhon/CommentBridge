@@ -12,6 +12,7 @@ const ISSUE_CODES = [
   'NO_ACTIVE_WORKER',
   'QUEUE_LAG',
   'UNKNOWN_AGE',
+  'EXPIRED_LEASE_AGE',
   'RETENTION_OVERDUE',
   'RETENTION_RECENT_FAILURE',
 ] as const;
@@ -82,6 +83,28 @@ export class UnknownHealthSignalDto {
   criticalAfterMs!: number;
 }
 
+export class ExpiredLeaseHealthSignalDto {
+  @ApiProperty({ enum: STATUSES })
+  status!: HealthStatus;
+
+  @ApiProperty({
+    nullable: true,
+    description:
+      'How long the oldest PROCESSING delivery has been past its lease expiry (evaluation time minus leaseUntil). Null when no lease has expired. The exact count is expiredLeases on GET /api/v1/deliveries/stats.',
+  })
+  oldestExpiredAgeMs!: number | null;
+
+  @ApiProperty({
+    description: 'Age at which this signal becomes DEGRADED (inclusive).',
+  })
+  warnAfterMs!: number;
+
+  @ApiProperty({
+    description: 'Age at which this signal becomes CRITICAL (inclusive).',
+  })
+  criticalAfterMs!: number;
+}
+
 export class RetentionHealthSignalDto {
   @ApiProperty({ enum: STATUSES })
   status!: HealthStatus;
@@ -121,6 +144,9 @@ export class DeliveryHealthSignalsDto {
   @ApiProperty({ type: UnknownHealthSignalDto })
   unknown!: UnknownHealthSignalDto;
 
+  @ApiProperty({ type: ExpiredLeaseHealthSignalDto })
+  expiredLeases!: ExpiredLeaseHealthSignalDto;
+
   @ApiProperty({ type: RetentionHealthSignalDto })
   retention!: RetentionHealthSignalDto;
 }
@@ -135,7 +161,9 @@ export class DeliveryHealthIssueDto {
   @ApiProperty({ enum: ['DEGRADED', 'CRITICAL'] })
   severity!: HealthIssueSeverity;
 
-  @ApiProperty({ enum: ['workers', 'queue', 'unknown', 'retention'] })
+  @ApiProperty({
+    enum: ['workers', 'queue', 'unknown', 'expiredLeases', 'retention'],
+  })
   signal!: HealthSignalName;
 
   @ApiProperty({ description: 'Short human-readable text; match on code, not this.' })
@@ -164,7 +192,7 @@ const iso = (date: Date | null): string | null => (date ? date.toISOString() : n
 export function toDeliveryHealthResponse(
   health: DeliveryHealth,
 ): DeliveryHealthResponseDto {
-  const { workers, queue, unknown, retention } = health.signals;
+  const { workers, queue, unknown, expiredLeases, retention } = health.signals;
   return {
     status: health.status,
     evaluatedAt: health.evaluatedAt.toISOString(),
@@ -172,6 +200,7 @@ export function toDeliveryHealthResponse(
       workers: { ...workers, lastHeartbeatAt: iso(workers.lastHeartbeatAt) },
       queue: { ...queue },
       unknown: { ...unknown },
+      expiredLeases: { ...expiredLeases },
       retention: {
         ...retention,
         lastSuccessAt: iso(retention.lastSuccessAt),

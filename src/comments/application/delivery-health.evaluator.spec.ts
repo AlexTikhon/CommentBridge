@@ -11,6 +11,8 @@ const config = loadDeliveryWorkerConfig({
   DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS: '300000',
   DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS: '300000',
   DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS: '1800000',
+  DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS: '60000',
+  DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS: '300000',
   DELIVERY_RETENTION_INTERVAL_MS: '3600000',
   DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER: '3',
 });
@@ -34,6 +36,7 @@ function healthyInput(
     },
     queue: { oldestDueAt: null },
     unknown: { count: 0, oldestSince: null },
+    expiredLeases: { oldestLeaseUntil: null },
     retention: {
       lastSucceededAt: ago(10 * 60_000),
       lastFailedAt: null,
@@ -69,6 +72,12 @@ describe('evaluateDeliveryHealth', () => {
       status: 'HEALTHY',
       count: 0,
       oldestAgeMs: null,
+    });
+    expect(health.signals.expiredLeases).toEqual({
+      status: 'HEALTHY',
+      oldestExpiredAgeMs: null,
+      warnAfterMs: 60_000,
+      criticalAfterMs: 300_000,
     });
     expect(health.signals.retention).toMatchObject({ status: 'HEALTHY' });
   });
@@ -273,6 +282,94 @@ describe('evaluateDeliveryHealth', () => {
     });
   });
 
+  describe('expired leases', () => {
+    const expired = (ageMs: number) =>
+      healthyInput({ expiredLeases: { oldestLeaseUntil: ago(ageMs) } });
+
+    it('is HEALTHY with no expired lease', () => {
+      expect(codes(healthyInput())).toEqual([]);
+    });
+
+    it('is HEALTHY just below the warning age', () => {
+      const health = evaluateDeliveryHealth(expired(59_999), config);
+      expect(health.status).toBe('HEALTHY');
+      expect(health.signals.expiredLeases).toMatchObject({
+        status: 'HEALTHY',
+        oldestExpiredAgeMs: 59_999,
+      });
+    });
+
+    it('is DEGRADED exactly at the warning age', () => {
+      const health = evaluateDeliveryHealth(expired(60_000), config);
+      expect(health.status).toBe('DEGRADED');
+      expect(health.issues).toEqual([
+        expect.objectContaining({
+          code: 'EXPIRED_LEASE_AGE',
+          severity: 'DEGRADED',
+          signal: 'expiredLeases',
+        }),
+      ]);
+      expect(health.signals.expiredLeases).toEqual({
+        status: 'DEGRADED',
+        oldestExpiredAgeMs: 60_000,
+        warnAfterMs: 60_000,
+        criticalAfterMs: 300_000,
+      });
+    });
+
+    it('is DEGRADED just below the critical age', () => {
+      expect(codes(expired(299_999))).toEqual([['EXPIRED_LEASE_AGE', 'DEGRADED']]);
+    });
+
+    it('is CRITICAL exactly at the critical age', () => {
+      const health = evaluateDeliveryHealth(expired(300_000), config);
+      expect(health.status).toBe('CRITICAL');
+      expect(health.issues).toEqual([
+        expect.objectContaining({
+          code: 'EXPIRED_LEASE_AGE',
+          severity: 'CRITICAL',
+          signal: 'expiredLeases',
+        }),
+      ]);
+    });
+
+    it('escalates as the same lease ages across evaluations', () => {
+      const leaseUntil = ago(30_000);
+      const evaluateAt = (elapsedMs: number) =>
+        evaluateDeliveryHealth(
+          healthyInput({
+            now: new Date(now.getTime() + elapsedMs),
+            expiredLeases: { oldestLeaseUntil: leaseUntil },
+          }),
+          config,
+        ).signals.expiredLeases;
+
+      expect(evaluateAt(0)).toMatchObject({
+        status: 'HEALTHY',
+        oldestExpiredAgeMs: 30_000,
+      });
+      expect(evaluateAt(30_000)).toMatchObject({
+        status: 'DEGRADED',
+        oldestExpiredAgeMs: 60_000,
+      });
+      expect(evaluateAt(270_000)).toMatchObject({
+        status: 'CRITICAL',
+        oldestExpiredAgeMs: 300_000,
+      });
+    });
+
+    it('never reports a negative age when the lease ends slightly ahead of the clock', () => {
+      const health = evaluateDeliveryHealth(
+        healthyInput({
+          expiredLeases: { oldestLeaseUntil: new Date(now.getTime() + 1) },
+        }),
+        config,
+      );
+      expect(health.signals.expiredLeases.oldestExpiredAgeMs).toBe(0);
+      expect(health.status).toBe('HEALTHY');
+    });
+  });
+
   describe('retention', () => {
     const retention = (
       overrides: Partial<DeliveryHealthInput['retention']>,
@@ -410,6 +507,17 @@ describe('evaluateDeliveryHealth', () => {
       ]);
     });
 
+    it('lets an expired lease alone decide the overall status', () => {
+      const health = evaluateDeliveryHealth(
+        healthyInput({ expiredLeases: { oldestLeaseUntil: ago(600_000) } }),
+        config,
+      );
+      expect(health.status).toBe('CRITICAL');
+      expect(health.issues.map((i) => [i.code, i.severity])).toEqual([
+        ['EXPIRED_LEASE_AGE', 'CRITICAL'],
+      ]);
+    });
+
     it('is DEGRADED when the worst signal is DEGRADED', () => {
       expect(
         evaluateDeliveryHealth(
@@ -419,7 +527,7 @@ describe('evaluateDeliveryHealth', () => {
       ).toBe('DEGRADED');
     });
 
-    it('lists issues in a stable order: workers, queue, unknown, retention', () => {
+    it('lists issues in a stable order: workers, queue, unknown, expired leases, retention', () => {
       const health = evaluateDeliveryHealth(
         healthyInput({
           workers: {
@@ -430,6 +538,7 @@ describe('evaluateDeliveryHealth', () => {
           },
           queue: { oldestDueAt: ago(400_000) },
           unknown: { count: 2, oldestSince: ago(2_000_000) },
+          expiredLeases: { oldestLeaseUntil: ago(400_000) },
           retention: {
             lastSucceededAt: ago(10 * HOUR),
             lastFailedAt: null,
@@ -444,6 +553,7 @@ describe('evaluateDeliveryHealth', () => {
         'NO_ACTIVE_WORKER',
         'QUEUE_LAG',
         'UNKNOWN_AGE',
+        'EXPIRED_LEASE_AGE',
         'RETENTION_OVERDUE',
       ]);
     });

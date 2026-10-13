@@ -565,11 +565,17 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
     // produced the unknown outcome is joined by its unique key; its startedAt is
     // when the ambiguous provider call began and, unlike updatedAt, nothing
     // reconciliation does ever moves it.
+    //
+    // The expired-lease age is one more index probe, on (status, leaseUntil). It is
+    // a plain read: no row locks, no SKIP LOCKED and no attempt join, which is the
+    // point. Recovery skips a locked delivery and cannot join a missing attempt, and
+    // those are exactly the leases that stay expired; health has to see them.
     const [row] = await this.prisma.$queryRaw<
       {
         oldestDueAt: Date | null;
         unknownCount: number;
         oldestUnknownSince: Date | null;
+        oldestExpiredLeaseAt: Date | null;
       }[]
     >(Prisma.sql`
       SELECT
@@ -580,7 +586,9 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
             WHERE "status" = 'RETRY' AND "nextAttemptAt" <= ${now})
         ) AS "oldestDueAt",
         unknown."count" AS "unknownCount",
-        unknown."oldestSince" AS "oldestUnknownSince"
+        unknown."oldestSince" AS "oldestUnknownSince",
+        (SELECT min("leaseUntil") FROM "ReplyDelivery"
+          WHERE "status" = 'PROCESSING' AND "leaseUntil" < ${now}) AS "oldestExpiredLeaseAt"
       FROM (
         SELECT
           count(*)::int AS "count",
@@ -595,6 +603,7 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
       oldestDueAt: row?.oldestDueAt ?? null,
       unknownCount: row?.unknownCount ?? 0,
       oldestUnknownSince: row?.oldestUnknownSince ?? null,
+      oldestExpiredLeaseAt: row?.oldestExpiredLeaseAt ?? null,
     };
   }
 

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { HttpStatus, Logger } from '@nestjs/common';
-import { ReplyDeliveryStatus } from '@prisma/client';
+import { Prisma, ReplyDeliveryStatus } from '@prisma/client';
 import type { Response } from 'express';
 import { CommentsService } from '../../src/comments/application/comments.service';
 import { DeliveryHealthService } from '../../src/comments/application/delivery-health.service';
@@ -13,6 +13,7 @@ import { PlatformAdapterRegistry } from '../../src/platforms/application/platfor
 import { MockInstagramAdapter } from '../../src/platforms/infrastructure/mock-instagram.adapter';
 import { MockLinkedInAdapter } from '../../src/platforms/infrastructure/mock-linkedin.adapter';
 import { ApplicationError } from '../../src/comments/domain/comment.errors';
+import { SocialPlatform } from '../../src/comments/domain/comment.types';
 import { SEED_IDS } from '../../prisma/seed';
 import {
   adminPrisma,
@@ -48,6 +49,8 @@ describe('delivery operational health (PostgreSQL)', () => {
     DELIVERY_HEALTH_QUEUE_LAG_CRITICAL_MS: '300000',
     DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS: '300000',
     DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS: '1800000',
+    DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS: '60000',
+    DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS: '300000',
     DELIVERY_RETENTION_INTERVAL_MS: '3600000',
     DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER: '3',
   });
@@ -68,6 +71,8 @@ describe('delivery operational health (PostgreSQL)', () => {
       nextAttemptAt?: Date;
       updatedAt?: Date;
       attemptStartedAt?: Date | null;
+      /** Defaults to an hour ago for PROCESSING and to no lease for every other status. */
+      leaseUntil?: Date | null;
     } = {},
   ) {
     const key = `health-${randomUUID()}`;
@@ -84,7 +89,12 @@ describe('delivery operational health (PostgreSQL)', () => {
         attemptCount: data.attemptStartedAt === null ? 0 : 1,
         nextAttemptAt: data.nextAttemptAt ?? ago(HOUR),
         updatedAt: data.updatedAt ?? ago(HOUR),
-        leaseUntil: processing ? ago(HOUR) : null,
+        leaseUntil:
+          data.leaseUntil !== undefined
+            ? data.leaseUntil
+            : processing
+              ? ago(HOUR)
+              : null,
         leaseToken: processing ? randomUUID() : null,
       },
     });
@@ -377,6 +387,271 @@ describe('delivery operational health (PostgreSQL)', () => {
       });
 
       expect((await service.evaluate(now)).status).toBe('HEALTHY');
+    });
+  });
+
+  describe('expired leases', () => {
+    const recovery = () => new PrismaReplyDeliveryRepository(workerService);
+    const processing = (
+      leaseUntil: Date | null,
+      extra: { attemptStartedAt?: null } = {},
+    ) => seedDelivery(ReplyDeliveryStatus.PROCESSING, { leaseUntil, ...extra });
+
+    /** Holds a row lock in an open transaction for as long as `during` runs. */
+    const whileLocked = <T>(lock: Prisma.Sql, during: () => Promise<T>): Promise<T> =>
+      prisma.$transaction(
+        async (transaction) => {
+          await transaction.$queryRaw(lock);
+          return during();
+        },
+        { timeout: 30_000 },
+      );
+
+    beforeEach(async () => activeWorker());
+
+    it('stays quiet while nothing is expired', async () => {
+      const health = await service.evaluate(now);
+
+      expect(health.signals.expiredLeases).toEqual({
+        status: 'HEALTHY',
+        oldestExpiredAgeMs: null,
+        warnAfterMs: 60_000,
+        criticalAfterMs: 300_000,
+      });
+      expect(health.status).toBe('HEALTHY');
+    });
+
+    it('reports the age of the oldest expired lease, however many there are', async () => {
+      await processing(ago(2 * MINUTE));
+      await processing(ago(10 * MINUTE));
+      await processing(ago(30 * SECOND));
+
+      const health = await service.evaluate(now);
+
+      expect(health.signals.expiredLeases).toMatchObject({
+        status: 'CRITICAL',
+        oldestExpiredAgeMs: 10 * MINUTE,
+      });
+      expect(codes(health)).toEqual(['EXPIRED_LEASE_AGE:CRITICAL']);
+    });
+
+    it('reports an overdue delivery that recovery cannot take because its row is locked', async () => {
+      // The confirmed reproduction: an active worker, nothing queued or UNKNOWN,
+      // retention off, and a lease that ended ten minutes ago on a locked row.
+      const quiet = new DeliveryHealthService(
+        deliveryRepository,
+        apiWorkerState,
+        loadDeliveryWorkerConfig({
+          DELIVERY_WORKER_STALE_AFTER_MS: '30000',
+          DELIVERY_RETENTION_ENABLED: 'false',
+        }),
+      );
+      const id = await processing(ago(10 * MINUTE));
+
+      const observed = await whileLocked(
+        Prisma.sql`SELECT "id" FROM "ReplyDelivery" WHERE "id" = ${id}::uuid FOR UPDATE`,
+        async () => ({
+          recovered: await recovery().reconcileExpiredLeases(now, 100),
+          snapshot: await deliveryRepository.getQueueSnapshot(now),
+          health: await quiet.evaluate(now),
+        }),
+      );
+
+      expect(observed.recovered).toBe(0);
+      expect(observed.snapshot.expiredLeases).toBe(1);
+      expect(observed.health.status).toBe('CRITICAL');
+      expect(observed.health.signals.expiredLeases).toMatchObject({
+        status: 'CRITICAL',
+        oldestExpiredAgeMs: 10 * MINUTE,
+      });
+      expect(codes(observed.health)).toEqual(['EXPIRED_LEASE_AGE:CRITICAL']);
+    });
+
+    it('does not wait on, or block behind, a locked delivery row', async () => {
+      const id = await processing(ago(2 * MINUTE));
+
+      const elapsed = await whileLocked(
+        Prisma.sql`SELECT "id" FROM "ReplyDelivery" WHERE "id" = ${id}::uuid FOR UPDATE`,
+        async () => {
+          const started = Date.now();
+          await service.evaluate(now);
+          return Date.now() - started;
+        },
+      );
+
+      expect(elapsed).toBeLessThan(2_000);
+    });
+
+    it('still sees the overdue delivery when its current attempt is the locked row', async () => {
+      const id = await processing(ago(2 * MINUTE));
+
+      const observed = await whileLocked(
+        Prisma.sql`SELECT "id" FROM "ReplyDeliveryAttempt" WHERE "deliveryId" = ${id}::uuid FOR UPDATE`,
+        async () => ({
+          recovered: await recovery().reconcileExpiredLeases(now, 100),
+          health: await service.evaluate(now),
+        }),
+      );
+
+      expect(observed.recovered).toBe(0);
+      expect(codes(observed.health)).toEqual(['EXPIRED_LEASE_AGE:DEGRADED']);
+    });
+
+    it('is not hidden by a missing current attempt, which recovery cannot join', async () => {
+      await processing(ago(10 * MINUTE), { attemptStartedAt: null });
+
+      const recovered = await recovery().reconcileExpiredLeases(now, 100);
+      const health = await service.evaluate(now);
+
+      expect(recovered).toBe(0);
+      expect(health.signals.expiredLeases.oldestExpiredAgeMs).toBe(10 * MINUTE);
+      expect(codes(health)).toEqual(['EXPIRED_LEASE_AGE:CRITICAL']);
+    });
+
+    it('ignores live leases and a lease that ends exactly now', async () => {
+      await processing(ahead(30 * SECOND));
+      await processing(now);
+
+      const health = await service.evaluate(now);
+
+      expect(health.signals.expiredLeases.oldestExpiredAgeMs).toBeNull();
+      expect(health.status).toBe('HEALTHY');
+    });
+
+    it('counts a lease from the first millisecond after it ends', async () => {
+      await processing(ago(1));
+
+      expect((await service.evaluate(now)).signals.expiredLeases).toMatchObject({
+        status: 'HEALTHY',
+        oldestExpiredAgeMs: 1,
+      });
+    });
+
+    it('ignores settled, queued and UNKNOWN deliveries, however old', async () => {
+      // The ReplyDelivery_lease_check constraint keeps leaseUntil NULL outside
+      // PROCESSING, so no other status can carry an expired lease.
+      for (const status of [
+        ReplyDeliveryStatus.SUCCEEDED,
+        ReplyDeliveryStatus.FAILED,
+        ReplyDeliveryStatus.DEAD_LETTERED,
+        ReplyDeliveryStatus.PENDING,
+        ReplyDeliveryStatus.RETRY,
+        ReplyDeliveryStatus.UNKNOWN,
+      ]) {
+        await seedDelivery(status, {
+          updatedAt: ago(10 * HOUR),
+          nextAttemptAt: ahead(HOUR),
+        });
+      }
+      await processing(ago(2 * MINUTE));
+
+      const health = await service.evaluate(now);
+
+      expect(health.signals.expiredLeases.oldestExpiredAgeMs).toBe(2 * MINUTE);
+    });
+
+    it('applies the warning and critical thresholds inclusively', async () => {
+      const id = await processing(ago(MINUTE - 1));
+      const lease = (leaseUntil: Date) =>
+        prisma.replyDelivery.update({ where: { id }, data: { leaseUntil } });
+
+      expect((await service.evaluate(now)).signals.expiredLeases.status).toBe(
+        'HEALTHY',
+      );
+
+      await lease(ago(MINUTE));
+      expect(codes(await service.evaluate(now))).toEqual([
+        'EXPIRED_LEASE_AGE:DEGRADED',
+      ]);
+
+      await lease(ago(5 * MINUTE - 1));
+      expect(codes(await service.evaluate(now))).toEqual([
+        'EXPIRED_LEASE_AGE:DEGRADED',
+      ]);
+
+      await lease(ago(5 * MINUTE));
+      expect(codes(await service.evaluate(now))).toEqual([
+        'EXPIRED_LEASE_AGE:CRITICAL',
+      ]);
+    });
+
+    it('grows with the clock for the same unrecovered lease', async () => {
+      await processing(ago(30 * SECOND));
+
+      const first = await service.evaluate(now);
+      const second = await service.evaluate(ahead(MINUTE));
+      const third = await service.evaluate(ahead(5 * MINUTE));
+
+      expect(first.signals.expiredLeases).toMatchObject({
+        status: 'HEALTHY',
+        oldestExpiredAgeMs: 30 * SECOND,
+      });
+      expect(second.signals.expiredLeases).toMatchObject({
+        status: 'DEGRADED',
+        oldestExpiredAgeMs: 90 * SECOND,
+      });
+      expect(third.signals.expiredLeases).toMatchObject({
+        status: 'CRITICAL',
+        oldestExpiredAgeMs: 5 * MINUTE + 30 * SECOND,
+      });
+    });
+
+    it('clears once recovery moves the lease to UNKNOWN', async () => {
+      await processing(ago(10 * MINUTE));
+      expect(codes(await service.evaluate(now))).toEqual([
+        'EXPIRED_LEASE_AGE:CRITICAL',
+      ]);
+
+      await expect(recovery().reconcileExpiredLeases(now, 100)).resolves.toBe(1);
+
+      const health = await service.evaluate(now);
+      expect(health.signals.expiredLeases.oldestExpiredAgeMs).toBeNull();
+      expect(health.issues.map((issue) => issue.code)).not.toContain(
+        'EXPIRED_LEASE_AGE',
+      );
+      // The unresolved outcome is now the UNKNOWN signal's to report.
+      expect(health.signals.unknown.count).toBe(1);
+    });
+
+    it('clears once the lease owner completes the delivery late', async () => {
+      const id = await processing(ago(10 * MINUTE));
+      const delivery = await prisma.replyDelivery.findUniqueOrThrow({ where: { id } });
+      expect(codes(await service.evaluate(now))).toEqual([
+        'EXPIRED_LEASE_AGE:CRITICAL',
+      ]);
+
+      await recovery().markSucceeded(
+        {
+          deliveryId: id,
+          leaseToken: delivery.leaseToken!,
+          replyId: delivery.replyId,
+          attemptNumber: 1,
+          platform: SocialPlatform.INSTAGRAM,
+          publicationExternalId: 'unused',
+          parentExternalCommentId: null,
+          accountExternalId: 'unused',
+          message: 'unused',
+          idempotencyKey: null,
+        },
+        { externalCommentId: `ext-${randomUUID()}`, remoteCreatedAt: now },
+        now,
+      );
+
+      const health = await service.evaluate(now);
+      expect(health.signals.expiredLeases.oldestExpiredAgeMs).toBeNull();
+      expect(health.status).toBe('HEALTHY');
+    });
+
+    it('moves to the next-oldest lease when the oldest one is recovered', async () => {
+      await processing(ago(20 * MINUTE));
+      await processing(ago(2 * MINUTE));
+
+      await expect(recovery().reconcileExpiredLeases(now, 1)).resolves.toBe(1);
+
+      expect((await service.evaluate(now)).signals.expiredLeases).toMatchObject({
+        status: 'DEGRADED',
+        oldestExpiredAgeMs: 2 * MINUTE,
+      });
     });
   });
 

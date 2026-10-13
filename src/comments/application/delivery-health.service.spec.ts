@@ -28,6 +28,7 @@ const quietQueue = (): DeliveryQueueHealthSnapshot => ({
   oldestDueAt: null,
   unknownCount: 0,
   oldestUnknownSince: null,
+  oldestExpiredLeaseAt: null,
 });
 
 describe('DeliveryHealthService', () => {
@@ -66,6 +67,7 @@ describe('DeliveryHealthService', () => {
       oldestDueAt: ago(90_000),
       unknownCount: 2,
       oldestUnknownSince: ago(10_000),
+      oldestExpiredLeaseAt: ago(120_000),
     });
 
     const health = await createService().evaluate(now);
@@ -74,7 +76,31 @@ describe('DeliveryHealthService', () => {
     expect(health.status).toBe('DEGRADED');
     expect(health.signals.queue.oldestDueAgeMs).toBe(90_000);
     expect(health.signals.unknown).toMatchObject({ count: 2, oldestAgeMs: 10_000 });
+    expect(health.signals.expiredLeases).toMatchObject({
+      status: 'DEGRADED',
+      oldestExpiredAgeMs: 120_000,
+    });
     expect(getHealthSnapshot).toHaveBeenCalledWith(now);
+  });
+
+  it('applies the configured expired-lease thresholds', async () => {
+    getHealthSnapshot.mockResolvedValue({
+      ...quietQueue(),
+      oldestExpiredLeaseAt: ago(10_000),
+    });
+
+    const health = await createService({
+      DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS: '10000',
+      DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS: '20000',
+    }).evaluate(now);
+
+    expect(health.signals.expiredLeases).toEqual({
+      status: 'DEGRADED',
+      oldestExpiredAgeMs: 10_000,
+      warnAfterMs: 10_000,
+      criticalAfterMs: 20_000,
+    });
+    expect(health.issues.map((issue) => issue.code)).toEqual(['EXPIRED_LEASE_AGE']);
   });
 
   it('asks for workers relative to the configured stale threshold', async () => {

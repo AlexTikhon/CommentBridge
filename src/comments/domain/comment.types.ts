@@ -144,6 +144,13 @@ export interface DeliveryQueueHealthSnapshot {
    * UNKNOWN delivery; null when there is none.
    */
   oldestUnknownSince: Date | null;
+  /**
+   * Oldest `leaseUntil` among PROCESSING deliveries whose lease ended before the
+   * evaluation time; null when none has expired. Read without row locks and without
+   * the attempt join the recovery statement needs, so a delivery that recovery cannot
+   * take (locked, or missing its current attempt) is still seen.
+   */
+  oldestExpiredLeaseAt: Date | null;
 }
 
 export interface ReplyDeliveryAttemptView {

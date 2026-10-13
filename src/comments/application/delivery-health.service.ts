@@ -75,6 +75,7 @@ export class DeliveryHealthService {
           },
           queue: { oldestDueAt: queue.oldestDueAt },
           unknown: { count: queue.unknownCount, oldestSince: queue.oldestUnknownSince },
+          expiredLeases: { oldestLeaseUntil: queue.oldestExpiredLeaseAt },
           retention: workers.retention,
         },
         this.config,

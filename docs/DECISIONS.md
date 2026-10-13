@@ -344,6 +344,26 @@ Choices inside operational health:
   `updatedAt`, because reconciliation rewrites `updatedAt` on every try and would make a
   permanently stuck delivery look recent. Counts are context only; age is the signal.
 - Queue lag counts only due `PENDING`/`RETRY` work, so scheduled backoff is not "late".
+- Expired leases are their own signal (`EXPIRED_LEASE_AGE`). A `PROCESSING` delivery
+  past its lease whose row recovery cannot take (the sweep skips locked rows, and joins
+  the current attempt, so a missing attempt hides it too) is not queued, not `UNKNOWN`
+  and not late, so every other signal stayed green while it sat there: an active worker,
+  an empty queue and a lease that ended ten minutes earlier on a locked row read
+  `HEALTHY`. The stats endpoint counted it but nothing judged it. The signal is the age
+  of the oldest such lease, because age, not count, is what separates "recovery is a poll
+  behind" from "recovery cannot take this", and it reuses the existing warn/critical shape
+  and inclusive thresholds (60 s / 5 min: normal recovery clears a lease within a poll or
+  two, so a minute is already abnormal). The read is deliberately not the recovery query:
+  no `FOR UPDATE`, no `SKIP LOCKED`, no attempt join, so it sees precisely the rows
+  recovery passes over, and a monitor polling it can neither wait on nor contend with a
+  worker. It carries no count; the stats endpoint owns that. It is
+  `min("leaseUntil")` on the existing `(status, leaseUntil)` index and no index was
+  added: on 300,000 settled deliveries plus 5 expired leases the planner chose an
+  index-only scan with `LIMIT 1` touching 5 buffers (3 when nothing has expired), the
+  whole health snapshot read 18 buffers in about 0.4 ms, and 30,000 expired leases cost
+  the same 5 buffers because only the first index entry is needed. The `ReplyDelivery_lease_check`
+  constraint (`leaseUntil` is set only while `PROCESSING`) is what makes the
+  `status = 'PROCESSING'` predicate exact rather than approximate.
 - The queries are `min(nextAttemptAt)` on the existing `(status, nextAttemptAt, id)`
   index and a count over the (normally tiny) `UNKNOWN` set, plus aggregates over the small
   worker table. They do not reuse the stats statement, which groups the whole delivery

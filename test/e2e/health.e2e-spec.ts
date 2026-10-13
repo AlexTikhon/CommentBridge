@@ -1,8 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { ValidationPipe } from '@nestjs/common';
 import type { INestApplication } from '@nestjs/common';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Test } from '@nestjs/testing';
 import type { TestingModule } from '@nestjs/testing';
 import {
+  Prisma,
   ReplyDeliveryAttemptStatus,
   ReplyDeliveryStatus,
   type PrismaClient,
@@ -94,6 +97,28 @@ describe('health endpoints (e2e)', () => {
         lastHeartbeatAt: new Date(Date.now() - ageMs),
       },
     });
+
+  /** A PROCESSING delivery whose lease ended `leaseAgoMs` ago and was never recovered. */
+  async function overdueLease(key: string, leaseAgoMs: number): Promise<string> {
+    const replyId = await queueReply(key);
+    const delivery = await prisma.replyDelivery.update({
+      where: { replyId },
+      data: {
+        status: ReplyDeliveryStatus.PROCESSING,
+        attemptCount: 1,
+        leaseToken: randomUUID(),
+        leaseUntil: new Date(Date.now() - leaseAgoMs),
+      },
+    });
+    await prisma.replyDeliveryAttempt.create({
+      data: {
+        deliveryId: delivery.id,
+        attemptNumber: 1,
+        status: ReplyDeliveryAttemptStatus.PROCESSING,
+      },
+    });
+    return delivery.id;
+  }
 
   const issueCodes = (body: { issues: { code: string }[] }) =>
     body.issues.map((issue) => issue.code);
@@ -206,6 +231,12 @@ describe('health endpoints (e2e)', () => {
             warnAfterMs: 300_000,
             criticalAfterMs: 1_800_000,
           },
+          expiredLeases: {
+            status: 'HEALTHY',
+            oldestExpiredAgeMs: null,
+            warnAfterMs: 60_000,
+            criticalAfterMs: 300_000,
+          },
           retention: {
             status: 'HEALTHY',
             enabled: true,
@@ -306,6 +337,119 @@ describe('health endpoints (e2e)', () => {
       expect(response.body.issues).toEqual([
         expect.objectContaining({ code: 'UNKNOWN_AGE', severity: 'CRITICAL' }),
       ]);
+    });
+
+    it('goes CRITICAL on a delivery whose lease expired long ago and whose row recovery cannot lock', async () => {
+      await heartbeat('current-worker', 1_000);
+      const id = await overdueLease('e2e-expired-lease', 10 * 60_000);
+
+      const response = await prisma.$transaction(
+        async (transaction) => {
+          await transaction.$queryRaw(
+            Prisma.sql`SELECT "id" FROM "ReplyDelivery" WHERE "id" = ${id}::uuid FOR UPDATE`,
+          );
+          return operational().expect(200);
+        },
+        { timeout: 30_000 },
+      );
+
+      expect(response.body.status).toBe('CRITICAL');
+      expect(response.body.signals.expiredLeases).toMatchObject({
+        status: 'CRITICAL',
+        warnAfterMs: 60_000,
+        criticalAfterMs: 300_000,
+      });
+      expect(
+        response.body.signals.expiredLeases.oldestExpiredAgeMs,
+      ).toBeGreaterThanOrEqual(10 * 60_000);
+      expect(response.body.signals.expiredLeases.oldestExpiredAgeMs).toBeLessThan(
+        11 * 60_000,
+      );
+      expect(response.body.issues).toEqual([
+        {
+          code: 'EXPIRED_LEASE_AGE',
+          severity: 'CRITICAL',
+          signal: 'expiredLeases',
+          message: expect.any(String),
+        },
+      ]);
+      expect(response.text).not.toMatch(/leaseToken|lease_token/i);
+    });
+
+    it('degrades on a lease that expired a little over a minute ago', async () => {
+      await heartbeat('current-worker', 1_000);
+      await overdueLease('e2e-expired-lease-warn', 90_000);
+
+      const response = await operational().expect(200);
+
+      expect(response.body.status).toBe('DEGRADED');
+      expect(issueCodes(response.body)).toEqual(['EXPIRED_LEASE_AGE']);
+    });
+
+    it('does not let a live lease raise the signal', async () => {
+      await heartbeat('current-worker', 1_000);
+      const leased = await queueReply('e2e-live-lease');
+      await prisma.replyDelivery.update({
+        where: { replyId: leased },
+        data: {
+          status: ReplyDeliveryStatus.PROCESSING,
+          leaseToken: randomUUID(),
+          leaseUntil: new Date(Date.now() + 30_000),
+        },
+      });
+
+      const response = await operational().expect(200);
+
+      expect(response.body.status).toBe('HEALTHY');
+      expect(response.body.signals.expiredLeases.oldestExpiredAgeMs).toBeNull();
+    });
+
+    it('keeps liveness and readiness green while a lease stays expired', async () => {
+      await heartbeat('current-worker', 1_000);
+      await overdueLease('e2e-expired-lease-probes', 20 * 60_000);
+
+      expect((await operational().expect(200)).body.status).toBe('CRITICAL');
+      await live().expect(200);
+      await ready().expect(200);
+      await legacy().expect(200);
+    });
+
+    it('describes the signal and its issue code in the OpenAPI document', () => {
+      const document = SwaggerModule.createDocument(
+        app,
+        new DocumentBuilder().setTitle('test').build(),
+      );
+      const schemas = document.components?.schemas as Record<
+        string,
+        {
+          properties?: Record<
+            string,
+            { enum?: string[]; type?: string; $ref?: string }
+          >;
+          required?: string[];
+        }
+      >;
+
+      expect(schemas.DeliveryHealthSignalsDto?.properties).toHaveProperty(
+        'expiredLeases',
+      );
+      expect(schemas.DeliveryHealthSignalsDto?.required).toContain('expiredLeases');
+      expect(schemas.ExpiredLeaseHealthSignalDto?.properties).toEqual(
+        expect.objectContaining({
+          status: expect.objectContaining({
+            enum: ['HEALTHY', 'DEGRADED', 'CRITICAL'],
+          }),
+          oldestExpiredAgeMs: expect.anything(),
+          warnAfterMs: expect.anything(),
+          criticalAfterMs: expect.anything(),
+        }),
+      );
+      expect(schemas.DeliveryHealthIssueDto?.properties?.code?.enum).toContain(
+        'EXPIRED_LEASE_AGE',
+      );
+      expect(schemas.DeliveryHealthIssueDto?.properties?.signal?.enum).toContain(
+        'expiredLeases',
+      );
     });
 
     it('shows retention failure state recorded by workers in shared storage', async () => {

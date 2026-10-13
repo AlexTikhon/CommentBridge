@@ -50,6 +50,14 @@ export interface DeliveryHealthConfig {
   unknownAgeWarnMs: number;
   /** Age of the oldest unresolved UNKNOWN outcome that is CRITICAL. */
   unknownAgeCriticalMs: number;
+  /**
+   * How long the oldest PROCESSING delivery may sit past its lease expiry before that
+   * is DEGRADED. Normal recovery moves an expired lease to UNKNOWN within a poll or
+   * two, so a lease that stays expired means recovery cannot take it.
+   */
+  expiredLeaseAgeWarnMs: number;
+  /** Age of the oldest expired, unrecovered lease that is CRITICAL. */
+  expiredLeaseAgeCriticalMs: number;
   /** Retention is overdue after this many intervals without a successful run. */
   retentionOverdueMultiplier: number;
 }
@@ -204,6 +212,14 @@ export function loadDeliveryWorkerConfig(
         'DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS',
         1_800_000,
       ),
+      expiredLeaseAgeWarnMs: integer(
+        'DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS',
+        60_000,
+      ),
+      expiredLeaseAgeCriticalMs: integer(
+        'DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS',
+        300_000,
+      ),
       retentionOverdueMultiplier: positiveNumber(
         'DELIVERY_HEALTH_RETENTION_OVERDUE_MULTIPLIER',
         3,
@@ -260,6 +276,11 @@ export function loadDeliveryWorkerConfig(
     if (health.unknownAgeCriticalMs <= health.unknownAgeWarnMs) {
       problems.push(
         'DELIVERY_HEALTH_UNKNOWN_AGE_CRITICAL_MS must be greater than DELIVERY_HEALTH_UNKNOWN_AGE_WARN_MS',
+      );
+    }
+    if (health.expiredLeaseAgeCriticalMs <= health.expiredLeaseAgeWarnMs) {
+      problems.push(
+        'DELIVERY_HEALTH_EXPIRED_LEASE_AGE_CRITICAL_MS must be greater than DELIVERY_HEALTH_EXPIRED_LEASE_AGE_WARN_MS',
       );
     }
     if (health.retentionOverdueMultiplier <= 1) {
