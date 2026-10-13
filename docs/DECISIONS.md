@@ -173,7 +173,23 @@ provider lookup) decides the outcome. A database check ties `leaseUntil` and
 
 Expired-lease reconciliation is a single statement rather than a read followed by
 a write, so a delivery that completes or is re-leased in between is never
-misclassified and the returned count is exact. The migration assigns tokens to any
+misclassified and the returned count is exact. It is also bounded and lock-free in
+the sense that matters: it was originally one `UPDATE` of every expired `PROCESSING`
+row, so a single locked delivery made the whole statement wait out the lock budget
+and roll back, and recovery of every unrelated lease with it. It now selects at most
+`DELIVERY_EXPIRED_LEASE_BATCH_SIZE` (default 100) leases, oldest first, with
+`FOR UPDATE SKIP LOCKED` on the delivery and its current attempt, then transitions
+exactly those rows. Locking the attempt as well is what keeps derived state
+coherent: a delivery is only moved to `UNKNOWN` when the attempt that belongs to it
+can be closed in the same statement, and a lease whose attempt is locked is skipped
+whole rather than half-recovered. An attempt that is already `UNKNOWN` (the lease
+being recovered is a reconciliation lease) is not rewritten, so its `finishedAt` and
+error code keep describing the first failure. One batch per drain keeps maintenance
+from delaying delivery slots; the cost is that a backlog of N expired leases takes
+N / batch drains to clear, which at the default and a one second poll is 100 per
+second per worker. The statement reads through the existing `(status, leaseUntil)`
+index (a 100-row batch from a 30,000-lease backlog in 150,000 deliveries read 129
+index entries in about half a millisecond), so no index was added. The migration assigns tokens to any
 in-flight `PROCESSING` rows without touching their status or expiry; they can only
 end by expiring into `UNKNOWN`.
 
@@ -553,15 +569,20 @@ true)` (`SET LOCAL`), so the tighter budget ends with the transaction and never 
   budget expires), the transaction rolls back as a whole, the job stays `PROCESSING`, and lease expiry
   moves it to `UNKNOWN`, where provider lookup finds the reply. A test holds a lock on the comment row
   to force exactly this and asserts the provider was called once.
-- **Maintenance must not block work.** The expired-lease sweep updates rows and therefore waits for
-  locks, while claims skip locked rows. A sweep that fails on a lock is logged
-  (`delivery.lease-sweep-failed`) and the drain carries on, so one locked row cannot stall all
-  delivery; the next drain retries. The cost is that a lock held indefinitely is visible only through
-  that log line and the age of `UNKNOWN` work in operational health.
+- **Maintenance must not block work.** The expired-lease sweep used to wait for row locks while
+  claims skipped them, so one locked delivery failed the whole sweep after the lock budget and
+  rolled back recovery of every other lease. It now skips locked rows like claims do (see _Lease
+  ownership tokens_): the unlocked leases are recovered immediately and a locked one is picked up by
+  a later drain. A sweep that fails for any other reason is still logged
+  (`delivery.lease-sweep-failed`) and the drain carries on. The cost is that a lock held
+  indefinitely on one delivery is no longer a repeating log line; it shows as that delivery staying
+  `PROCESSING` past its lease (`expiredLeases` in the queue snapshot) instead.
 - **Shutdown.** Stopping waits for the drain, retention batch and heartbeat in flight. Each is now
   bounded by the budgets, so shutdown takes about one lock budget instead of as long as the lock is held; a test blocks a drain on a held lock and checks shutdown
   completes within the lock budget, nothing is left waiting server-side, and the connection closes.
-  Retention uses `SKIP LOCKED` and cannot block on locks, so only the statement budget applies to it.
+  Retention and the expired-lease sweep use `SKIP LOCKED` and cannot block on locks, so only the
+  statement budget applies to them. What still waits, and so still has lock-timeout coverage, is a
+  worker recording a completion and the operator retry and dead-letter actions.
 
 Not done: a pool-wait timeout (`pool_timeout`) and a cap on pool size were left at Prisma's defaults;
 they bound connection acquisition rather than database work and are better chosen with real load

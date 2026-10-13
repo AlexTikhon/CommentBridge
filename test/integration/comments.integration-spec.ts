@@ -31,6 +31,7 @@ import {
 } from '../database-test-utils';
 
 const workerNow = new Date('2100-01-01T00:00:00.000Z');
+const RECOVERY_BATCH = 100;
 
 describe('comments persistence integration', () => {
   // Fixtures and inspection use the schema owner; the code under test connects as
@@ -469,7 +470,10 @@ describe('comments persistence integration', () => {
     expect(claimed?.replyId).toBe(accepted.reply.id);
 
     await expect(
-      deliveryRepository.reconcileExpiredLeases(new Date(workerNow.getTime() + 2_000)),
+      deliveryRepository.reconcileExpiredLeases(
+        new Date(workerNow.getTime() + 2_000),
+        RECOVERY_BATCH,
+      ),
     ).resolves.toBe(1);
 
     const stored = await prisma.comment.findUniqueOrThrow({
@@ -673,7 +677,7 @@ describe('comments persistence integration', () => {
 
       // A stalls; its lease expires and is reconciled to UNKNOWN.
       await expect(
-        deliveryRepository.reconcileExpiredLeases(at(lease + 1_000)),
+        deliveryRepository.reconcileExpiredLeases(at(lease + 1_000), RECOVERY_BATCH),
       ).resolves.toBe(1);
 
       // Worker B claims the same delivery for reconciliation: same attempt number,
@@ -786,7 +790,10 @@ describe('comments persistence integration', () => {
       ).leaseToken;
       expect(slowToken).not.toBeNull();
 
-      await deliveryRepository.reconcileExpiredLeases(at(lease + 1_000));
+      await deliveryRepository.reconcileExpiredLeases(
+        at(lease + 1_000),
+        RECOVERY_BATCH,
+      );
       const reconciler = await deliveryRepository.claimUnknown(
         at(lease + 2_000),
         at(2 * lease + 2_000),
@@ -862,12 +869,12 @@ describe('comments persistence integration', () => {
       // C completes after its (now stale) expiry snapshot would have been taken.
       await deliveryRepository.markSucceeded(finished!, providerResult, at(500));
 
-      await expect(deliveryRepository.reconcileExpiredLeases(at(5_000))).resolves.toBe(
-        1,
-      );
-      await expect(deliveryRepository.reconcileExpiredLeases(at(5_000))).resolves.toBe(
-        0,
-      );
+      await expect(
+        deliveryRepository.reconcileExpiredLeases(at(5_000), RECOVERY_BATCH),
+      ).resolves.toBe(1);
+      await expect(
+        deliveryRepository.reconcileExpiredLeases(at(5_000), RECOVERY_BATCH),
+      ).resolves.toBe(0);
 
       const [a, b, c] = await Promise.all([
         load(expired!.replyId),
@@ -909,7 +916,7 @@ describe('comments persistence integration', () => {
 
       const [completion, reconciled] = await Promise.allSettled([
         deliveryRepository.markSucceeded(claimed!, providerResult, at(2_000)),
-        deliveryRepository.reconcileExpiredLeases(at(2_000)),
+        deliveryRepository.reconcileExpiredLeases(at(2_000), RECOVERY_BATCH),
       ]);
 
       const completed = completion.status === 'fulfilled';
@@ -936,7 +943,7 @@ describe('comments persistence integration', () => {
     it('does not count provider lookup as another delivery attempt', async () => {
       const replyId = await queue('lease-no-attempt-inflation');
       const first = await deliveryRepository.claimNext(at(0), at(lease));
-      await deliveryRepository.reconcileExpiredLeases(at(lease + 1));
+      await deliveryRepository.reconcileExpiredLeases(at(lease + 1), RECOVERY_BATCH);
 
       for (let round = 0; round < 3; round += 1) {
         const lookup = await deliveryRepository.claimUnknown(
@@ -961,7 +968,7 @@ describe('comments persistence integration', () => {
     it('keeps normal and reconciliation claims mutually exclusive under concurrency', async () => {
       const unknownReply = await queue('lease-concurrent-unknown');
       await deliveryRepository.claimNext(at(0), at(1_000));
-      await deliveryRepository.reconcileExpiredLeases(at(5_000));
+      await deliveryRepository.reconcileExpiredLeases(at(5_000), RECOVERY_BATCH);
       await queue('lease-concurrent-pending');
 
       const claims = await Promise.all([

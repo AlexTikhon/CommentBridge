@@ -17,6 +17,12 @@ export interface DeliveryWorkerConfig {
    * keeps one slot for normal delivery (or alternates queues when the budget is one).
    */
   maxReconciliationsPerTick: number;
+  /**
+   * Most expired PROCESSING leases one drain moves to UNKNOWN. The sweep is one
+   * bounded batch per drain, so a large backlog of abandoned leases is worked off
+   * across successive drains instead of in one long statement.
+   */
+  expiredLeaseBatchSize: number;
   /** How often a worker process refreshes its liveness row. */
   heartbeatIntervalMs: number;
   /** A worker whose last heartbeat is older than this is reported STALE. */
@@ -164,6 +170,7 @@ export function loadDeliveryWorkerConfig(
       3,
       10_000,
     ),
+    expiredLeaseBatchSize: integer('DELIVERY_EXPIRED_LEASE_BATCH_SIZE', 100, 10_000),
     heartbeatIntervalMs: integer('DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS', 10_000),
     staleAfterMs: integer('DELIVERY_WORKER_STALE_AFTER_MS', 30_000),
     retention: {

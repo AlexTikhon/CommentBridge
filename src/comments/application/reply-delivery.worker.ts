@@ -219,12 +219,14 @@ export class ReplyDeliveryWorker {
   }
 
   /**
-   * The maintenance step of a drain. It is best effort: it waits for row locks like any
-   * update, so a lock held by someone else (an operator transaction, a long migration)
-   * makes it fail once the database lock budget runs out. That must not stop this
-   * drain from claiming work, because claims never wait for locks (they skip locked
-   * rows), and the lease it could not expire is simply swept by a later drain. The
-   * failure is logged every time it happens, so a lock that stays held is visible.
+   * The maintenance step of a drain: one bounded batch of expired leases, never a
+   * loop, so a backlog is worked off across drains and cannot delay this drain's
+   * delivery slots. Like claims, it skips rows another transaction has locked (an
+   * operator transaction, a completion in flight) instead of waiting for them; a
+   * skipped lease is swept by a later drain. It is still best effort: if the
+   * statement fails for any other reason (statement budget, connection) that must
+   * not stop this drain from claiming work. The failure is logged every time it
+   * happens, so a sweep that keeps failing is visible.
    */
   private async sweepExpiredLeases(now: Date): Promise<number> {
     try {
@@ -236,7 +238,10 @@ export class ReplyDeliveryWorker {
   }
 
   async reconcileExpiredLeases(now: Date): Promise<number> {
-    const reconciled = await this.repository.reconcileExpiredLeases(now);
+    const reconciled = await this.repository.reconcileExpiredLeases(
+      now,
+      this.config.expiredLeaseBatchSize,
+    );
     if (reconciled > 0) {
       this.logger.warn(`Marked ${reconciled} expired reply deliveries as UNKNOWN.`);
     }

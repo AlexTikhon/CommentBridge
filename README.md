@@ -209,10 +209,14 @@ rolls back and the job stays `PROCESSING` until its lease expires, then reconcil
 resolves it by provider lookup: a persistence failure after provider acceptance is never a
 blind redelivery.
 
-The expired-lease sweep waits for row locks like any update, so a lock held by someone else
-makes it fail after `DB_LOCK_TIMEOUT_MS`. The drain logs `delivery.lease-sweep-failed` and
-carries on, because claims skip locked rows; the next drain retries the sweep. A lock that
-stays held shows up as that log line repeating and as `UNKNOWN` age in operational health.
+The expired-lease sweep skips rows that another transaction has locked (the delivery, or the
+attempt it would close) instead of waiting for them, exactly as claims do, so one locked row
+cannot fail the recovery of unrelated leases. A skipped lease is recovered by a later drain;
+a lock that stays held shows up as that delivery's age in operational health and in
+`expiredLeases` of the queue snapshot. Operations that must wait for a row, such as a worker
+recording a completion or an operator action, still fail after `DB_LOCK_TIMEOUT_MS`. If the
+sweep fails for another reason (statement budget, connection) the drain logs
+`delivery.lease-sweep-failed` and carries on; the next drain retries it.
 
 ## Quick start
 
@@ -417,14 +421,23 @@ worker really sent, so it is still delivered once. The token is never exposed by
 the API. PostgreSQL enforces that `PROCESSING` rows have both `leaseUntil` and
 `leaseToken`, and all other states have neither.
 
-`reconcileExpiredLeases` is one SQL statement that moves only rows that are still
-`PROCESSING` and expired, closes their open attempt, and returns the number
-actually transitioned. A provider lookup during reconciliation is not a new
-outbound attempt, so `attemptCount` is unchanged.
+`reconcileExpiredLeases` is one SQL statement that recovers a bounded batch of
+expired leases, at most `DELIVERY_EXPIRED_LEASE_BATCH_SIZE` per drain, oldest lease
+first (then by id). It selects `PROCESSING` rows whose lease has ended together with
+their current attempt using `FOR UPDATE ... SKIP LOCKED`, so a delivery or attempt
+that is locked elsewhere is passed over and does not use up a batch slot, and the
+statement never waits on a lock. The selected deliveries move to `UNKNOWN` with
+ownership cleared and their still-`PROCESSING` attempt is closed in the same
+statement; an attempt that is already closed (a reconciliation lease runs under the
+attempt whose unknown outcome made it reconcilable) is left exactly as it was. It
+returns the number of deliveries actually transitioned. A backlog larger than the batch
+is worked off across successive drains; the recovered deliveries are then reconciled by
+provider lookup like any other `UNKNOWN` delivery. A provider lookup during
+reconciliation is not a new outbound attempt, so `attemptCount` is unchanged.
 
 ## Worker scheduling and lifecycle
 
-Each poll runs one bounded drain: expired-lease maintenance once, then up to
+Each poll runs one bounded drain: one batch of expired-lease maintenance, then up to
 `DELIVERY_MAX_JOBS_PER_TICK` jobs from two queues, with progress guaranteed for both under
 every accepted configuration:
 
@@ -460,6 +473,7 @@ state; the worker simply goes `STALE` when its heartbeat ages out.
 | `DELIVERY_MAX_RETRY_DELAY_MS`           | `60000` | Backoff cap; at least the base delay                                     |
 | `DELIVERY_MAX_JOBS_PER_TICK`            | `10`    | Jobs per drain                                                           |
 | `DELIVERY_MAX_RECONCILIATIONS_PER_TICK` | `3`     | Reconciliation slots; at most the job budget (normal delivery keeps one) |
+| `DELIVERY_EXPIRED_LEASE_BATCH_SIZE`     | `100`   | Expired leases recovered per drain, 1 to 10000; the rest wait a drain    |
 | `DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` | How often a worker refreshes its heartbeat                               |
 | `DELIVERY_WORKER_STALE_AFTER_MS`        | `30000` | Heartbeat age after which a worker is `STALE`; must exceed the interval  |
 

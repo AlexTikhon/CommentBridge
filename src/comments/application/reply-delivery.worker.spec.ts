@@ -348,15 +348,36 @@ describe('ReplyDeliveryWorker', () => {
       await worker.drain(() => now);
 
       expect(repository.reconcileExpiredLeases).toHaveBeenCalledTimes(1);
-      expect(repository.reconcileExpiredLeases).toHaveBeenCalledWith(now);
+      expect(repository.reconcileExpiredLeases).toHaveBeenCalledWith(now, 100);
     });
 
-    it('keeps claiming work when the expired-lease sweep cannot get its locks', async () => {
+    it('recovers at most the configured batch per drain, even when a full batch came back', async () => {
+      worker = createWorker({ expiredLeaseBatchSize: 7 });
+      repository.reconcileExpiredLeases.mockResolvedValue(7);
+
+      const result = await worker.drain(() => now);
+
+      // A full batch means more may be waiting; they are left to later drains rather
+      // than looped over inside this one, so recovery never delays delivery slots.
+      expect(repository.reconcileExpiredLeases).toHaveBeenCalledTimes(1);
+      expect(repository.reconcileExpiredLeases).toHaveBeenCalledWith(now, 7);
+      expect(result.expiredLeases).toBe(7);
+    });
+
+    it('applies the same batch limit on the single-step path', async () => {
+      worker = createWorker({ expiredLeaseBatchSize: 3 });
+
+      await worker.processNext(now);
+
+      expect(repository.reconcileExpiredLeases).toHaveBeenCalledWith(now, 3);
+    });
+
+    it('keeps claiming work when the expired-lease sweep fails', async () => {
       const warn = jest.spyOn(Logger.prototype, 'warn');
       repository.reconcileExpiredLeases.mockRejectedValue(
         new Prisma.PrismaClientKnownRequestError(
-          'canceling statement due to lock timeout postgresql://u:secret@db/app',
-          { code: 'P2010', clientVersion: '6.19.3', meta: { code: '55P03' } },
+          'canceling statement due to statement timeout postgresql://u:secret@db/app',
+          { code: 'P2010', clientVersion: '6.19.3', meta: { code: '57014' } },
         ),
       );
       repository.claimNext.mockResolvedValueOnce(workItem()).mockResolvedValue(null);
@@ -373,7 +394,7 @@ describe('ReplyDeliveryWorker', () => {
           errorCategory: 'database',
           errorClass: 'PrismaClientKnownRequestError',
           errorCode: 'P2010',
-          sqlState: '55P03',
+          sqlState: '57014',
         }),
       );
       expect(JSON.stringify(warn.mock.calls)).not.toContain('secret');

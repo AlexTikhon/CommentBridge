@@ -448,26 +448,56 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
   }
 
   /**
-   * One statement, so the check and the write cannot be separated by a
-   * concurrent completion or re-claim. The UPDATE re-evaluates its predicate
-   * after waiting on a row lock, so a delivery that finished (or was re-leased)
-   * meanwhile is no longer PROCESSING-and-expired and is left alone. The open
-   * attempt is closed from the rows actually transitioned, and the returned
-   * count is the number of deliveries moved, not the number first observed.
+   * Moves one bounded batch of expired leases to UNKNOWN and returns how many
+   * deliveries it actually moved.
+   *
+   * One statement, so the check and the write cannot be separated by a concurrent
+   * completion or re-claim. Candidates are the oldest expired leases (by lease end,
+   * then id), selected with row locks on the delivery AND on its current attempt and
+   * with SKIP LOCKED, so a lease whose delivery or attempt another transaction holds is
+   * passed over, costs no batch slot, and is simply recovered by a later sweep; the
+   * statement never waits on a lock, so one locked row cannot roll back recovery of
+   * the others. Because both rows are locked before either is written, a delivery is
+   * never left UNKNOWN with its attempt still open. The row is re-checked against its
+   * newest version when locked, so a delivery that finished (or was re-leased)
+   * meanwhile is no longer PROCESSING-and-expired and is left alone.
+   *
+   * An attempt that is already closed is not rewritten: a reconciliation lease runs
+   * under the attempt whose unknown outcome made it reconcilable, and that history
+   * stays as it was.
+   *
+   * No index beyond (status, leaseUntil) is needed: the expired set is read through it
+   * and only the rows being recovered are locked and written.
    */
-  async reconcileExpiredLeases(now: Date): Promise<number> {
+  async reconcileExpiredLeases(now: Date, limit: number): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError('The expired-lease batch limit must be a positive integer.');
+    }
     const [row] = await this.prisma.$queryRaw<{ count: number }[]>(Prisma.sql`
-      WITH expired AS (
-        UPDATE "ReplyDelivery"
+      WITH candidate AS (
+        SELECT d."id", a."id" AS "attemptId"
+        FROM "ReplyDelivery" d
+        JOIN "ReplyDeliveryAttempt" a
+          ON a."deliveryId" = d."id" AND a."attemptNumber" = d."attemptCount"
+        WHERE d."status" = 'PROCESSING'
+          AND d."leaseUntil" < ${now}
+        ORDER BY d."leaseUntil" ASC, d."id" ASC
+        FOR UPDATE OF d, a SKIP LOCKED
+        LIMIT ${limit}
+      ),
+      expired AS (
+        UPDATE "ReplyDelivery" d
         SET
           "status" = 'UNKNOWN',
           "leaseUntil" = NULL,
           "leaseToken" = NULL,
           "lastErrorCode" = 'LEASE_EXPIRED',
           "updatedAt" = ${now}
-        WHERE "status" = 'PROCESSING'
-          AND "leaseUntil" < ${now}
-        RETURNING "id", "attemptCount"
+        FROM candidate c
+        WHERE d."id" = c."id"
+          AND d."status" = 'PROCESSING'
+          AND d."leaseUntil" < ${now}
+        RETURNING d."id"
       ),
       closed AS (
         UPDATE "ReplyDeliveryAttempt" a
@@ -475,9 +505,9 @@ export class PrismaReplyDeliveryRepository implements ReplyDeliveryRepository {
           "status" = 'UNKNOWN',
           "errorCode" = 'LEASE_EXPIRED',
           "finishedAt" = ${now}
-        FROM expired
-        WHERE a."deliveryId" = expired."id"
-          AND a."attemptNumber" = expired."attemptCount"
+        FROM candidate c
+        JOIN expired e ON e."id" = c."id"
+        WHERE a."id" = c."attemptId"
           AND a."status" = 'PROCESSING'
         RETURNING a."id"
       )

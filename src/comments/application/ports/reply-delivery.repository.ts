@@ -61,5 +61,5 @@ export interface ReplyDeliveryRepository {
    */
   getHealthSnapshot(now: Date): Promise<DeliveryQueueHealthSnapshot>;
   /** Moves genuinely expired PROCESSING deliveries to UNKNOWN; returns how many. */
-  reconcileExpiredLeases(now: Date): Promise<number>;
+  reconcileExpiredLeases(now: Date, limit: number): Promise<number>;
 }

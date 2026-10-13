@@ -255,57 +255,115 @@ describe('database execution budgets (PostgreSQL)', () => {
   });
 
   describe('a lock held by another connection', () => {
-    it('makes the expired-lease sweep fail within the lock budget instead of waiting', async () => {
-      const { deliveryId } = await reply('expired-lease');
-      const lock = await lockDelivery(deliveryId);
+    const RECOVERY_BATCH = 100;
 
-      const started = Date.now();
-      const failure = await deliveries.reconcileExpiredLeases(afterLease).then(
-        () => undefined,
-        (error: unknown) => error,
+    const lockAttempt = (deliveryId: string) =>
+      holdLock(
+        (tx) =>
+          tx.$queryRaw`SELECT "id" FROM "ReplyDeliveryAttempt" WHERE "deliveryId" = ${deliveryId}::uuid FOR UPDATE`,
       );
-      const elapsed = Date.now() - started;
-      await lock.release();
-
-      expect(sqlState(failure)).toBe(LOCK_NOT_AVAILABLE);
-      expect(elapsed).toBeGreaterThanOrEqual(LOCK_TIMEOUT_MS - 50);
-      expect(elapsed).toBeLessThan(LOCK_TIMEOUT_MS + SLACK_MS);
-    });
-
-    it('lets the very next sweep succeed once the lock is gone', async () => {
-      const { deliveryId } = await reply('expired-lease');
-      const lock = await lockDelivery(deliveryId);
-      await expect(deliveries.reconcileExpiredLeases(afterLease)).rejects.toBeDefined();
-      await lock.release();
-
-      await expect(deliveries.reconcileExpiredLeases(afterLease)).resolves.toBe(1);
-      const row = await admin.replyDelivery.findUniqueOrThrow({
+    const open = (deliveryId: string) =>
+      admin.replyDelivery.findUniqueOrThrow({
         where: { id: deliveryId },
+        include: { attempts: true },
       });
-      expect(row.status).toBe('UNKNOWN');
-    });
 
-    it('does not stop the worker from delivering other replies in the same drain', async () => {
-      const blocked = await reply('expired-lease');
-      const healthy = await reply('queued');
-      const lock = await lockDelivery(blocked.deliveryId);
+    // What gets locked is the recovery candidate itself: the delivery row, or the
+    // attempt row that recovery would have to close with it.
+    describe.each([
+      ['delivery row', lockDelivery],
+      ['current attempt row', lockAttempt],
+    ])('on the %s of an expired lease', (_name, lockIt) => {
+      it('skips it, recovers the unlocked one, and fails nothing', async () => {
+        const blocked = await reply('expired-lease');
+        const free = await reply('expired-lease');
+        const blockedBefore = await open(blocked.deliveryId);
+        const lock = await lockIt(blocked.deliveryId);
 
-      const started = Date.now();
-      const result = await worker.drain(() => afterLease);
-      const elapsed = Date.now() - started;
-      await lock.release();
+        const recovered = await deliveries.reconcileExpiredLeases(
+          afterLease,
+          RECOVERY_BATCH,
+        );
+        const freeAfter = await open(free.deliveryId);
+        const blockedAfter = await open(blocked.deliveryId);
+        await lock.release();
 
-      expect(result).toMatchObject({ expiredLeases: 0, delivered: 1 });
-      expect(elapsed).toBeLessThan(LOCK_TIMEOUT_MS + SLACK_MS);
-      const sent = await admin.comment.findUniqueOrThrow({
-        where: { id: healthy.replyId },
+        expect(recovered).toBe(1);
+        expect(freeAfter).toMatchObject({ status: 'UNKNOWN', leaseToken: null });
+        expect(freeAfter.attempts[0]).toMatchObject({
+          status: 'UNKNOWN',
+          errorCode: 'LEASE_EXPIRED',
+        });
+        // Left exactly as it was: still leased, attempt still open, no partial change.
+        expect(blockedAfter).toEqual(blockedBefore);
       });
-      expect(sent.deliveryStatus).toBe('SENT');
-      // The blocked delivery was left exactly as it was.
-      const untouched = await admin.replyDelivery.findUniqueOrThrow({
-        where: { id: blocked.deliveryId },
+
+      it('recovers it on the very next sweep once the lock is gone', async () => {
+        const blocked = await reply('expired-lease');
+        const lock = await lockIt(blocked.deliveryId);
+        await expect(
+          deliveries.reconcileExpiredLeases(afterLease, RECOVERY_BATCH),
+        ).resolves.toBe(0);
+        await lock.release();
+
+        await expect(
+          deliveries.reconcileExpiredLeases(afterLease, RECOVERY_BATCH),
+        ).resolves.toBe(1);
+
+        const row = await open(blocked.deliveryId);
+        expect(row.status).toBe('UNKNOWN');
+        expect(row.attempts[0]?.status).toBe('UNKNOWN');
       });
-      expect(untouched.status).toBe('PROCESSING');
+
+      it('does not use up the batch: unlocked leases behind it are still recovered', async () => {
+        // Locked leases are the oldest, so a batch that counted them would be spent
+        // before reaching the unlocked ones.
+        const blocked = [
+          await reply('expired-lease'),
+          await reply('expired-lease'),
+          await reply('expired-lease'),
+        ];
+        await admin.replyDelivery.updateMany({
+          where: { id: { in: blocked.map((row) => row.deliveryId) } },
+          data: { leaseUntil: new Date('2026-01-01T00:00:00.000Z') },
+        });
+        const free = [await reply('expired-lease'), await reply('expired-lease')];
+        const locks = [];
+        for (const row of blocked) locks.push(await lockIt(row.deliveryId));
+
+        const recovered = await deliveries.reconcileExpiredLeases(afterLease, 2);
+        await Promise.all(locks.map((lock) => lock.release()));
+
+        expect(recovered).toBe(2);
+        for (const row of free)
+          expect((await open(row.deliveryId)).status).toBe('UNKNOWN');
+        for (const row of blocked) {
+          expect((await open(row.deliveryId)).status).toBe('PROCESSING');
+        }
+      });
+
+      it('lets the worker keep delivering other replies in the same drain, without waiting', async () => {
+        const blocked = await reply('expired-lease');
+        const healthy = await reply('queued');
+        const warn = jest.spyOn(Logger.prototype, 'warn');
+        const lock = await lockIt(blocked.deliveryId);
+
+        const result = await worker.drain(() => afterLease);
+        await lock.release();
+
+        expect(result).toMatchObject({ expiredLeases: 0, delivered: 1 });
+        // The sweep succeeded by skipping; it did not fail and get swallowed.
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(
+          'delivery.lease-sweep-failed',
+        );
+        const sent = await admin.comment.findUniqueOrThrow({
+          where: { id: healthy.replyId },
+        });
+        expect(sent.deliveryStatus).toBe('SENT');
+        const untouched = await open(blocked.deliveryId);
+        expect(untouched.status).toBe('PROCESSING');
+        expect(untouched.attempts[0]?.status).toBe('PROCESSING');
+      });
     });
 
     it('recovers on the next drain: the expired lease is reconciled and resolved', async () => {
@@ -324,6 +382,43 @@ describe('database execution budgets (PostgreSQL)', () => {
         where: { id: blocked.deliveryId },
       });
       expect(row.status).toBe('RETRY');
+    });
+
+    // Operations that must wait for a row (completing a job, operator actions) still
+    // do, and still fail within the lock budget rather than waiting indefinitely.
+    it('still bounds a completion that needs the locked delivery by the lock budget', async () => {
+      const { deliveryId, replyId } = await reply('queued');
+      const claimed = await deliveries.claimNext(
+        afterLease,
+        new Date(afterLease.getTime() + 30_000),
+      );
+      expect(claimed?.deliveryId).toBe(deliveryId);
+      const lock = await lockDelivery(deliveryId);
+
+      const started = Date.now();
+      const failure = await deliveries
+        .markSucceeded(
+          claimed!,
+          { externalCommentId: 'late-reply', remoteCreatedAt: afterLease },
+          afterLease,
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      const elapsed = Date.now() - started;
+      await lock.release();
+
+      expect(sqlState(failure)).toBe(LOCK_NOT_AVAILABLE);
+      expect(elapsed).toBeGreaterThanOrEqual(LOCK_TIMEOUT_MS - 50);
+      expect(elapsed).toBeLessThan(LOCK_TIMEOUT_MS + SLACK_MS);
+      const row = await open(deliveryId);
+      expect(row.status).toBe('PROCESSING');
+      expect(row.attempts[0]?.status).toBe('PROCESSING');
+      expect(
+        (await admin.comment.findUniqueOrThrow({ where: { id: replyId } }))
+          .deliveryStatus,
+      ).toBe('PENDING');
     });
   });
 
@@ -404,8 +499,10 @@ describe('database execution budgets (PostgreSQL)', () => {
     }
 
     it('completes within the lock budget instead of waiting for the lock', async () => {
-      const { deliveryId } = await reply('expired-lease');
-      const lock = await lockDelivery(deliveryId);
+      // The expired-lease sweep skips locked rows, so what blocks here is a completion:
+      // the provider accepts the reply and recording it needs the locked comment row.
+      const { deliveryId, replyId } = await reply('queued');
+      const lock = await lockComment(replyId);
       const running = runtime();
       await running.start();
       await waitUntilBlocked();
@@ -423,11 +520,16 @@ describe('database execution budgets (PostgreSQL)', () => {
         SELECT count(*)::int AS n FROM pg_stat_activity
         WHERE usename = 'commentbridge_worker' AND wait_event_type = 'Lock'`;
       expect(waiting[0]?.n).toBe(0);
-      // The blocked delivery was never touched.
+      // The completion rolled back as a whole: the job still looks in-flight, and its
+      // lease will expire into UNKNOWN for reconciliation.
       const row = await admin.replyDelivery.findUniqueOrThrow({
         where: { id: deliveryId },
       });
       expect(row.status).toBe('PROCESSING');
+      expect(
+        (await admin.comment.findUniqueOrThrow({ where: { id: replyId } }))
+          .deliveryStatus,
+      ).toBe('PENDING');
       await workerService.$connect();
     });
   });

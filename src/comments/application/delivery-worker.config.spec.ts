@@ -15,6 +15,7 @@ describe('loadDeliveryWorkerConfig', () => {
       maxRetryDelayMs: 60_000,
       maxJobsPerTick: 10,
       maxReconciliationsPerTick: 3,
+      expiredLeaseBatchSize: 100,
       heartbeatIntervalMs: 10_000,
       staleAfterMs: 30_000,
       retention: {
@@ -49,6 +50,7 @@ describe('loadDeliveryWorkerConfig', () => {
         DELIVERY_MAX_RETRY_DELAY_MS: '800',
         DELIVERY_MAX_JOBS_PER_TICK: '4',
         DELIVERY_MAX_RECONCILIATIONS_PER_TICK: '',
+        DELIVERY_EXPIRED_LEASE_BATCH_SIZE: '25',
         DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS: '2000',
         DELIVERY_WORKER_STALE_AFTER_MS: '7000',
       }),
@@ -61,6 +63,7 @@ describe('loadDeliveryWorkerConfig', () => {
       maxRetryDelayMs: 800,
       maxJobsPerTick: 4,
       maxReconciliationsPerTick: 3,
+      expiredLeaseBatchSize: 25,
       heartbeatIntervalMs: 2_000,
       staleAfterMs: 7_000,
       retention: expect.objectContaining({ enabled: true, batchSize: 500 }),
@@ -76,6 +79,11 @@ describe('loadDeliveryWorkerConfig', () => {
     ['DELIVERY_PROVIDER_TIMEOUT_MS', 'soon'],
     ['DELIVERY_MAX_JOBS_PER_TICK', '0'],
     ['DELIVERY_MAX_RECONCILIATIONS_PER_TICK', '0'],
+    ['DELIVERY_EXPIRED_LEASE_BATCH_SIZE', '0'],
+    ['DELIVERY_EXPIRED_LEASE_BATCH_SIZE', '-1'],
+    ['DELIVERY_EXPIRED_LEASE_BATCH_SIZE', '1.5'],
+    ['DELIVERY_EXPIRED_LEASE_BATCH_SIZE', 'all'],
+    ['DELIVERY_EXPIRED_LEASE_BATCH_SIZE', '10001'],
     ['DELIVERY_POLL_INTERVAL_MS', '99999999999'],
     ['DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS', '0'],
     ['DELIVERY_WORKER_HEARTBEAT_INTERVAL_MS', 'often'],
@@ -83,6 +91,23 @@ describe('loadDeliveryWorkerConfig', () => {
   ])('rejects invalid %s=%s', (name, value) => {
     expect(() => loadDeliveryWorkerConfig({ [name]: value })).toThrow(
       InvalidDeliveryWorkerConfigError,
+    );
+  });
+
+  it('accepts an expired-lease batch size from one up to the documented maximum', () => {
+    for (const size of [1, 10_000]) {
+      expect(
+        loadDeliveryWorkerConfig({ DELIVERY_EXPIRED_LEASE_BATCH_SIZE: String(size) })
+          .expiredLeaseBatchSize,
+      ).toBe(size);
+    }
+  });
+
+  it('names the batch size setting, not its value, when it is rejected', () => {
+    expect(() =>
+      loadDeliveryWorkerConfig({ DELIVERY_EXPIRED_LEASE_BATCH_SIZE: '123456' }),
+    ).toThrow(
+      /DELIVERY_EXPIRED_LEASE_BATCH_SIZE must be a positive integer no greater than 10000$/,
     );
   });
 
