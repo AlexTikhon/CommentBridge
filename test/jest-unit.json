@@ -6,7 +6,7 @@
   "transform": {
     "^.+\\.(t|j)s$": ["ts-jest", { "tsconfig": "tsconfig.json" }]
   },
-  "collectCoverageFrom": ["src/**/*.ts", "!src/main.ts"],
+  "collectCoverageFrom": ["src/**/*.ts"],
   "coverageDirectory": "coverage/unit",
   "testEnvironment": "node"
 }

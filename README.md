@@ -554,7 +554,9 @@ logged. Messages, provider payloads, and credentials are never logged.
 
 Failures are logged the same way, as one JSON line with a fixed `event`
 (`delivery-worker.tick-failed`, `.drain-record-failed`, `.heartbeat-failed`,
-`.retention-failed`, `.retention-record-failed`, `.start-failed`, `.shutdown-failed`),
+`.retention-failed`, `.retention-record-failed`, `.start-failed`, `.shutdown-failed`; the API
+process reports `api.start-failed`, then `api.cleanup-failed` or `api.cleanup-timed-out` if
+releasing the half-started application also failed, and exits 1),
 the `workerInstanceId` where the process has one, and only these error fields:
 `errorCategory` (`configuration`, `database`, `system`, `internal`, `unknown`),
 `errorClass` (from a fixed list, never `error.name`), and, when they have the exact shape

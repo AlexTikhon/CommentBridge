@@ -405,8 +405,23 @@ framework's own exception handler prints the whole startup exception object by i
   which replaces any error object reaching `error`, `warn` or `fatal` with the same safe line and
   keeps only context labels from the other arguments (which drops stacks). Without it the secret
   was printed by the framework before `worker.ts` could handle the error; the process-level test
-  was written against that behavior. It is installed for the worker only, because that is the
-  process the finding named.
+  was written against that behavior.
+- **The API start-up path is the same.** `src/main.ts` passes `SafeConsoleLogger` and
+  `abortOnError: false` to `NestFactory.create`, so the framework's own report of a failure while
+  providers are built is the safe line. The part that was missed first is that `create()` does not
+  run the init hooks: the database connects inside `app.listen()`, which is not covered by the
+  framework's exception zone at all, so a failed connection used to leave `void bootstrap()` as an
+  unhandled rejection that Node printed whole. `main()` is now the explicit handler: it logs
+  `api.start-failed` with the fields above and exits 1. Once the application exists it also closes
+  it, for at most 5 seconds, so the database client is released; a failed close is a second line,
+  `api.cleanup-failed` (or `api.cleanup-timed-out`), written after the first and never in place of
+  it. There is no global `unhandledRejection` or `uncaughtException` handler: a process that
+  failed to start must not be able to carry on.
+- **One framework line is a string.** When the HTTP server emits `error` while binding, Nest logs
+  `error.toString()`, which no object-level rule can make safe. `SafeConsoleLogger` recognises it by
+  its `NestApplication` context and writes `framework.application-error` instead. The rejected
+  `listen()` still reaches `main()`, and `EADDRINUSE` and `EACCES` joined the allowlisted codes so
+  that a port clash is still diagnosable from `errorCode`.
 - **Persisted codes follow the same rule.** The retention error code stored on the worker row and
   shown by operational health used to be `error.name` when it matched a character class, which a
   secret-shaped name satisfies. It is now the class label, so an error with a custom name is stored

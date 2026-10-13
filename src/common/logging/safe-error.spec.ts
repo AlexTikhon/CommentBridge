@@ -106,6 +106,19 @@ describe('safeErrorFields', () => {
     });
   });
 
+  it.each(['EADDRINUSE', 'EACCES'])(
+    'reports %s, which is how a server that cannot bind its port fails',
+    (code) => {
+      const failure = Object.assign(new Error(`listen ${code} ${SECRET}`), { code });
+
+      expect(safeErrorFields(failure)).toEqual({
+        errorCategory: 'system',
+        errorClass: 'Error',
+        errorCode: code,
+      });
+    },
+  );
+
   it('shows the message of a configuration error, which is written by us, and only that', () => {
     const error = new ConfigurationError(
       'DB_STATEMENT_TIMEOUT_MS must be a positive integer',
@@ -237,6 +250,26 @@ describe('SafeConsoleLogger', () => {
     expect(written).toContain('Something failed.');
     expect(written).toContain('Context');
     expect(written).not.toContain('SENTINEL');
+  });
+
+  it('replaces the string the framework logs when the HTTP server cannot listen', () => {
+    // NestApplication logs `error.toString()` when the server emits `error`: a plain
+    // string, so only its context label tells it apart from a line we wrote.
+    new SafeConsoleLogger().error(`Error: ${SECRET}`, undefined, 'NestApplication');
+
+    expect(written).not.toContain('SENTINEL');
+    expect(written).not.toContain('hunter2');
+    expect(written).toContain('framework.application-error');
+    expect(written).toContain('NestApplication');
+  });
+
+  it('does not rewrite the strings other components log at error level', () => {
+    new SafeConsoleLogger().error(
+      'Unexpected error requestId=r-1',
+      'ProblemDetailsFilter',
+    );
+
+    expect(written).toContain('Unexpected error requestId=r-1');
   });
 
   it('writes our own structured lines unchanged', () => {

@@ -57,7 +57,16 @@ const SYSTEM_ERROR_CODES = new Set([
   'EHOSTUNREACH',
   'ENETUNREACH',
   'EPIPE',
+  // A server that cannot bind its port. Without these a port clash would be reported
+  // with no diagnostic at all, now that the framework's own line is replaced below.
+  'EADDRINUSE',
+  'EACCES',
 ]);
+/**
+ * Loggers whose error *strings* are not ours. `NestApplication` logs `error.toString()`
+ * when the HTTP server emits `error` (its name and message, which is untrusted text).
+ */
+const FRAMEWORK_ERROR_CONTEXTS = new Set(['NestApplication']);
 
 type ErrorConstructor = abstract new (...args: never[]) => Error;
 const DATABASE_ERRORS: readonly (readonly [ErrorConstructor, string])[] = [
@@ -177,10 +186,22 @@ export function errorEventLine(
  * Installed as the application logger, this turns every error object that reaches
  * `error`, `warn` or `fatal` into the safe event line, and keeps only the context
  * label of the other arguments, which drops stacks and arbitrary objects.
+ *
+ * One framework error is a string rather than an object: the HTTP server's `error`
+ * event is logged as `error.toString()`, which no inspection of the message can make
+ * safe. That line is recognised by its context and replaced by a fixed event; the
+ * error itself still rejects `listen()`, so the application reports it by type and code.
  */
 export class SafeConsoleLogger extends ConsoleLogger {
   override error(message: unknown, ...optionalParams: unknown[]): void {
-    super.error(...sanitize(message, optionalParams));
+    const [safeMessage, ...labels] = sanitize(message, optionalParams);
+    const fromFramework = labels.some(
+      (label) => typeof label === 'string' && FRAMEWORK_ERROR_CONTEXTS.has(label),
+    );
+    super.error(
+      fromFramework ? eventLine('framework.application-error') : safeMessage,
+      ...labels,
+    );
   }
 
   override warn(message: unknown, ...optionalParams: unknown[]): void {
